@@ -366,7 +366,7 @@ def render_results_page(r: Dict[str, Any]) -> None:
     fig_profit = px.line(r["profit_curve"], x="price", y="adjusted_profit", template="plotly_dark")
     fig_profit.add_vline(x=r["current_price"], line_dash="dash", line_color="#ffffff")
     fig_profit.add_vline(x=r["best_price"], line_color="#5da0ff")
-    fig_profit.update_layout(**_base_plotly_layout("Прибыль vs Цена"))
+    fig_profit.update_layout(**_base_plotly_layout("Risk-adjusted profit vs Цена"))
     st.plotly_chart(fig_profit, use_container_width=True)
 
     explanation = generate_explanation(r, data_quality=r.get("data_quality", {}))

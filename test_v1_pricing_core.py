@@ -1,9 +1,10 @@
 import numpy as np
 import pandas as pd
 
+from data_adapter import normalize_transactions
 from data_adapter import build_daily_from_transactions_scoped
 from pricing_core.v1_elasticity import compute_price_multiplier
-from pricing_core.v1_features import V1_BASELINE_FEATURES
+from pricing_core.v1_features import V1_BASELINE_FEATURES, build_v1_feature_matrix
 from pricing_core.v1_orchestrator import run_full_pricing_analysis_universal_v1
 from pricing_core.v1_scenario import run_v1_what_if_projection
 
@@ -88,3 +89,58 @@ def test_v1_feature_spec_contains_only_projection_safe_features():
     out = run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1")
     feats = out["_trained_bundle"]["feature_spec"]["baseline_features"]
     assert set(feats).issubset(set(V1_BASELINE_FEATURES))
+
+
+def test_v1_feature_fill_has_no_global_median_leakage():
+    df = _make_txn(days=35)
+    features = build_v1_feature_matrix(build_daily_from_transactions_scoped(df, "sku-1", category="cat-a"))
+    first_row = features.iloc[0]
+    assert first_row["sales_lag7"] == 0.0
+    assert first_row["sales_lag28"] == 0.0
+    assert first_row["sales_ma28"] == 0.0
+
+
+def test_v1_business_recommendation_contains_revenue_and_volume_changes():
+    out = run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1")
+    structured = out["business_recommendation"]["structured"]
+    assert structured["expected_revenue_change"] is not None
+    assert structured["expected_volume_change"] is not None
+
+
+def test_v1_user_facing_profit_is_raw_and_adjusted_is_separate():
+    out = run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1", risk_lambda=1.2)
+    total_profit = float(out["forecast_current"]["profit"].sum())
+    assert np.isclose(out["current_profit"], total_profit)
+    assert "current_profit_adjusted" in out
+    assert "best_profit_adjusted" in out
+    assert out["current_profit_adjusted"] <= out["current_profit"]
+
+
+def test_v1_business_decision_not_overridden_and_has_legacy_alias():
+    out = run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1")
+    biz = out["business_recommendation"]
+    structured_decision = biz.get("structured", {}).get("decision_type")
+    assert structured_decision in {"action", "test", "hold", "no_decision"}
+    assert "legacy_decision_type" in biz
+    assert biz["legacy_decision_type"] in {"change_price", "pilot_change", "hold", "no_decision"}
+
+
+def test_normalize_transactions_warns_on_mixed_discount_rate_scale():
+    raw = _make_txn(days=4).drop(columns=["discount_rate"]).copy()
+    raw.loc[0, "discount"] = 0.1
+    raw.loc[1, "discount"] = 15.0
+    raw.loc[2, "discount"] = 0.2
+    raw.loc[3, "discount"] = 10.0
+
+    mapping = {
+        "date": "date",
+        "product_id": "product_id",
+        "category": "category",
+        "price": "price",
+        "quantity": "quantity",
+        "revenue": "revenue",
+        "cost": "cost",
+        "discount": "discount",
+    }
+    _, quality = normalize_transactions(raw, mapping)
+    assert any("смешанный формат discount_rate" in w.lower() for w in quality.get("warnings", []))

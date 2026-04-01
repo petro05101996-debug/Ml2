@@ -64,11 +64,20 @@ def build_v1_feature_matrix(daily: pd.DataFrame) -> pd.DataFrame:
     out["month_cos"] = np.cos(2 * np.pi * month / 12.0)
     out["time_index_norm"] = np.linspace(0.0, 1.0, num=len(out)) if len(out) > 1 else 0.0
 
+    prev_mean = out["sales"].shift(1).expanding(min_periods=1).mean()
+
+    out["sales_lag1"] = out["sales_lag1"].fillna(0.0)
+    out["sales_lag7"] = out["sales_lag7"].fillna(out["sales_lag1"]).fillna(0.0)
+    out["sales_lag28"] = out["sales_lag28"].fillna(out["sales_lag7"]).fillna(out["sales_lag1"]).fillna(0.0)
+
+    out["sales_ma7"] = out["sales_ma7"].fillna(prev_mean).fillna(0.0)
+    out["sales_ma28"] = out["sales_ma28"].fillna(prev_mean).fillna(0.0)
+    out["sales_std28"] = out["sales_std28"].fillna(0.0)
+
     for c in V1_BASELINE_FEATURES:
         if c not in out.columns:
             out[c] = 0.0
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-        out[c] = out[c].fillna(out[c].median() if out[c].notna().any() else 0.0)
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
     return out
 
 
