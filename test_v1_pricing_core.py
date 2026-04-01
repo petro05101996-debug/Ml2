@@ -144,3 +144,4 @@ def test_normalize_transactions_warns_on_mixed_discount_rate_scale():
     }
     _, quality = normalize_transactions(raw, mapping)
     assert any("смешанный формат discount_rate" in w.lower() for w in quality.get("warnings", []))
+    assert quality.get("can_recommend") is False
