@@ -103,13 +103,29 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
     if missing_cost_count > 0:
         quality["warnings"].append(f"cost содержит пропуски: {missing_cost_count}. Заполнено proxy 65% от цены.")
 
-    if "discount_rate" in out.columns:
-        raw_discount = pd.to_numeric(out["discount_rate"], errors="coerce")
-        discount_amount_mask = raw_discount > 1.0
-        if discount_amount_mask.any():
-            out.loc[discount_amount_mask, "discount_rate"] = (raw_discount[discount_amount_mask] / out.loc[discount_amount_mask, "price"].replace(0, np.nan)).clip(lower=0.0, upper=0.95)
-            quality["warnings"].append("discount_rate > 1 интерпретирован как абсолютная скидка и переведён в discount_rate = discount_amount/price")
-        out["discount_rate"] = pd.to_numeric(out["discount_rate"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=0.95)
+    if "discount_amount" in out.columns:
+        raw_amount = pd.to_numeric(out["discount_amount"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        out["discount_rate"] = (
+            raw_amount / out["price"].replace(0, np.nan)
+        ).fillna(0.0).clip(lower=0.0, upper=0.95)
+
+    elif "discount_rate" in out.columns:
+        raw_rate = pd.to_numeric(out["discount_rate"], errors="coerce")
+
+        mixed_scale = ((raw_rate > 1.0).any()) and ((raw_rate.between(0.0, 1.0, inclusive="both")).any())
+        if mixed_scale:
+            quality["warnings"].append(
+                "Обнаружен смешанный формат discount_rate: часть строк похожа на rate, часть на absolute amount. "
+                "Для корректного расчёта нужен отдельный столбец discount_amount."
+            )
+
+        if (raw_rate > 1.0).all():
+            out["discount_rate"] = (
+                raw_rate / out["price"].replace(0, np.nan)
+            ).fillna(0.0).clip(lower=0.0, upper=0.95)
+            quality["warnings"].append("discount_rate интерпретирован как абсолютная скидка по всем строкам.")
+        else:
+            out["discount_rate"] = raw_rate.fillna(0.0).clip(lower=0.0, upper=0.95)
 
     if "freight_value" not in out.columns:
         out["freight_value"] = 0.0

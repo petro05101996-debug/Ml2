@@ -35,7 +35,7 @@ def _make_future_dates(last_date: pd.Timestamp, horizon_days: int) -> pd.DataFra
 
 
 def _compute_confidence(wape: float, quality_cap: float, can_recommend: bool) -> float:
-    raw_conf = 1.0 / (1.0 + max(float(wape), 0.0) / 100.0)
+    raw_conf = float(np.exp(-max(float(wape), 0.0) / 30.0))
     signal_cap = 1.0 if can_recommend else 0.55
     return float(np.clip(raw_conf * float(quality_cap) * signal_cap, 0.0, 1.0))
 
@@ -157,10 +157,6 @@ def run_full_pricing_analysis_universal_v1(
 
     confidence = _compute_confidence(float(holdout_metrics.get("wape", 100.0)), float(data_quality.get("confidence_cap", 0.5)), can_rec)
 
-    decision_type = "change_price" if can_rec and abs(optimal_price - base_ctx["price"]) > 1e-9 else "hold"
-    if not can_rec:
-        decision_type = "no_decision"
-
     reason_hints = {
         "key_driver_positive": "Лучшая цена выбрана по adjusted profit",
         "key_driver_negative": "Сдерживающий фактор — риск падения объёма",
@@ -170,15 +166,29 @@ def run_full_pricing_analysis_universal_v1(
     biz_rec = build_business_recommendation(
         current_price=float(base_ctx["price"]),
         recommended_price=float(optimal_price if can_rec else base_ctx["price"]),
-        current_profit=float(current_sim["adjusted_profit"]),
-        recommended_profit=float(optimal_sim["adjusted_profit"] if can_rec else current_sim["adjusted_profit"]),
+        current_profit=float(current_sim["total_profit"]),
+        recommended_profit=float(optimal_sim["total_profit"] if can_rec else current_sim["total_profit"]),
+        current_revenue=float(current_sim["total_revenue"]),
+        recommended_revenue=float(optimal_sim["total_revenue"] if can_rec else current_sim["total_revenue"]),
+        current_volume=float(current_sim["total_volume"]),
+        recommended_volume=float(optimal_sim["total_volume"] if can_rec else current_sim["total_volume"]),
         confidence=confidence,
         elasticity=float(elasticity_info["pooled_elasticity"]),
         history_days=history_days,
         data_quality=data_quality,
+        base_ctx=base_ctx,
         reason_hints=reason_hints,
     )
-    biz_rec["decision_type"] = decision_type
+    structured_decision = biz_rec.get("structured", {}).get("decision_type", "hold")
+    if structured_decision == "action":
+        legacy_decision = "change_price"
+    elif structured_decision == "test":
+        legacy_decision = "pilot_change"
+    elif structured_decision == "hold":
+        legacy_decision = "hold"
+    else:
+        legacy_decision = "no_decision"
+    biz_rec["legacy_decision_type"] = legacy_decision
     if rec_reasons:
         biz_rec["decision_reasons"] = rec_reasons
 
@@ -190,6 +200,11 @@ def run_full_pricing_analysis_universal_v1(
         pd.DataFrame([holdout_metrics]).to_excel(writer, sheet_name="metrics", index=False)
     excel_buffer.seek(0)
 
+    current_profit_raw = float(current_sim["total_profit"])
+    best_profit_raw = float(current_sim["total_profit"] if not can_rec else optimal_sim["total_profit"])
+    current_profit_adjusted = float(current_sim["adjusted_profit"])
+    best_profit_adjusted = float(current_sim["adjusted_profit"] if not can_rec else optimal_sim["adjusted_profit"])
+
     return {
         "daily": daily_base,
         "recommendation": rec,
@@ -200,13 +215,15 @@ def run_full_pricing_analysis_universal_v1(
         "elasticity_map": elasticity_info["elasticity_by_month"],
         "current_price": float(base_ctx["price"]),
         "best_price": float(base_ctx["price"] if not can_rec else optimal_price),
-        "current_profit": float(current_sim["adjusted_profit"]),
-        "best_profit": float(current_sim["adjusted_profit"] if not can_rec else optimal_sim["adjusted_profit"]),
+        "current_profit": current_profit_raw,
+        "best_profit": best_profit_raw,
+        "current_profit_adjusted": current_profit_adjusted,
+        "best_profit_adjusted": best_profit_adjusted,
         "current_revenue": float(current_sim["total_revenue"]),
         "best_revenue": float(current_sim["total_revenue"] if not can_rec else optimal_sim["total_revenue"]),
         "current_volume": float(current_sim["total_volume"]),
         "best_volume": float(current_sim["total_volume"] if not can_rec else optimal_sim["total_volume"]),
-        "profit_lift_pct": float(((optimal_sim["adjusted_profit"] - current_sim["adjusted_profit"]) / max(abs(current_sim["adjusted_profit"]), 1e-9) * 100.0) if can_rec else 0.0),
+        "profit_lift_pct": float(((best_profit_raw - current_profit_raw) / max(abs(current_profit_raw), 1e-9) * 100.0) if can_rec else 0.0),
         "data_quality": data_quality,
         "excel_buffer": excel_buffer,
         "business_recommendation": biz_rec,
