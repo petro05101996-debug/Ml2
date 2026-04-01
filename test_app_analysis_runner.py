@@ -52,14 +52,14 @@ def test_run_analysis_from_context_handles_non_seekable_inputs(monkeypatch):
 def test_run_analysis_from_context_supports_russian_universal_load_mode(monkeypatch):
     captured = {}
 
-    def fake_run_full_pricing_analysis_universal(universal_txn, target_category, target_sku, **kwargs):
+    def fake_run_full_pricing_analysis_universal_v1(universal_txn, target_category, target_sku, **kwargs):
         captured["universal_txn"] = universal_txn
         captured["target_category"] = target_category
         captured["target_sku"] = target_sku
         captured["kwargs"] = kwargs
         return {"ok": True}
 
-    monkeypatch.setattr(runner, "run_full_pricing_analysis_universal", fake_run_full_pricing_analysis_universal)
+    monkeypatch.setattr(runner, "run_full_pricing_analysis_universal_v1", fake_run_full_pricing_analysis_universal_v1)
 
     universal_df = pd.DataFrame({"product_id": ["sku-1"], "category": ["cat"], "price": [100]})
     ctx = {
