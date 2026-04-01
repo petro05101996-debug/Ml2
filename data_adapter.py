@@ -56,7 +56,7 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
     if "discount_rate" not in out.columns and "discount" in out.columns:
         out["discount_rate"] = out["discount"]
 
-    for c in ["price", "quantity", "revenue", "cost", "discount_rate", "freight_value", "stock", "promotion", "rating", "reviews_count"]:
+    for c in ["price", "quantity", "revenue", "cost", "discount_rate", "freight_value", "stock", "promotion", "rating", "review_score", "reviews_count"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     if "price" in out.columns:
@@ -118,6 +118,12 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
         out["discount_rate"] = 0.0
     # Legacy compatibility: core still reads discount in multiple places.
     out["discount"] = pd.to_numeric(out["discount_rate"], errors="coerce").fillna(0.0)
+    if "review_score" not in out.columns and "rating" in out.columns:
+        out["review_score"] = pd.to_numeric(out["rating"], errors="coerce")
+    if "review_score" in out.columns:
+        out["review_score"] = pd.to_numeric(out["review_score"], errors="coerce")
+    if "rating" not in out.columns and "review_score" in out.columns:
+        out["rating"] = out["review_score"]
 
     if "category" not in out.columns:
         out["category"] = "unknown"
@@ -253,6 +259,14 @@ def build_daily_from_transactions(txn: pd.DataFrame, sku_id: str) -> pd.DataFram
     daily["category"] = sku["category"].mode().iloc[0] if "category" in sku.columns and not sku["category"].dropna().empty else "unknown"
     daily["sku_id"] = str(sku_id)
     return daily
+
+
+def build_daily_from_transactions_scoped(txn: pd.DataFrame, sku_id: str, category: Optional[str] = None) -> pd.DataFrame:
+    mask = txn["product_id"].astype(str) == str(sku_id)
+    if category is not None and "category" in txn.columns:
+        mask &= txn["category"].astype(str) == str(category)
+    scoped = txn[mask].copy()
+    return build_daily_from_transactions(scoped, sku_id)
 
 
 def objective_to_weights(mode: str) -> Dict[str, float]:

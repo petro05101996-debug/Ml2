@@ -6,7 +6,7 @@ from typing import Any, Dict
 import numpy as np
 import pandas as pd
 
-from pricing_core import run_full_pricing_analysis, run_full_pricing_analysis_universal
+from pricing_core import run_full_pricing_analysis, run_full_pricing_analysis_universal_v1
 
 
 UNIVERSAL_LOAD_MODES = {
@@ -38,12 +38,11 @@ def run_analysis_from_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
     risk_lambda = float(caution_to_risk_lambda.get(selected_caution, 0.7))
 
     if load_mode in UNIVERSAL_LOAD_MODES:
-        return run_full_pricing_analysis_universal(
+        return run_full_pricing_analysis_universal_v1(
             ctx["universal_txn"],
             target_category,
             target_sku,
             objective_mode=ctx.get("objective_mode", "maximize_profit"),
-            objective_weights_override=ctx.get("objective_weights_override"),
             horizon_days=horizon_days,
             risk_lambda=risk_lambda,
         )
