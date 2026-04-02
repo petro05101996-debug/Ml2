@@ -806,7 +806,16 @@ def _make_direct_monotone_constraints(feature_names: List[str]) -> List[int]:
     return monotone
 
 
-def build_models(X: pd.DataFrame, y: pd.Series, feature_names: List[str], n_models: int = CONFIG["ENSEMBLE_SIZE"], kind: str = "direct", small_mode: bool = False, cat_features: Optional[List[str]] = None) -> List[Any]:
+def build_models(
+    X: pd.DataFrame,
+    y: pd.Series,
+    feature_names: List[str],
+    n_models: int = CONFIG["ENSEMBLE_SIZE"],
+    kind: str = "direct",
+    small_mode: bool = False,
+    cat_features: Optional[List[str]] = None,
+    sample_weight: Optional[pd.Series] = None,
+) -> List[Any]:
     ensemble: List[Any] = []
     if len(X) == 0:
         raise ValueError("Пустая обучающая выборка.")
@@ -818,10 +827,11 @@ def build_models(X: pd.DataFrame, y: pd.Series, feature_names: List[str], n_mode
     elif n_rows >= CONFIG["LARGE_DATA_ROWS"]:
         effective_n_models = min(effective_n_models, 3)
 
-    def _sample_indices() -> np.ndarray:
+    def _sample_indices(seed_offset: int) -> np.ndarray:
         sample_size = min(n_rows, max_train_rows)
         replace = sample_size >= n_rows
-        return np.random.choice(n_rows, size=sample_size, replace=replace)
+        rng = np.random.default_rng(42 + seed_offset)
+        return rng.choice(n_rows, size=sample_size, replace=replace)
 
     monotone = _make_direct_monotone_constraints(feature_names) if kind == "direct" else [0] * len(feature_names)
     cat_depth = CONFIG["SMALL_CAT_DEPTH"] if small_mode else CONFIG["CAT_DEPTH"]
@@ -843,12 +853,15 @@ def build_models(X: pd.DataFrame, y: pd.Series, feature_names: List[str], n_mode
                 monotone_constraints=monotone, allow_writing_files=False,
                 od_type="Iter", od_wait=50, l2_leaf_reg=cat_l2, thread_count=1
             )
-            idx = _sample_indices()
+            idx = _sample_indices(i)
             fit_x = X.iloc[idx][feature_names].copy()
             for c in cat_features:
                 if c in fit_x.columns:
                     fit_x[c] = fit_x[c].astype(str)
-            model.fit(fit_x, y.iloc[idx], cat_features=cat_idx if cat_idx else None)
+            fit_weight = None
+            if sample_weight is not None:
+                fit_weight = pd.to_numeric(sample_weight.iloc[idx], errors="coerce").fillna(1.0).values
+            model.fit(fit_x, y.iloc[idx], cat_features=cat_idx if cat_idx else None, sample_weight=fit_weight)
             ensemble.append(model)
             gc.collect()
         return ensemble
@@ -867,8 +880,11 @@ def build_models(X: pd.DataFrame, y: pd.Series, feature_names: List[str], n_mode
                     l2_regularization=CONFIG["SMALL_HGB_L2"] if small_mode else 0.1, random_state=42 + i
                 )
                 model = HistGradientBoostingRegressor(monotonic_cst=monotone, **kwargs)
-                idx = _sample_indices()
-                model.fit(_numeric_for_non_catboost(X.iloc[idx][feature_names], cat_features), y.iloc[idx])
+                idx = _sample_indices(i)
+                fit_weight = None
+                if sample_weight is not None:
+                    fit_weight = pd.to_numeric(sample_weight.iloc[idx], errors="coerce").fillna(1.0).values
+                model.fit(_numeric_for_non_catboost(X.iloc[idx][feature_names], cat_features), y.iloc[idx], sample_weight=fit_weight)
                 ensemble.append(model)
                 gc.collect()
             except Exception:
@@ -887,8 +903,11 @@ def build_models(X: pd.DataFrame, y: pd.Series, feature_names: List[str], n_mode
             n_estimators=rf_trees, max_depth=CONFIG["RF_DEPTH"], max_features=max_feat,
             random_state=42 + i, n_jobs=1
         )
-        idx = _sample_indices()
-        model.fit(_numeric_for_non_catboost(X.iloc[idx][feature_names], cat_features), y.iloc[idx])
+        idx = _sample_indices(i)
+        fit_weight = None
+        if sample_weight is not None:
+            fit_weight = pd.to_numeric(sample_weight.iloc[idx], errors="coerce").fillna(1.0).values
+        model.fit(_numeric_for_non_catboost(X.iloc[idx][feature_names], cat_features), y.iloc[idx], sample_weight=fit_weight)
         ensemble.append(model)
         gc.collect()
     return ensemble

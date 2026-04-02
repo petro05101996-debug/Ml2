@@ -30,6 +30,51 @@ def _eval_wape(actual: pd.Series, pred: pd.Series) -> float:
     return float(np.abs(actual - pred).sum() / denom * 100.0)
 
 
+def _eval_e2e_holdout_wape(
+    test_df: pd.DataFrame,
+    pred_baseline_sales: np.ndarray,
+    elasticity_map: Dict[str, float],
+    pooled_elasticity: float,
+    reference_price: float,
+) -> float:
+    from .v1_elasticity import compute_price_multiplier
+
+    tmp = test_df.copy().reset_index(drop=True)
+    tmp["baseline_sales_pred"] = pd.to_numeric(pd.Series(pred_baseline_sales), errors="coerce").fillna(0.0).clip(lower=0.0)
+    adjusted_sales = []
+    for _, row in tmp.iterrows():
+        month_key = str(pd.Timestamp(row["date"]).to_period("M"))
+        elasticity = float(elasticity_map.get(month_key, pooled_elasticity))
+        multiplier = compute_price_multiplier(float(row["price"]), float(reference_price), elasticity)
+        adjusted_sales.append(float(row["baseline_sales_pred"]) * float(multiplier))
+    tmp["e2e_pred_sales"] = adjusted_sales
+    return _eval_wape(tmp["sales"], tmp["e2e_pred_sales"])
+
+
+def _build_holdout_diag(test_df: pd.DataFrame, pred_sales: np.ndarray) -> pd.DataFrame:
+    diag = test_df.copy().reset_index(drop=True)
+    diag["pred_sales"] = pd.to_numeric(pd.Series(pred_sales), errors="coerce").fillna(0.0).clip(lower=0.0)
+    diag["residual"] = diag["pred_sales"] - diag["sales"]
+    diag["abs_error"] = (diag["pred_sales"] - diag["sales"]).abs()
+    diag["bias_pct"] = np.where(diag["sales"] > 0, (diag["pred_sales"] - diag["sales"]) / diag["sales"], np.nan)
+    diag["month"] = pd.to_datetime(diag["date"]).dt.to_period("M").astype(str)
+    diag["dow_name"] = pd.to_datetime(diag["date"]).dt.day_name()
+    return diag
+
+
+def _summarize_holdout_diag(diag: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    if len(diag) == 0 or group_col not in diag.columns:
+        return pd.DataFrame()
+    out = diag.groupby(group_col, dropna=False).agg(
+        actual_mean=("sales", "mean"),
+        pred_mean=("pred_sales", "mean"),
+        abs_error_mean=("abs_error", "mean"),
+        days=("sales", "size"),
+    ).reset_index()
+    out["bias_pct"] = np.where(out["actual_mean"] > 0, (out["pred_mean"] - out["actual_mean"]) / out["actual_mean"], np.nan)
+    return out.sort_values(group_col)
+
+
 def _make_future_dates(last_date: pd.Timestamp, horizon_days: int) -> pd.DataFrame:
     return pd.DataFrame({"date": pd.date_range(pd.Timestamp(last_date) + pd.Timedelta(days=1), periods=int(horizon_days), freq="D")})
 
@@ -67,10 +112,12 @@ def can_recommend_price(price_signal: Dict[str, Any], holdout_metrics: Dict[str,
         reasons.append("price_changes_below_min")
     if float(price_signal.get("rel_price_span", 0.0)) < CONFIG["MIN_REL_PRICE_SPAN"]:
         reasons.append("rel_price_span_below_min")
-    if float(holdout_metrics.get("wape", 100.0)) > 35:
+    if float(holdout_metrics.get("e2e_wape", holdout_metrics.get("wape", 100.0))) > 35:
         reasons.append("holdout_wape_above_threshold")
     if str(data_quality.get("level", "unknown")) in {"poor", "unavailable"}:
         reasons.append("data_quality_too_low")
+    if bool(data_quality.get("can_recommend", True)) is False:
+        reasons.append("data_quality_blocks_recommendation")
     return len(reasons) == 0, reasons
 
 
@@ -94,21 +141,46 @@ def run_full_pricing_analysis_universal_v1(
     train_df = daily_base.iloc[:train_end].copy()
     test_df = daily_base.iloc[val_end:].copy()
 
-    baseline_models = train_v1_baseline_model(train_df, feature_spec, small_mode=len(train_df) < 120)
+    baseline_models_bt = train_v1_baseline_model(train_df, feature_spec, small_mode=len(train_df) < 120)
+    baseline_models_final = train_v1_baseline_model(daily_base, feature_spec, small_mode=len(daily_base) < 120)
+    elasticity_info_bt = estimate_v1_elasticity(train_df)
+    elasticity_info_final = estimate_v1_elasticity(daily_base)
+
+    holdout_diag = pd.DataFrame()
+    holdout_by_month = pd.DataFrame()
+    holdout_by_dow = pd.DataFrame()
     if len(test_df):
         holdout_frame = test_df.reindex(columns=feature_spec["baseline_features"], fill_value=np.nan)
-        pred_log, _ = predict_v1_baseline_log(holdout_frame, baseline_models, feature_spec)
-        pred_test = np.expm1(pred_log)
-        holdout_metrics = {"wape": _eval_wape(test_df["sales"], pd.Series(pred_test, index=test_df.index))}
+        pred_log_bt, _ = predict_v1_baseline_log(holdout_frame, baseline_models_bt, feature_spec)
+        pred_test_bt = np.expm1(pred_log_bt)
+        baseline_holdout_wape = _eval_wape(test_df["sales"], pd.Series(pred_test_bt, index=test_df.index))
+        reference_price_bt = float(train_df["price"].median()) if len(train_df) else float(daily_base["price"].median())
+        e2e_holdout_wape = _eval_e2e_holdout_wape(
+            test_df=test_df,
+            pred_baseline_sales=pred_test_bt,
+            elasticity_map=elasticity_info_bt["elasticity_by_month"],
+            pooled_elasticity=float(elasticity_info_bt["pooled_elasticity"]),
+            reference_price=reference_price_bt,
+        )
+        holdout_metrics = {"baseline_wape": baseline_holdout_wape, "e2e_wape": e2e_holdout_wape, "wape": e2e_holdout_wape}
+        holdout_diag = _build_holdout_diag(test_df, pred_test_bt)
+        holdout_by_month = _summarize_holdout_diag(holdout_diag, "month")
+        holdout_by_dow = _summarize_holdout_diag(holdout_diag, "dow_name")
     else:
-        holdout_metrics = {"wape": 100.0}
+        holdout_metrics = {"baseline_wape": 100.0, "e2e_wape": 100.0, "wape": 100.0}
 
     price_signal = evaluate_price_signal(daily_base)
-    elasticity_info = estimate_v1_elasticity(train_df)
 
     history_days = int((daily_base["date"].max() - daily_base["date"].min()).days + 1)
     missing_share = float(txn.isna().mean().mean()) if len(txn) else 1.0
     data_quality = assess_data_quality(history_days, len(daily_base), missing_share, float(holdout_metrics.get("wape", 100.0)))
+    upstream_quality = normalized_txn.attrs.get("normalization_quality", {}) if hasattr(normalized_txn, "attrs") else {}
+    if bool(upstream_quality.get("can_recommend")) is False:
+        data_quality["can_recommend"] = False
+        data_quality["level"] = "poor"
+        data_quality["confidence_cap"] = min(float(data_quality.get("confidence_cap", 0.5)), 0.55)
+    if str(upstream_quality.get("data_quality", "")).lower() == "poor":
+        data_quality["level"] = "poor"
     can_rec, rec_reasons = can_recommend_price(price_signal, holdout_metrics, data_quality)
 
     base_ctx = _build_base_ctx(daily_base, target_category, target_sku)
@@ -116,11 +188,11 @@ def run_full_pricing_analysis_universal_v1(
 
     rec = recommend_v1_price_horizon(
         latest_row,
-        baseline_models,
+        baseline_models_final,
         daily_base,
         base_ctx,
-        elasticity_info["elasticity_by_month"],
-        float(elasticity_info["pooled_elasticity"]),
+        elasticity_info_final["elasticity_by_month"],
+        float(elasticity_info_final["pooled_elasticity"]),
         feature_spec,
         n_days=int(horizon_days),
         objective_mode=objective_mode,
@@ -133,11 +205,11 @@ def run_full_pricing_analysis_universal_v1(
         latest_row,
         base_ctx["price"],
         future_dates,
-        baseline_models,
+        baseline_models_final,
         daily_base,
         base_ctx,
-        elasticity_info["elasticity_by_month"],
-        float(elasticity_info["pooled_elasticity"]),
+        elasticity_info_final["elasticity_by_month"],
+        float(elasticity_info_final["pooled_elasticity"]),
         feature_spec,
         risk_lambda=float(risk_lambda),
     )
@@ -146,13 +218,42 @@ def run_full_pricing_analysis_universal_v1(
         latest_row,
         optimal_price,
         future_dates,
-        baseline_models,
+        baseline_models_final,
         daily_base,
         base_ctx,
-        elasticity_info["elasticity_by_month"],
-        float(elasticity_info["pooled_elasticity"]),
+        elasticity_info_final["elasticity_by_month"],
+        float(elasticity_info_final["pooled_elasticity"]),
         feature_spec,
         risk_lambda=float(risk_lambda),
+    )
+
+    drift_summary = pd.DataFrame(
+        [
+            {
+                "segment": "train",
+                "sales_mean": train_df["sales"].mean(),
+                "price_mean": train_df["price"].mean(),
+                "discount_mean": train_df["discount"].mean(),
+            },
+            {
+                "segment": "last_30",
+                "sales_mean": daily_base.tail(30)["sales"].mean(),
+                "price_mean": daily_base.tail(30)["price"].mean(),
+                "discount_mean": daily_base.tail(30)["discount"].mean(),
+            },
+            {
+                "segment": "last_60",
+                "sales_mean": daily_base.tail(60)["sales"].mean(),
+                "price_mean": daily_base.tail(60)["price"].mean(),
+                "discount_mean": daily_base.tail(60)["discount"].mean(),
+            },
+            {
+                "segment": "last_90",
+                "sales_mean": daily_base.tail(90)["sales"].mean(),
+                "price_mean": daily_base.tail(90)["price"].mean(),
+                "discount_mean": daily_base.tail(90)["discount"].mean(),
+            },
+        ]
     )
 
     confidence = _compute_confidence(float(holdout_metrics.get("wape", 100.0)), float(data_quality.get("confidence_cap", 0.5)), can_rec)
@@ -173,7 +274,7 @@ def run_full_pricing_analysis_universal_v1(
         current_volume=float(current_sim["total_volume"]),
         recommended_volume=float(optimal_sim["total_volume"] if can_rec else current_sim["total_volume"]),
         confidence=confidence,
-        elasticity=float(elasticity_info["pooled_elasticity"]),
+        elasticity=float(elasticity_info_final["pooled_elasticity"]),
         history_days=history_days,
         data_quality=data_quality,
         base_ctx=base_ctx,
@@ -197,6 +298,10 @@ def run_full_pricing_analysis_universal_v1(
         daily_base.to_excel(writer, sheet_name="history", index=False)
         current_sim["daily"].to_excel(writer, sheet_name="baseline", index=False)
         optimal_sim["daily"].to_excel(writer, sheet_name="optimal", index=False)
+        holdout_diag.to_excel(writer, sheet_name="holdout_diag", index=False)
+        holdout_by_month.to_excel(writer, sheet_name="holdout_by_month", index=False)
+        holdout_by_dow.to_excel(writer, sheet_name="holdout_by_dow", index=False)
+        drift_summary.to_excel(writer, sheet_name="drift_summary", index=False)
         pd.DataFrame([holdout_metrics]).to_excel(writer, sheet_name="metrics", index=False)
     excel_buffer.seek(0)
 
@@ -212,7 +317,7 @@ def run_full_pricing_analysis_universal_v1(
         "forecast_optimal": optimal_sim["daily"],
         "profit_curve": pd.DataFrame(rec.get("results", [])),
         "holdout_metrics": pd.DataFrame([holdout_metrics]),
-        "elasticity_map": elasticity_info["elasticity_by_month"],
+        "elasticity_map": elasticity_info_final["elasticity_by_month"],
         "current_price": float(base_ctx["price"]),
         "best_price": float(base_ctx["price"] if not can_rec else optimal_price),
         "current_profit": current_profit_raw,
@@ -228,14 +333,15 @@ def run_full_pricing_analysis_universal_v1(
         "excel_buffer": excel_buffer,
         "business_recommendation": biz_rec,
         "_trained_bundle": {
-            "baseline_models": baseline_models,
+            "baseline_models": baseline_models_final,
+            "baseline_models_backtest": baseline_models_bt,
             "feature_spec": feature_spec,
             "daily_base": daily_base,
             "base_ctx": base_ctx,
             "latest_row": latest_row,
             "future_dates": future_dates,
-            "elasticity_map": elasticity_info["elasticity_by_month"],
-            "pooled_elasticity": float(elasticity_info["pooled_elasticity"]),
+            "elasticity_map": elasticity_info_final["elasticity_by_month"],
+            "pooled_elasticity": float(elasticity_info_final["pooled_elasticity"]),
             "price_signal": price_signal,
             "confidence": confidence,
             "data_quality": data_quality,
