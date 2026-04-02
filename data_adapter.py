@@ -38,12 +38,13 @@ def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.Dat
 
 def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = apply_mapping(df, mapping)
-    quality: Dict[str, Any] = {"warnings": [], "errors": [], "raw_stats": {}}
+    quality: Dict[str, Any] = {"warnings": [], "errors": [], "raw_stats": {}, "can_recommend": True, "data_quality": "ok"}
 
     required = canonical_required_fields()
     missing_required = [c for c in required if c not in out.columns]
     if missing_required:
         quality["errors"].append(f"Отсутствуют обязательные поля: {missing_required}")
+        out.attrs["normalization_quality"] = quality
         return out, quality
 
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
@@ -156,6 +157,7 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
     checks = run_data_quality_checks(out, raw_stats=quality.get("raw_stats", {}))
     quality["warnings"].extend(checks.get("warnings", []))
     quality["stats"] = checks.get("stats", {})
+    out.attrs["normalization_quality"] = quality
     return out, quality
 
 

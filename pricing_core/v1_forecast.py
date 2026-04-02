@@ -17,7 +17,16 @@ def train_v1_baseline_model(
     feats = list(feature_spec.get("baseline_features", []))
     X = clean_feature_frame(train_df, feats)[feats]
     y = pd.to_numeric(train_df.get("log_sales", np.log1p(train_df.get("sales", 0.0))), errors="coerce").fillna(0.0)
-    return build_models(X, y, feats, kind="baseline", small_mode=small_mode, cat_features=feature_spec.get("cat_features_baseline", []))
+    weights = pd.Series(np.linspace(1.0, 1.8, num=len(train_df)), index=train_df.index)
+    return build_models(
+        X,
+        y,
+        feats,
+        kind="baseline",
+        small_mode=small_mode,
+        cat_features=feature_spec.get("cat_features_baseline", []),
+        sample_weight=weights,
+    )
 
 
 def predict_v1_baseline_log(
