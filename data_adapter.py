@@ -118,6 +118,8 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
                 "Обнаружен смешанный формат discount_rate: часть строк похожа на rate, часть на absolute amount. "
                 "Для корректного расчёта нужен отдельный столбец discount_amount."
             )
+            quality["can_recommend"] = False
+            quality["data_quality"] = "poor"
 
         if (raw_rate > 1.0).all():
             out["discount_rate"] = (
