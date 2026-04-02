@@ -38,7 +38,7 @@ def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.Dat
 
 def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = apply_mapping(df, mapping)
-    quality: Dict[str, Any] = {"warnings": [], "errors": [], "raw_stats": {}}
+    quality: Dict[str, Any] = {"warnings": [], "errors": [], "raw_stats": {}, "can_recommend": True, "data_quality": "good"}
 
     required = canonical_required_fields()
     missing_required = [c for c in required if c not in out.columns]
@@ -118,6 +118,8 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
                 "Обнаружен смешанный формат discount_rate: часть строк похожа на rate, часть на absolute amount. "
                 "Для корректного расчёта нужен отдельный столбец discount_amount."
             )
+            quality["can_recommend"] = False
+            quality["data_quality"] = "poor"
 
         if (raw_rate > 1.0).all():
             out["discount_rate"] = (

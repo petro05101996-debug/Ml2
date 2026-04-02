@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook
 
 from data_adapter import normalize_transactions
 from data_adapter import build_daily_from_transactions_scoped
@@ -144,3 +145,61 @@ def test_normalize_transactions_warns_on_mixed_discount_rate_scale():
     }
     _, quality = normalize_transactions(raw, mapping)
     assert any("смешанный формат discount_rate" in w.lower() for w in quality.get("warnings", []))
+    assert quality.get("can_recommend") is False
+    assert quality.get("data_quality") == "poor"
+
+
+def test_v1_final_model_is_trained_on_full_daily_base(monkeypatch):
+    import pricing_core.v1_orchestrator as orch
+
+    train_lengths = []
+    orig_train = orch.train_v1_baseline_model
+
+    def _spy(train_df, feature_spec, small_mode=False):
+        train_lengths.append(len(train_df))
+        return orig_train(train_df, feature_spec, small_mode=small_mode)
+
+    monkeypatch.setattr(orch, "train_v1_baseline_model", _spy)
+    out = orch.run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1")
+    assert len(train_lengths) >= 2
+    assert max(train_lengths) == len(out["daily"])
+    assert min(train_lengths) == len(out["_trained_bundle"]["train_df"])
+    assert max(train_lengths) > min(train_lengths)
+
+
+def test_v1_holdout_metrics_include_baseline_and_e2e_wape():
+    out = run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1")
+    metrics = out["holdout_metrics"].iloc[0].to_dict()
+    assert "baseline_wape" in metrics
+    assert "e2e_wape" in metrics
+    assert np.isfinite(float(metrics["baseline_wape"]))
+    assert np.isfinite(float(metrics["e2e_wape"]))
+
+
+def test_v1_excel_contains_holdout_and_drift_sheets():
+    out = run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1")
+    wb = load_workbook(out["excel_buffer"], read_only=True)
+    for sheet in {"holdout_diag", "holdout_by_month", "holdout_by_dow", "drift_summary"}:
+        assert sheet in wb.sheetnames
+
+
+def test_v1_baseline_wape_is_deterministic_between_runs():
+    out1 = run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1")
+    out2 = run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1")
+    w1 = float(out1["holdout_metrics"]["baseline_wape"].iloc[0])
+    w2 = float(out2["holdout_metrics"]["baseline_wape"].iloc[0])
+    assert np.isclose(w1, w2)
+
+
+def test_v1_mixed_discount_blocks_price_recommendation():
+    mixed = _make_txn(days=120).copy()
+    mixed["discount_rate"] = np.where(np.arange(len(mixed)) % 2 == 0, 0.1, 15.0)
+    out = run_full_pricing_analysis_universal_v1(mixed, "cat-a", "sku-1")
+    bundle = out["_trained_bundle"]
+    assert bundle["can_recommend_price"] is False
+    assert out["best_price"] == out["current_price"]
+
+
+def test_v1_features_include_trend_gap_fields():
+    assert "sales_ma14" in V1_BASELINE_FEATURES
+    assert "sales_trend_gap_7_28" in V1_BASELINE_FEATURES

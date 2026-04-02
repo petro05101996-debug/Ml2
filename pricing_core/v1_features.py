@@ -10,8 +10,10 @@ V1_BASELINE_FEATURES = [
     "sales_lag7",
     "sales_lag28",
     "sales_ma7",
+    "sales_ma14",
     "sales_ma28",
     "sales_std28",
+    "sales_trend_gap_7_28",
     "freight_value",
     "review_score",
     "promotion",
@@ -51,8 +53,10 @@ def build_v1_feature_matrix(daily: pd.DataFrame) -> pd.DataFrame:
     out["sales_lag7"] = out["sales"].shift(7)
     out["sales_lag28"] = out["sales"].shift(28)
     out["sales_ma7"] = out["sales"].shift(1).rolling(7, min_periods=3).mean()
+    out["sales_ma14"] = out["sales"].shift(1).rolling(14, min_periods=5).mean()
     out["sales_ma28"] = out["sales"].shift(1).rolling(28, min_periods=7).mean()
     out["sales_std28"] = out["sales"].shift(1).rolling(28, min_periods=7).std()
+    out["sales_trend_gap_7_28"] = out["sales_ma7"] - out["sales_ma28"]
 
     out["dow"] = out["date"].dt.dayofweek
     out["is_weekend"] = (out["dow"] >= 5).astype(float)
@@ -71,8 +75,10 @@ def build_v1_feature_matrix(daily: pd.DataFrame) -> pd.DataFrame:
     out["sales_lag28"] = out["sales_lag28"].fillna(out["sales_lag7"]).fillna(out["sales_lag1"]).fillna(0.0)
 
     out["sales_ma7"] = out["sales_ma7"].fillna(prev_mean).fillna(0.0)
+    out["sales_ma14"] = out["sales_ma14"].fillna(prev_mean).fillna(0.0)
     out["sales_ma28"] = out["sales_ma28"].fillna(prev_mean).fillna(0.0)
     out["sales_std28"] = out["sales_std28"].fillna(0.0)
+    out["sales_trend_gap_7_28"] = out["sales_trend_gap_7_28"].fillna(0.0)
 
     for c in V1_BASELINE_FEATURES:
         if c not in out.columns:
@@ -96,8 +102,10 @@ def build_v1_one_step_features(
     hist = history_df.copy()
     sales = pd.to_numeric(hist.get("sales", 0.0), errors="coerce").fillna(0.0)
     ma7 = float(sales.tail(7).mean()) if len(sales) else 0.0
+    ma14 = float(sales.tail(14).mean()) if len(sales) else ma7
     ma28 = float(sales.tail(28).mean()) if len(sales) else ma7
     std28 = float(sales.tail(28).std(ddof=0)) if len(sales) > 1 else 0.0
+    trend_gap_7_28 = ma7 - ma28
 
     day_of_year = int(current_date.dayofyear)
     month = int(current_date.month)
@@ -108,8 +116,10 @@ def build_v1_one_step_features(
         "sales_lag7": _get_sales(hist, 7),
         "sales_lag28": _get_sales(hist, 28),
         "sales_ma7": ma7,
+        "sales_ma14": ma14,
         "sales_ma28": ma28,
         "sales_std28": std28,
+        "sales_trend_gap_7_28": trend_gap_7_28,
         "freight_value": float(base_ctx.get("freight_value", 0.0)),
         "review_score": float(base_ctx.get("review_score", 4.5)),
         "promotion": float(base_ctx.get("promotion", 0.0)),
