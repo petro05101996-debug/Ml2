@@ -15,6 +15,9 @@ from .v1_features import build_v1_feature_matrix, derive_v1_feature_spec
 from .v1_forecast import predict_v1_baseline_log, train_v1_baseline_model
 from .v1_optimizer import recommend_v1_price_horizon, simulate_v1_horizon_profit
 
+V1_ANALYSIS_ENGINE = "v1_universal"
+V1_ANALYSIS_ENGINE_VERSION = "v1_universal_2026_04_route_check"
+
 
 def _safe_split_sizes(n: int) -> Tuple[int, int]:
     train_end = max(3, int(n * 0.7))
@@ -128,6 +131,8 @@ def run_full_pricing_analysis_universal_v1(
     objective_mode: str = "maximize_profit",
     horizon_days: int = 30,
     risk_lambda: float = 0.7,
+    analysis_route: str = "",
+    ui_load_mode: str = "",
 ) -> Dict[str, Any]:
     txn = normalized_txn.copy()
     daily_base = build_daily_from_transactions_scoped(txn, target_sku, target_category)
@@ -293,6 +298,17 @@ def run_full_pricing_analysis_universal_v1(
     if rec_reasons:
         biz_rec["decision_reasons"] = rec_reasons
 
+    result_stub = {
+        "analysis_engine": V1_ANALYSIS_ENGINE,
+        "analysis_engine_version": V1_ANALYSIS_ENGINE_VERSION,
+        "analysis_route": analysis_route,
+        "ui_load_mode": ui_load_mode,
+    }
+    holdout_metrics["analysis_engine"] = result_stub["analysis_engine"]
+    holdout_metrics["analysis_engine_version"] = result_stub["analysis_engine_version"]
+    holdout_metrics["analysis_route"] = result_stub.get("analysis_route", "unknown")
+    holdout_metrics["ui_load_mode"] = result_stub.get("ui_load_mode", "unknown")
+
     excel_buffer = BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
         daily_base.to_excel(writer, sheet_name="history", index=False)
@@ -303,6 +319,16 @@ def run_full_pricing_analysis_universal_v1(
         holdout_by_dow.to_excel(writer, sheet_name="holdout_by_dow", index=False)
         drift_summary.to_excel(writer, sheet_name="drift_summary", index=False)
         pd.DataFrame([holdout_metrics]).to_excel(writer, sheet_name="metrics", index=False)
+        run_info = pd.DataFrame(
+            [
+                {"key": "analysis_engine", "value": result_stub["analysis_engine"]},
+                {"key": "analysis_engine_version", "value": result_stub["analysis_engine_version"]},
+                {"key": "analysis_route", "value": result_stub.get("analysis_route", "")},
+                {"key": "ui_load_mode", "value": result_stub.get("ui_load_mode", "")},
+                {"key": "generated_at_utc", "value": pd.Timestamp.utcnow().isoformat()},
+            ]
+        )
+        run_info.to_excel(writer, sheet_name="run_info", index=False)
     excel_buffer.seek(0)
 
     current_profit_raw = float(current_sim["total_profit"])
@@ -332,6 +358,10 @@ def run_full_pricing_analysis_universal_v1(
         "data_quality": data_quality,
         "excel_buffer": excel_buffer,
         "business_recommendation": biz_rec,
+        "analysis_engine": result_stub["analysis_engine"],
+        "analysis_engine_version": result_stub["analysis_engine_version"],
+        "analysis_route": result_stub["analysis_route"],
+        "ui_load_mode": result_stub["ui_load_mode"],
         "_trained_bundle": {
             "baseline_models": baseline_models_final,
             "baseline_models_backtest": baseline_models_bt,

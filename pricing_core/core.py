@@ -37,6 +37,9 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 
 np.random.seed(42)
 
+LEGACY_ANALYSIS_ENGINE = "legacy_core"
+LEGACY_ANALYSIS_ENGINE_VERSION = "legacy_core_2026_04_route_check"
+
 try:
     import statsmodels.api as sm
     from statsmodels.tools.tools import add_constant
@@ -1626,6 +1629,8 @@ def run_full_pricing_analysis(
     target_sku: str,
     horizon_days: int = CONFIG["HORIZON_DAYS_DEFAULT"],
     risk_lambda: float = 0.7,
+    analysis_route: str = "",
+    ui_load_mode: str = "",
 ):
     raw_df = build_raw_frame(orders, order_items, products, reviews)
     if len(raw_df) == 0:
@@ -1751,6 +1756,17 @@ def run_full_pricing_analysis(
         reason_hints=reason_hints,
     )
 
+    result_stub = {
+        "analysis_engine": LEGACY_ANALYSIS_ENGINE,
+        "analysis_engine_version": LEGACY_ANALYSIS_ENGINE_VERSION,
+        "analysis_route": analysis_route,
+        "ui_load_mode": ui_load_mode,
+    }
+    holdout_metrics["analysis_engine"] = result_stub["analysis_engine"]
+    holdout_metrics["analysis_engine_version"] = result_stub["analysis_engine_version"]
+    holdout_metrics["analysis_route"] = result_stub.get("analysis_route", "unknown")
+    holdout_metrics["ui_load_mode"] = result_stub.get("ui_load_mode", "unknown")
+
     excel_buffer = BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
         daily_base.to_excel(writer, sheet_name="История", index=False)
@@ -1759,6 +1775,16 @@ def run_full_pricing_analysis(
         profit_curve_df.to_excel(writer, sheet_name="Кривая_прибыли", index=False)
         pd.DataFrame([holdout_metrics]).to_excel(writer, sheet_name="Метрики", index=False)
         pd.DataFrame(list(shrunk_random_effects.items()), columns=["Месяц", "Эластичность"]).to_excel(writer, sheet_name="Эластичность", index=False)
+        run_info = pd.DataFrame(
+            [
+                {"key": "analysis_engine", "value": result_stub["analysis_engine"]},
+                {"key": "analysis_engine_version", "value": result_stub["analysis_engine_version"]},
+                {"key": "analysis_route", "value": result_stub.get("analysis_route", "")},
+                {"key": "ui_load_mode", "value": result_stub.get("ui_load_mode", "")},
+                {"key": "generated_at_utc", "value": pd.Timestamp.utcnow().isoformat()},
+            ]
+        )
+        run_info.to_excel(writer, sheet_name="run_info", index=False)
     excel_buffer.seek(0)
 
     profit_lift_pct = ((optimal_sim["adjusted_profit"] - current_sim["adjusted_profit"]) / max(current_sim["adjusted_profit"], 1) * 100) if current_sim["adjusted_profit"] > 0 else 0
@@ -1785,6 +1811,10 @@ def run_full_pricing_analysis(
         "excel_buffer": excel_buffer,
         "flag": decision_flag(latest_row, rec),
         "business_recommendation": biz_rec,
+        "analysis_engine": result_stub["analysis_engine"],
+        "analysis_engine_version": result_stub["analysis_engine_version"],
+        "analysis_route": result_stub["analysis_route"],
+        "ui_load_mode": result_stub["ui_load_mode"],
         "_trained_bundle": {
             "direct_models": direct_models,
             "baseline_models": baseline_models,

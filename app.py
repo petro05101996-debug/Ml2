@@ -309,6 +309,15 @@ def render_scenario_lab(r: Dict[str, Any]) -> None:
 def render_results_page(r: Dict[str, Any]) -> None:
     st.markdown('<div class="page-title">Результаты</div>', unsafe_allow_html=True)
     st.markdown('<div class="muted">Слой результатов, ориентированный на решение.</div>', unsafe_allow_html=True)
+    engine = r.get("analysis_engine", "unknown")
+    engine_ver = r.get("analysis_engine_version", "unknown")
+    route = r.get("analysis_route", "unknown")
+    load_mode = r.get("ui_load_mode", "unknown")
+    engine_line = f"Engine: {engine} | Version: {engine_ver} | Route: {route} | Load mode: {load_mode}"
+    if hasattr(st, "info"):
+        st.info(engine_line)
+    else:
+        st.markdown(engine_line)
     decision = build_main_decision_text(r)
     biz = r.get("business_recommendation", {})
     structured = biz.get("structured", {}) if isinstance(biz, dict) else {}
@@ -417,7 +426,10 @@ if st.session_state.results is not None:
             st.session_state.active_page = "Настройка"
             st.rerun()
     with top2:
-        st.download_button("Скачать Excel-отчёт", data=st.session_state.results["excel_buffer"], file_name=f"pricing_report_{st.session_state.get('selected_sku_for_results', 'report')}.xlsx", use_container_width=True)
+        engine = st.session_state.results.get("analysis_engine", "unknown")
+        sku = st.session_state.results.get("sku", st.session_state.get("selected_sku_for_results", "report"))
+        file_name = f"pricing_report_{sku}_{engine}.xlsx"
+        st.download_button("Скачать Excel-отчёт", data=st.session_state.results["excel_buffer"], file_name=file_name, use_container_width=True)
 
 if active_page == "Обзор":
     render_overview()
