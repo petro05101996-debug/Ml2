@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
-import base64
 
 import numpy as np
 import pandas as pd
@@ -83,13 +82,13 @@ def _render_excel_download_link(file_name: str, excel_payload: Any) -> None:
     if not isinstance(data_bytes, (bytes, bytearray)):
         st.warning("Не удалось подготовить Excel для скачивания.")
         return
-    b64_payload = base64.b64encode(bytes(data_bytes)).decode("utf-8")
-    st.markdown(
-        f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_payload}" '
-        f'download="{file_name}" style="text-decoration:none;">'
-        '<div style="display:flex;align-items:center;justify-content:center;width:100%;padding:0.65rem 1rem;border-radius:0.65rem;'
-        'border:1px solid rgba(255,255,255,0.16);background:#1f77ff;color:#fff;font-weight:600;">Скачать Excel-отчёт</div></a>',
-        unsafe_allow_html=True,
+    st.download_button(
+        label="Скачать Excel-отчёт",
+        data=bytes(data_bytes),
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key=f"excel_download_{file_name}",
     )
 
 def _base_plotly_layout(title: str) -> Dict[str, Any]:
@@ -331,10 +330,10 @@ def render_results_page(r: Dict[str, Any]) -> None:
     route = r.get("analysis_route", "unknown")
     load_mode = r.get("ui_load_mode", "unknown")
     engine_line = f"Engine: {engine} | Version: {engine_ver} | Route: {route} | Load mode: {load_mode}"
-    if hasattr(st, "info"):
-        st.info(engine_line)
+    if hasattr(st, "caption"):
+        st.caption(f"Технический режим анализа: {engine_line}")
     else:
-        st.markdown(engine_line)
+        st.markdown(f"Технический режим анализа: {engine_line}")
     decision = build_main_decision_text(r)
     biz = r.get("business_recommendation", {})
     structured = biz.get("structured", {}) if isinstance(biz, dict) else {}
@@ -446,7 +445,11 @@ if st.session_state.results is not None:
         engine = st.session_state.results.get("analysis_engine", "unknown")
         sku = st.session_state.results.get("sku", st.session_state.get("selected_sku_for_results", "report"))
         file_name = f"pricing_report_{sku}_{engine}.xlsx"
-        _render_excel_download_link(file_name=file_name, excel_payload=st.session_state.results["excel_buffer"])
+        excel_payload = st.session_state.results.get("excel_buffer")
+        if excel_payload is None:
+            st.warning("Excel-отчёт недоступен для этого запуска. Повторите анализ.")
+        else:
+            _render_excel_download_link(file_name=file_name, excel_payload=excel_payload)
 
 if active_page == "Обзор":
     render_overview()
