@@ -23,7 +23,7 @@ def test_run_analysis_from_context_handles_non_seekable_inputs(monkeypatch):
         captured["target_category"] = target_category
         captured["target_sku"] = target_sku
         captured["kwargs"] = kwargs
-        return {"ok": True}
+        return {"ok": True, "analysis_engine": "legacy_core"}
 
     monkeypatch.setattr(runner, "run_full_pricing_analysis", fake_run_full_pricing_analysis)
 
@@ -41,7 +41,10 @@ def test_run_analysis_from_context_handles_non_seekable_inputs(monkeypatch):
 
     out = runner.run_analysis_from_context(ctx)
 
-    assert out == {"ok": True}
+    assert out["ok"] is True
+    assert out["analysis_engine"] == "legacy_core"
+    assert out["analysis_route"] == "runner_to_legacy_core"
+    assert out["ui_load_mode"] == "Legacy Olist (3 CSV)"
     assert captured["target_category"] == "cat"
     assert captured["target_sku"] == "sku-1"
     assert captured["kwargs"]["horizon_days"] == 14
@@ -57,7 +60,7 @@ def test_run_analysis_from_context_supports_russian_universal_load_mode(monkeypa
         captured["target_category"] = target_category
         captured["target_sku"] = target_sku
         captured["kwargs"] = kwargs
-        return {"ok": True}
+        return {"ok": True, "analysis_engine": "v1_universal"}
 
     monkeypatch.setattr(runner, "run_full_pricing_analysis_universal_v1", fake_run_full_pricing_analysis_universal_v1)
 
@@ -73,7 +76,10 @@ def test_run_analysis_from_context_supports_russian_universal_load_mode(monkeypa
 
     out = runner.run_analysis_from_context(ctx)
 
-    assert out == {"ok": True}
+    assert out["ok"] is True
+    assert out["analysis_engine"] == "v1_universal"
+    assert out["analysis_route"] == "runner_to_v1_universal"
+    assert out["ui_load_mode"] == "Универсальный CSV"
     assert captured["universal_txn"].equals(universal_df)
     assert captured["target_category"] == "cat"
     assert captured["target_sku"] == "sku-1"

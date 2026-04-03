@@ -38,46 +38,61 @@ def run_analysis_from_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
     risk_lambda = float(caution_to_risk_lambda.get(selected_caution, 0.7))
 
     if load_mode in UNIVERSAL_LOAD_MODES:
-        return run_full_pricing_analysis_universal_v1(
+        analysis_route = "runner_to_v1_universal"
+        result = run_full_pricing_analysis_universal_v1(
             ctx["universal_txn"],
             target_category,
             target_sku,
             objective_mode=ctx.get("objective_mode", "maximize_profit"),
             horizon_days=horizon_days,
             risk_lambda=risk_lambda,
+            analysis_route=analysis_route,
+            ui_load_mode=str(load_mode),
         )
+        if result.get("analysis_engine") != "v1_universal":
+            raise RuntimeError("Expected v1_universal engine but got a different analysis_engine marker.")
+        result["analysis_route"] = analysis_route
+    else:
+        analysis_route = "runner_to_legacy_core"
+        orders_file = ctx.get("orders_file")
+        items_file = ctx.get("items_file")
+        products_file = ctx.get("products_file")
+        reviews_file = ctx.get("reviews_file")
 
-    orders_file = ctx.get("orders_file")
-    items_file = ctx.get("items_file")
-    products_file = ctx.get("products_file")
-    reviews_file = ctx.get("reviews_file")
+        orders = _read_csv_input(orders_file)
+        items = _read_csv_input(items_file)
+        products = _read_csv_input(products_file)
+        reviews = _read_csv_input(reviews_file) if reviews_file is not None else pd.DataFrame()
 
-    orders = _read_csv_input(orders_file)
-    items = _read_csv_input(items_file)
-    products = _read_csv_input(products_file)
-    reviews = _read_csv_input(reviews_file) if reviews_file is not None else pd.DataFrame()
+        if ctx.get("orders_col_map"):
+            orders = orders.rename(columns=ctx["orders_col_map"])
+        if ctx.get("items_col_map"):
+            items = items.rename(columns=ctx["items_col_map"])
+        if ctx.get("products_col_map"):
+            products = products.rename(columns=ctx["products_col_map"])
+        if ctx.get("reviews_col_map") and len(reviews):
+            reviews = reviews.rename(columns=ctx["reviews_col_map"])
 
-    if ctx.get("orders_col_map"):
-        orders = orders.rename(columns=ctx["orders_col_map"])
-    if ctx.get("items_col_map"):
-        items = items.rename(columns=ctx["items_col_map"])
-    if ctx.get("products_col_map"):
-        products = products.rename(columns=ctx["products_col_map"])
-    if ctx.get("reviews_col_map") and len(reviews):
-        reviews = reviews.rename(columns=ctx["reviews_col_map"])
+        if "order_item_id" not in items.columns:
+            items["order_item_id"] = np.arange(1, len(items) + 1)
+        if "freight_value" not in items.columns:
+            items["freight_value"] = 0.0
 
-    if "order_item_id" not in items.columns:
-        items["order_item_id"] = np.arange(1, len(items) + 1)
-    if "freight_value" not in items.columns:
-        items["freight_value"] = 0.0
+        result = run_full_pricing_analysis(
+            orders,
+            items,
+            products,
+            reviews,
+            target_category,
+            target_sku,
+            horizon_days=horizon_days,
+            risk_lambda=risk_lambda,
+            analysis_route=analysis_route,
+            ui_load_mode=str(load_mode),
+        )
+        if result.get("analysis_engine") != "legacy_core":
+            raise RuntimeError("Expected legacy_core engine but got a different analysis_engine marker.")
+        result["analysis_route"] = analysis_route
 
-    return run_full_pricing_analysis(
-        orders,
-        items,
-        products,
-        reviews,
-        target_category,
-        target_sku,
-        horizon_days=horizon_days,
-        risk_lambda=risk_lambda,
-    )
+    result["ui_load_mode"] = str(load_mode)
+    return result
