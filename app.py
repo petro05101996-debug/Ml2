@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import base64
 
 import numpy as np
 import pandas as pd
@@ -74,6 +75,22 @@ UI_TEXT_RU = {
 def _horizon_help_text() -> str:
     return "7–30 дней — краткосрочно, 60–90 — среднесрочно, 180+ — долгосрочное планирование."
 
+
+
+
+def _render_excel_download_link(file_name: str, excel_payload: Any) -> None:
+    data_bytes = excel_payload.getvalue() if hasattr(excel_payload, "getvalue") else excel_payload
+    if not isinstance(data_bytes, (bytes, bytearray)):
+        st.warning("Не удалось подготовить Excel для скачивания.")
+        return
+    b64_payload = base64.b64encode(bytes(data_bytes)).decode("utf-8")
+    st.markdown(
+        f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_payload}" '
+        f'download="{file_name}" style="text-decoration:none;">'
+        '<div style="display:flex;align-items:center;justify-content:center;width:100%;padding:0.65rem 1rem;border-radius:0.65rem;'
+        'border:1px solid rgba(255,255,255,0.16);background:#1f77ff;color:#fff;font-weight:600;">Скачать Excel-отчёт</div></a>',
+        unsafe_allow_html=True,
+    )
 
 def _base_plotly_layout(title: str) -> Dict[str, Any]:
     return dict(title=title, template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=20, r=20, t=60, b=20))
@@ -429,7 +446,7 @@ if st.session_state.results is not None:
         engine = st.session_state.results.get("analysis_engine", "unknown")
         sku = st.session_state.results.get("sku", st.session_state.get("selected_sku_for_results", "report"))
         file_name = f"pricing_report_{sku}_{engine}.xlsx"
-        st.download_button("Скачать Excel-отчёт", data=st.session_state.results["excel_buffer"], file_name=file_name, use_container_width=True)
+        _render_excel_download_link(file_name=file_name, excel_payload=st.session_state.results["excel_buffer"])
 
 if active_page == "Обзор":
     render_overview()
