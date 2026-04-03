@@ -5,9 +5,11 @@ from data_adapter import normalize_transactions
 from data_adapter import build_daily_from_transactions_scoped
 from pricing_core.v1_elasticity import compute_price_multiplier
 from pricing_core.v1_features import V1_BASELINE_FEATURES, build_v1_feature_matrix
+from pricing_core.v1_forecast import recursive_v1_baseline_forecast
 from pricing_core.v1_orchestrator import run_full_pricing_analysis_universal_v1
 from pricing_core.v1_scenario import run_v1_what_if_projection
 from pricing_core import v1_orchestrator as orch
+from pricing_core import v1_forecast as forecast_mod
 
 
 def _make_txn(days=120, weak_price=False):
@@ -213,3 +215,49 @@ def test_baseline_wape_is_deterministic_on_repeated_runs():
 def test_v1_features_include_new_trend_columns():
     assert "sales_ma14" in V1_BASELINE_FEATURES
     assert "sales_trend_gap_7_28" in V1_BASELINE_FEATURES
+
+
+def test_v1_split_has_no_middle_gap():
+    train_end, val_end = orch._safe_split_sizes(100)
+    assert train_end == val_end
+    sample = pd.DataFrame({"x": np.arange(100)})
+    train = sample.iloc[:train_end]
+    test = sample.iloc[val_end:]
+    assert int(train.index[-1]) + 1 == int(test.index[0])
+
+
+def test_v1_features_include_sales_same_dow_ma8():
+    assert "sales_same_dow_ma8" in V1_BASELINE_FEATURES
+    feats = build_v1_feature_matrix(build_daily_from_transactions_scoped(_make_txn(days=35), "sku-1", category="cat-a"))
+    assert "sales_same_dow_ma8" in feats.columns
+
+
+def test_v1_holdout_bias_factor_is_bounded():
+    out = run_full_pricing_analysis_universal_v1(_make_txn(days=120), "cat-a", "sku-1")
+    factor = float(out["_trained_bundle"]["baseline_bias_factor"])
+    assert 0.95 <= factor <= 1.12
+
+
+def test_v1_recursive_forecast_applies_bias_factor(monkeypatch):
+    def _fake_predict(frame, baseline_models, feature_spec):
+        return np.array([np.log1p(10.0)]), np.array([0.0])
+
+    monkeypatch.setattr(forecast_mod, "predict_v1_baseline_log", _fake_predict)
+    history = pd.DataFrame(
+        {
+            "date": pd.date_range("2025-01-01", periods=35, freq="D"),
+            "sales": np.full(35, 10.0),
+            "price": np.full(35, 100.0),
+            "cost": np.full(35, 65.0),
+            "discount": np.zeros(35),
+            "promotion": np.zeros(35),
+            "freight_value": np.full(35, 2.0),
+            "review_score": np.full(35, 4.7),
+        }
+    )
+    future = pd.DataFrame({"date": pd.date_range("2025-02-05", periods=5, freq="D")})
+    base_ctx = {"price": 100.0, "cost": 65.0, "discount": 0.0, "promotion": 0.0, "freight_value": 2.0, "review_score": 4.7}
+    feature_spec = {"baseline_features": V1_BASELINE_FEATURES, "cat_features_baseline": []}
+    pred_10 = recursive_v1_baseline_forecast([], history, future, base_ctx, feature_spec, bias_factor=1.0)
+    pred_11 = recursive_v1_baseline_forecast([], history, future, base_ctx, feature_spec, bias_factor=1.1)
+    assert float(pred_11["baseline_sales"].sum()) > float(pred_10["baseline_sales"].sum())
