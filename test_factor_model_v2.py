@@ -75,6 +75,7 @@ def test_factor_backtest_is_out_of_sample():
     bt = run_factor_rolling_backtest(ff, spec)
     assert bt["trained"] is True
     assert bt["n_valid_windows"] >= 1
+    assert "median_factor_target_rmse" in bt
 
 
 def test_price_override_changes_factor_multiplier_with_trained_factor():

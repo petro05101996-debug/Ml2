@@ -141,7 +141,14 @@ def run_baseline_rolling_backtest(panel_train: pd.DataFrame, target_category: st
     return {"rolling_diag": rolling_diag, "rolling_metrics": rolling_metrics, "rolling_summary": summary}
 
 
-def build_baseline_oof_predictions(panel_train: pd.DataFrame, target_category: str, target_sku: str, min_train_days: int = 120, step_days: int = 7, horizon_days: int = 7) -> pd.DataFrame:
+def build_baseline_oof_predictions(
+    panel_train: pd.DataFrame,
+    target_category: str,
+    target_sku: str,
+    min_train_days: int = 84,
+    step_days: int = 7,
+    horizon_days: int = 7,
+) -> pd.DataFrame:
     from pricing_core.baseline_features import derive_baseline_feature_spec
 
     target = panel_train[(panel_train["category"].astype(str) == str(target_category)) & (panel_train["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
@@ -150,25 +157,34 @@ def build_baseline_oof_predictions(panel_train: pd.DataFrame, target_category: s
     if target.empty:
         return out
 
-    unique_dates = sorted(pd.to_datetime(target["date"].dropna().unique()))
-    for i in range(int(min_train_days), len(unique_dates), int(step_days)):
-        cut = pd.Timestamp(unique_dates[i])
-        tr_target = target[target["date"] < cut].copy()
-        if tr_target["date"].nunique() < int(min_train_days):
+    target = target.reset_index(drop=True)
+    n = len(target)
+    start_idx = int(max(min_train_days, 1))
+
+    while start_idx < n:
+        train_end_date = pd.Timestamp(target.iloc[start_idx - 1]["date"])
+        test_slice = target.iloc[start_idx:start_idx + int(horizon_days)].copy()
+        if test_slice.empty:
+            break
+        test_dates_df = pd.DataFrame({"date": pd.to_datetime(test_slice["date"].values)})
+
+        panel_w = panel_train[pd.to_datetime(panel_train["date"]) <= train_end_date].copy()
+        target_w = target[pd.to_datetime(target["date"]) <= train_end_date].copy()
+        if target_w["date"].nunique() < int(min_train_days) or panel_w.empty:
+            start_idx += int(step_days)
             continue
-        te_dates = [d for d in unique_dates[i:i + int(horizon_days)]]
-        if not te_dates:
-            continue
-        te_target = target[target["date"].isin(te_dates)].copy()
-        if te_target.empty:
-            continue
-        panel_w = panel_train[panel_train["date"] < cut].copy()
-        spec = derive_baseline_feature_spec(panel_w)
-        trained = train_baseline_model(panel_w, spec, small_mode=len(panel_w) < 200, training_profile="backtest")
-        base_ctx = {k: (tr_target[k].dropna().astype(str).iloc[-1] if k in tr_target.columns and k in ["product_id", "category", "region", "channel", "segment"] else "unknown") for k in ["product_id", "category", "region", "channel", "segment"]}
-        fc = recursive_baseline_forecast(trained, tr_target, pd.DataFrame({"date": te_dates}), base_ctx, spec)
-        pred_map = dict(zip(pd.to_datetime(fc["date"]), pd.to_numeric(fc["baseline_pred"], errors="coerce")))
-        mask = out["date"].isin(te_dates) & out["baseline_oof"].isna()
-        out.loc[mask, "baseline_oof"] = out.loc[mask, "date"].map(pred_map)
+
+        spec_w = derive_baseline_feature_spec(panel_w)
+        trained_w = train_baseline_model(panel_w, spec_w, small_mode=len(panel_w) < 200, training_profile="backtest")
+        base_ctx_w = {
+            k: (target_w[k].dropna().astype(str).iloc[-1] if k in target_w.columns and k in ["product_id", "category", "region", "channel", "segment"] else "unknown")
+            for k in ["product_id", "category", "region", "channel", "segment"]
+        }
+        fc_w = recursive_baseline_forecast(trained_w, target_w, test_dates_df, base_ctx_w, spec_w)
+        pred_map = dict(zip(pd.to_datetime(fc_w["date"]), pd.to_numeric(fc_w["baseline_pred"], errors="coerce")))
+
+        mask = out["date"].isin(test_slice["date"]) & out["baseline_oof"].isna()
+        out.loc[mask, "baseline_oof"] = pd.to_datetime(out.loc[mask, "date"]).map(pred_map)
+        start_idx += int(step_days)
 
     return out.sort_values("date").reset_index(drop=True)

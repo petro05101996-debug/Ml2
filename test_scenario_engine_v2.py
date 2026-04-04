@@ -69,3 +69,18 @@ def test_invalid_shock_shape_raises():
         assert False
     except ValueError:
         assert True
+
+
+def test_scenario_mode_is_exposed():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None)
+    assert out["mode"] == "baseline_only"
+
+
+def test_baseline_override_is_used_for_scenario_path():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    override = pd.DataFrame({"date": fut["date"], "baseline_pred": [11.0, 12.0, 13.0]})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None, baseline_override_df=override)
+    assert out["scenario_forecast"]["baseline_pred"].tolist() == [11.0, 12.0, 13.0]

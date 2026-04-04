@@ -48,9 +48,12 @@ def apply_user_overrides(base_ctx: Dict[str, Any], scenario_overrides: Dict[str,
 def build_future_factor_frame(target_history: pd.DataFrame, future_dates_df: pd.DataFrame, scenario_ctx: Dict[str, Any], feature_spec: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     price_hist = pd.to_numeric(target_history.get("price", np.nan), errors="coerce").dropna()
-    recent_price_ref = float(price_hist.tail(28).median()) if len(price_hist) else 1.0
+    recent_price_ref = float(price_hist.tail(28).median()) if len(price_hist.tail(28)) else np.nan
+    if not np.isfinite(recent_price_ref) or recent_price_ref <= 0:
+        recent_price_ref = float(price_hist.median()) if len(price_hist) else 1.0
     if not np.isfinite(recent_price_ref) or recent_price_ref <= 0:
         recent_price_ref = 1.0
+
     last_vals = target_history.tail(1).to_dict("records")[0] if len(target_history) else {}
     for dt in pd.to_datetime(future_dates_df["date"], errors="coerce"):
         r: Dict[str, Any] = {"date": pd.Timestamp(dt)}
