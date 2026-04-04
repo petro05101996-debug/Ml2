@@ -14,7 +14,6 @@ V1_BASELINE_FEATURES = [
     "sales_ma28",
     "sales_trend_gap_7_28",
     "sales_std28",
-    "sales_same_dow_ma8",
     "freight_value",
     "review_score",
     "promotion",
@@ -60,10 +59,6 @@ def build_v1_feature_matrix(daily: pd.DataFrame) -> pd.DataFrame:
     out["sales_std28"] = out["sales"].shift(1).rolling(28, min_periods=7).std()
 
     out["dow"] = out["date"].dt.dayofweek
-    out["sales_same_dow_ma8"] = (
-        out.groupby("dow")["sales"]
-        .transform(lambda s: s.shift(1).rolling(8, min_periods=3).mean())
-    )
     out["is_weekend"] = (out["dow"] >= 5).astype(float)
     day_of_year = out["date"].dt.dayofyear
     out["sin_doy"] = np.sin(2 * np.pi * day_of_year / 365.25)
@@ -82,7 +77,6 @@ def build_v1_feature_matrix(daily: pd.DataFrame) -> pd.DataFrame:
     out["sales_ma7"] = out["sales_ma7"].fillna(prev_mean).fillna(0.0)
     out["sales_ma14"] = out["sales_ma14"].fillna(prev_mean).fillna(0.0)
     out["sales_ma28"] = out["sales_ma28"].fillna(prev_mean).fillna(0.0)
-    out["sales_same_dow_ma8"] = out["sales_same_dow_ma8"].fillna(out["sales_ma7"]).fillna(prev_mean).fillna(0.0)
     out["sales_trend_gap_7_28"] = out["sales_trend_gap_7_28"].fillna(0.0)
     out["sales_std28"] = out["sales_std28"].fillna(0.0)
 
@@ -112,10 +106,6 @@ def build_v1_one_step_features(
     ma28 = float(sales.tail(28).mean()) if len(sales) else ma7
     trend_gap_7_28 = ma7 - ma28
     std28 = float(sales.tail(28).std(ddof=0)) if len(sales) > 1 else 0.0
-    hist_dates = pd.to_datetime(hist["date"], errors="coerce")
-    current_dow = int(current_date.dayofweek)
-    same_dow_sales = sales[hist_dates.dt.dayofweek == current_dow]
-    sales_same_dow_ma8 = float(same_dow_sales.tail(8).mean()) if len(same_dow_sales) else ma7
 
     day_of_year = int(current_date.dayofyear)
     month = int(current_date.month)
@@ -130,7 +120,6 @@ def build_v1_one_step_features(
         "sales_ma28": ma28,
         "sales_trend_gap_7_28": trend_gap_7_28,
         "sales_std28": std28,
-        "sales_same_dow_ma8": sales_same_dow_ma8,
         "freight_value": float(base_ctx.get("freight_value", 0.0)),
         "review_score": float(base_ctx.get("review_score", 4.5)),
         "promotion": float(base_ctx.get("promotion", 0.0)),
