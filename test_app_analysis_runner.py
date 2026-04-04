@@ -3,18 +3,16 @@ import pandas as pd
 import app_analysis_runner as runner
 
 
-def test_run_analysis_from_context_universal_only(monkeypatch):
+def test_runner_invokes_v2(monkeypatch):
     captured = {}
 
-    def fake_run_full_pricing_analysis_universal_v1(universal_txn, target_category, target_sku, **kwargs):
-        captured.update({"universal_txn": universal_txn, "target_category": target_category, "target_sku": target_sku, "kwargs": kwargs})
-        return {"ok": True, "analysis_engine": "v1_universal"}
+    def fake_run_full_pricing_analysis_v2(universal_txn, target_category, target_sku, **kwargs):
+        captured["kwargs"] = kwargs
+        return {"ok": True, "analysis_engine": "v2_decomposed_baseline_factor_shock"}
 
-    monkeypatch.setattr(runner, "run_full_pricing_analysis_universal_v1", fake_run_full_pricing_analysis_universal_v1)
-    universal_df = pd.DataFrame({"product_id": ["sku-1"], "category": ["cat"], "price": [100]})
-    ctx = {"load_mode": "Универсальный CSV", "target_category": "cat", "target_sku": "sku-1", "universal_txn": universal_df, "forecast_horizon_days": 30, "caution_level": "Высокий"}
-
+    monkeypatch.setattr(runner, "run_full_pricing_analysis_v2", fake_run_full_pricing_analysis_v2)
+    ctx = {"load_mode": "Universal CSV", "target_category": "cat", "target_sku": "sku-1", "universal_txn": pd.DataFrame({"product_id": ["sku-1"]}), "forecast_horizon_days": 14}
     out = runner.run_analysis_from_context(ctx)
-    assert out["ok"] is True
-    assert out["analysis_engine"] == "v1_universal"
-    assert captured["universal_txn"].equals(universal_df)
+    assert out["analysis_engine"] == "v2_decomposed_baseline_factor_shock"
+    assert out["analysis_route"] == "runner_to_v2_decomposed"
+    assert captured["kwargs"]["horizon_days"] == 14
