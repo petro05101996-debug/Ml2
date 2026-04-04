@@ -42,12 +42,13 @@ def run_v1_what_if_projection(
         trained_bundle["base_ctx"],
         float(base_ctx["price"]),
         future_dates,
-        trained_bundle["demand_models"],
+        trained_bundle["trained_models"],
         base_history,
         base_ctx,
         trained_bundle["feature_spec"],
         risk_lambda=float(trained_bundle.get("risk_lambda", 0.7)),
         calibration_factor=float(trained_bundle.get("calibration_factor", 1.0)),
+        forecast_mode=str(trained_bundle.get("forecast_mode", "strong_signal")),
     )
 
     daily = sim["daily"].copy()

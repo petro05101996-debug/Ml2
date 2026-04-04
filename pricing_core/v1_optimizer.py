@@ -32,20 +32,21 @@ def simulate_v1_horizon_profit(
     base_row: Dict[str, Any],
     candidate_price: float,
     future_dates_df: pd.DataFrame,
-    demand_models: List[Any],
+    trained_models: Dict[str, Any],
     base_history: pd.DataFrame,
     base_ctx: Dict[str, Any],
     feature_spec: Dict[str, Any],
     unit_cost: Optional[float] = None,
     risk_lambda: float = 0.7,
     calibration_factor: float = 1.0,
+    forecast_mode: str = "strong_signal",
 ) -> Dict[str, Any]:
     local_ctx = dict(base_ctx)
     local_ctx["price"] = float(candidate_price)
     if unit_cost is not None:
         local_ctx["cost"] = float(unit_cost)
 
-    fc = recursive_v1_demand_forecast(demand_models, base_history, future_dates_df, local_ctx, feature_spec, calibration_factor=float(calibration_factor))
+    fc = recursive_v1_demand_forecast(trained_models, base_history, future_dates_df, local_ctx, feature_spec, calibration_factor=float(calibration_factor), forecast_mode=forecast_mode)
     daily = fc.copy()
     daily["pred_demand"] = pd.to_numeric(daily["pred_sales"], errors="coerce").fillna(0.0)
     daily, econ_checks = compute_daily_unit_economics(daily, quantity_col="pred_sales")
@@ -60,7 +61,7 @@ def simulate_v1_horizon_profit(
     ood_flags = _get_ood_flags(base_history, float(candidate_price))
     ood_penalty = OOD_PENALTY_RATE * max(total_profit, 0.0) * float(risk_lambda) if ood_flags else 0.0
 
-    baseline_sim = recursive_v1_demand_forecast(demand_models, base_history, future_dates_df, dict(base_ctx), feature_spec, calibration_factor=float(calibration_factor))
+    baseline_sim = recursive_v1_demand_forecast(trained_models, base_history, future_dates_df, dict(base_ctx), feature_spec, calibration_factor=float(calibration_factor), forecast_mode=forecast_mode)
     baseline_volume = float(pd.to_numeric(baseline_sim.get("pred_sales", 0.0), errors="coerce").fillna(0.0).sum()) if len(baseline_sim) else 0.0
     volume_guard_penalty = VOLUME_GUARD_PENALTY_RATE * max(total_profit, 0.0) * float(risk_lambda) if baseline_volume > 0 and total_volume < baseline_volume * 0.9 else 0.0
     adjusted_profit = float(total_profit - jump_penalty - ood_penalty - volume_guard_penalty)
@@ -80,7 +81,7 @@ def simulate_v1_horizon_profit(
     }
 
 
-def recommend_v1_price_horizon(base_row: Dict[str, Any], demand_models: List[Any], base_history: pd.DataFrame, base_ctx: Dict[str, Any], feature_spec: Dict[str, Any], n_days: int = 30, objective_mode: str = "maximize_profit", risk_lambda: float = 0.7, can_recommend: bool = True, price_signal_ok: bool = True, calibration_factor: float = 1.0) -> Dict[str, Any]:
+def recommend_v1_price_horizon(base_row: Dict[str, Any], trained_models: Dict[str, Any], base_history: pd.DataFrame, base_ctx: Dict[str, Any], feature_spec: Dict[str, Any], n_days: int = 30, objective_mode: str = "maximize_profit", risk_lambda: float = 0.7, can_recommend: bool = True, price_signal_ok: bool = True, calibration_factor: float = 1.0, forecast_mode: str = "strong_signal") -> Dict[str, Any]:
     current_price = float(base_row.get("price", 0.0))
     future_dates_df = pd.DataFrame({"date": pd.date_range(pd.Timestamp(base_history["date"].max()) + pd.Timedelta(days=1), periods=int(n_days), freq="D")})
 
@@ -92,7 +93,7 @@ def recommend_v1_price_horizon(base_row: Dict[str, Any], demand_models: List[Any
         p10, p90 = current_price * 0.9, current_price * 1.1
 
     if not can_recommend or not price_signal_ok:
-        return {"best_price": current_price, "best_idx": 0, "results": [], "best_sim": None, "current_sim": simulate_v1_horizon_profit(base_row, current_price, future_dates_df, demand_models, base_history, base_ctx, feature_spec, risk_lambda=float(risk_lambda), calibration_factor=float(calibration_factor)), "recommendation_blocked": True}
+        return {"best_price": current_price, "best_idx": 0, "results": [], "best_sim": None, "current_sim": simulate_v1_horizon_profit(base_row, current_price, future_dates_df, trained_models, base_history, base_ctx, feature_spec, risk_lambda=float(risk_lambda), calibration_factor=float(calibration_factor), forecast_mode=forecast_mode), "recommendation_blocked": True}
 
     low = max(p10, current_price * 0.90)
     high = min(p90, current_price * 1.10)
@@ -100,7 +101,7 @@ def recommend_v1_price_horizon(base_row: Dict[str, Any], demand_models: List[Any
 
     results = []
     for p in grid:
-        sim = simulate_v1_horizon_profit(base_row, float(p), future_dates_df, demand_models, base_history, base_ctx, feature_spec, risk_lambda=float(risk_lambda), calibration_factor=float(calibration_factor))
+        sim = simulate_v1_horizon_profit(base_row, float(p), future_dates_df, trained_models, base_history, base_ctx, feature_spec, risk_lambda=float(risk_lambda), calibration_factor=float(calibration_factor), forecast_mode=forecast_mode)
         margin_ratio = float(sim["total_profit"] / sim["total_revenue"]) if sim["total_revenue"] > 0 else 0.0
         results.append({"price": float(p), "sim": sim, "adjusted_profit": sim["adjusted_profit"], "revenue": sim["total_revenue"], "pred_volume": sim["total_volume"], "baseline_volume": sim["baseline_volume"], "margin_ratio": margin_ratio})
 
