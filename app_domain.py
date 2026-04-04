@@ -24,7 +24,7 @@ REQUIRED_PRESET_KEYS = [
 def build_default_scenario_inputs(base_price: float, horizon_days: int, base_ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
     default_names = ["Baseline", "Scenario A", "Scenario B", "Scenario C"]
     default_price_mult = [1.0, 1.03, 0.97, 1.08]
-    rating_default = float(base_ctx.get("review_score", base_ctx.get("rating", 4.5)))
+    review_default = float(base_ctx.get("review_score", base_ctx.get("rating", 4.5)))
     reviews_default = float(base_ctx.get("reviews_count", 0.0))
     return [
         {
@@ -36,7 +36,7 @@ def build_default_scenario_inputs(base_price: float, horizon_days: int, base_ctx
             "discount_multiplier": 1.0,
             "stock_cap": 0.0,
             "promotion": 0.0,
-            "rating": rating_default,
+            "review_score": review_default,
             "reviews_count": reviews_default,
             "horizon_days": int(horizon_days),
         }
