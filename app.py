@@ -162,8 +162,8 @@ def render_scenario_lab(r: Dict[str, Any]) -> None:
         cost = st.slider("Множитель себестоимости", 0.7, 1.3, float(base_preset.get("cost_multiplier", 1.0)), 0.05)
         st.markdown("**Дополнительные пользовательские факторы**")
         user_factor_overrides = {}
-        for factor in r["_trained_bundle"]["feature_spec"].get("user_factor_features", []):
-            label = factor.replace("user_factor__", "", 1)
+        for factor in r["_trained_bundle"]["feature_spec"].get("user_numeric_features", []):
+            label = factor.replace("user_factor_num__", "", 1)
             user_factor_overrides[factor] = st.number_input(label, value=float(r["_trained_bundle"]["base_ctx"].get(factor, 0.0)), step=0.1)
 
     w = run_v1_what_if_projection(
@@ -211,6 +211,24 @@ def render_results_page(r: Dict[str, Any]) -> None:
     holdout_metrics = r.get("holdout_metrics")
     if isinstance(holdout_metrics, pd.DataFrame) and not holdout_metrics.empty:
         st.dataframe(holdout_metrics, use_container_width=True)
+        diag_row = holdout_metrics.iloc[0].to_dict()
+        st.markdown("#### Диагностика модели")
+        st.write(
+            {
+                "forecast_wape": diag_row.get("forecast_wape"),
+                "mae": diag_row.get("mae"),
+                "rmse": diag_row.get("rmse"),
+                "sum_ratio": diag_row.get("sum_ratio"),
+                "bias_pct": diag_row.get("bias_pct"),
+                "forecast_mode": diag_row.get("forecast_mode"),
+                "price_signal_ok": diag_row.get("price_signal_ok"),
+                "weak_factors": diag_row.get("weak_factors"),
+                "ood_flags": diag_row.get("ood_flags"),
+                "can_recommend_price": diag_row.get("can_recommend_price"),
+            }
+        )
+        if not bool(diag_row.get("can_recommend_price", False)):
+            st.warning("Ценовой сигнал недостаточен для надёжной рекомендации.")
     if st.button("Запустить: текущий vs рекомендованный vs консервативный", use_container_width=True):
         st.session_state.scenario_table = run_scenario_set(r["_trained_bundle"], build_default_scenario_inputs(float(r["current_price"]), int(r.get("forecast_horizon_days", 30)), r["_trained_bundle"]["base_ctx"])[:3], run_v1_what_if_projection)
     if st.session_state.get("scenario_table") is not None:
