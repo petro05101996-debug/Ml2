@@ -41,20 +41,12 @@ def simulate_v1_horizon_profit(
     unit_cost: Optional[float] = None,
     allow_extrapolate: bool = False,
     risk_lambda: float = 0.7,
-    baseline_bias_factor: float = 1.0,
 ) -> Dict[str, Any]:
     local_ctx = dict(base_ctx)
     local_ctx["price"] = float(candidate_price)
     if unit_cost is not None:
         local_ctx["cost"] = float(unit_cost)
-    baseline_daily = recursive_v1_baseline_forecast(
-        baseline_models,
-        base_history,
-        future_dates_df,
-        local_ctx,
-        feature_spec,
-        bias_factor=float(baseline_bias_factor),
-    )
+    baseline_daily = recursive_v1_baseline_forecast(baseline_models, base_history, future_dates_df, local_ctx, feature_spec)
     ref_price = _reference_price(base_history, base_row)
 
     rows = []
@@ -125,7 +117,6 @@ def recommend_v1_price_horizon(
     objective_mode: str = "maximize_profit",
     risk_lambda: float = 0.7,
     can_recommend: bool = True,
-    baseline_bias_factor: float = 1.0,
 ) -> Dict[str, Any]:
     current_price = float(base_row.get("price", 0.0))
     spread = (0.95, 1.05) if not can_recommend else (0.85, 1.15)
@@ -145,7 +136,6 @@ def recommend_v1_price_horizon(
             pooled_elasticity,
             feature_spec,
             risk_lambda=float(risk_lambda),
-            baseline_bias_factor=float(baseline_bias_factor),
         )
         margin_ratio = float(sim["total_profit"] / sim["total_revenue"]) if sim["total_revenue"] > 0 else 0.0
         results.append({"price": float(p), "sim": sim, "adjusted_profit": sim["adjusted_profit"], "revenue": sim["total_revenue"], "pred_volume": sim["total_volume"], "baseline_volume": sim["baseline_volume"], "margin_ratio": margin_ratio})

@@ -17,16 +17,7 @@ def train_v1_baseline_model(
     feats = list(feature_spec.get("baseline_features", []))
     X = clean_feature_frame(train_df, feats)[feats]
     y = pd.to_numeric(train_df.get("log_sales", np.log1p(train_df.get("sales", 0.0))), errors="coerce").fillna(0.0)
-    weights = pd.Series(1.0, index=train_df.index, dtype=float)
-    n = len(train_df)
-    if n >= 180:
-        weights.iloc[-180:] = 1.20
-    if n >= 90:
-        weights.iloc[-90:] = 1.55
-    if n >= 45:
-        weights.iloc[-45:] = 1.95
-    if n >= 21:
-        weights.iloc[-21:] = 2.25
+    weights = pd.Series(np.linspace(1.0, 1.8, num=len(train_df)), index=train_df.index)
     return build_models(
         X,
         y,
@@ -60,7 +51,6 @@ def recursive_v1_baseline_forecast(
     future_dates_df: pd.DataFrame,
     base_ctx: Dict[str, Any],
     feature_spec: Dict[str, Any],
-    bias_factor: float = 1.0,
 ) -> pd.DataFrame:
     hist = history_df.copy().sort_values("date").reset_index(drop=True)
     history_span_days = int((hist["date"].max() - hist["date"].min()).days + 1) if len(hist) else 1
@@ -69,12 +59,10 @@ def recursive_v1_baseline_forecast(
         step = build_v1_one_step_features(hist, pd.Timestamp(dt), base_ctx, history_span_days)
         pred_log, pred_std = predict_v1_baseline_log(step, baseline_models, feature_spec)
         baseline_log = float(pred_log[0])
-        baseline_sales_raw = float(max(np.expm1(baseline_log), 0.0))
-        baseline_sales = float(max(baseline_sales_raw * float(bias_factor), 0.0))
+        baseline_sales = float(max(np.expm1(baseline_log), 0.0))
         rows.append(
             {
                 "date": pd.Timestamp(dt),
-                "baseline_sales_raw": baseline_sales_raw,
                 "baseline_sales": baseline_sales,
                 "baseline_log": baseline_log,
                 "baseline_std": float(pred_std[0]),

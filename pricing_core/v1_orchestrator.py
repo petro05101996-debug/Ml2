@@ -20,9 +20,10 @@ V1_ANALYSIS_ENGINE_VERSION = "v1_universal_2026_04_route_check"
 
 
 def _safe_split_sizes(n: int) -> Tuple[int, int]:
-    split = max(30, int(n * 0.8))
-    split = min(split, n - 1)
-    return split, split
+    train_end = max(3, int(n * 0.7))
+    val_end = max(train_end + 1, int(n * 0.85))
+    val_end = min(val_end, n)
+    return train_end, val_end
 
 
 def _eval_wape(actual: pd.Series, pred: pd.Series) -> float:
@@ -153,16 +154,11 @@ def run_full_pricing_analysis_universal_v1(
     holdout_diag = pd.DataFrame()
     holdout_by_month = pd.DataFrame()
     holdout_by_dow = pd.DataFrame()
-    bias_factor = 1.0
     if len(test_df):
         holdout_frame = test_df.reindex(columns=feature_spec["baseline_features"], fill_value=np.nan)
         pred_log_bt, _ = predict_v1_baseline_log(holdout_frame, baseline_models_bt, feature_spec)
         pred_test_bt = np.expm1(pred_log_bt)
         baseline_holdout_wape = _eval_wape(test_df["sales"], pd.Series(pred_test_bt, index=test_df.index))
-        pred_sum = float(np.sum(pred_test_bt))
-        actual_sum = float(pd.to_numeric(test_df["sales"], errors="coerce").fillna(0.0).sum())
-        if pred_sum > 1e-9:
-            bias_factor = float(np.clip(actual_sum / pred_sum, 0.95, 1.12))
         reference_price_bt = float(train_df["price"].median()) if len(train_df) else float(daily_base["price"].median())
         e2e_holdout_wape = _eval_e2e_holdout_wape(
             test_df=test_df,
@@ -207,7 +203,6 @@ def run_full_pricing_analysis_universal_v1(
         objective_mode=objective_mode,
         risk_lambda=float(risk_lambda),
         can_recommend=can_rec,
-        baseline_bias_factor=bias_factor,
     )
 
     future_dates = _make_future_dates(pd.Timestamp(daily_base["date"].max()), int(horizon_days))
@@ -222,7 +217,6 @@ def run_full_pricing_analysis_universal_v1(
         float(elasticity_info_final["pooled_elasticity"]),
         feature_spec,
         risk_lambda=float(risk_lambda),
-        baseline_bias_factor=bias_factor,
     )
     optimal_price = float(rec.get("best_price", base_ctx["price"]))
     optimal_sim = simulate_v1_horizon_profit(
@@ -236,7 +230,6 @@ def run_full_pricing_analysis_universal_v1(
         float(elasticity_info_final["pooled_elasticity"]),
         feature_spec,
         risk_lambda=float(risk_lambda),
-        baseline_bias_factor=bias_factor,
     )
 
     drift_summary = pd.DataFrame(
@@ -385,6 +378,5 @@ def run_full_pricing_analysis_universal_v1(
             "can_recommend_price": can_rec,
             "recommendation_reasons": rec_reasons,
             "risk_lambda": float(risk_lambda),
-            "baseline_bias_factor": float(bias_factor),
         },
     }
