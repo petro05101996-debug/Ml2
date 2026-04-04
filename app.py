@@ -49,6 +49,38 @@ def _base_plotly_layout(title: str) -> Dict[str, Any]:
     return dict(title=title, template="plotly_dark")
 
 
+def _format_report(r: Dict[str, Any], explanation: Dict[str, Any]) -> str:
+    decision = build_main_decision_text(r)
+    objective = r.get("objective_mode", "—")
+    current_price = float(r.get("current_price", 0.0))
+    recommended_price = r.get("recommended_price")
+    confidence = r.get("confidence")
+
+    lines = [
+        "# Отчёт ценового анализа",
+        "",
+        "## Краткий итог",
+        f"- Решение: {decision.get('action', '—')}",
+        f"- Цель оптимизации: {objective}",
+        f"- Текущая цена: {current_price:,.2f}",
+        f"- Рекомендованная цена: {float(recommended_price):,.2f}" if recommended_price is not None else "- Рекомендованная цена: —",
+        f"- Уверенность (эвристика): {float(confidence):.2f}" if confidence is not None else "- Уверенность (эвристика): —",
+        "",
+        "## Пояснение модели",
+        str(explanation.get("summary", "Нет дополнительного пояснения.")),
+    ]
+
+    scenario_table = st.session_state.get("scenario_table")
+    if scenario_table is not None and not scenario_table.empty:
+        lines.extend(["", "## Сценарии", scenario_table.to_csv(index=False)])
+
+    sensitivity_df = st.session_state.get("sensitivity_df")
+    if sensitivity_df is not None and not sensitivity_df.empty:
+        lines.extend(["", "## Карта чувствительности", sensitivity_df.to_csv(index=False)])
+
+    return "\n".join(lines)
+
+
 def _build_target_selection(universal_txn: Optional[pd.DataFrame]) -> Dict[str, Optional[str]]:
     if universal_txn is None or universal_txn.empty:
         return {"target_category": None, "target_sku": None, "category_options": [], "sku_options": []}
@@ -144,11 +176,45 @@ def render_scenario_lab(r: Dict[str, Any]) -> None:
 def render_results_page(r: Dict[str, Any]) -> None:
     decision = build_main_decision_text(r)
     st.markdown(f"### {decision.get('action', '—')}")
+    explanation = generate_explanation(r, data_quality=r.get("data_quality", {}))
+    col_excel, col_md = st.columns(2)
+    excel_buffer = r.get("excel_buffer")
+    if excel_buffer is not None:
+        try:
+            excel_payload = excel_buffer.getvalue()
+        except Exception:
+            excel_payload = None
+        if excel_payload:
+            col_excel.download_button(
+                "Скачать отчёт (.xlsx)",
+                data=excel_payload,
+                file_name="pricing_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+    report_text = _format_report(r, explanation)
+    col_md.download_button(
+        "Скачать отчёт (.md)",
+        data=report_text.encode("utf-8"),
+        file_name="pricing_report.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+    dq = r.get("data_quality", {}) or {}
+    st.caption(
+        f"Качество анализа: {dq.get('label', '—')}. "
+        f"Уровень: {dq.get('level', '—')}. "
+        "Метрика качества прогноза рассчитывается через WAPE на holdout-периоде."
+    )
+    if dq.get("issues"):
+        st.warning("Ограничения качества данных: " + "; ".join([str(x) for x in dq.get("issues", [])]))
+    holdout_metrics = r.get("holdout_metrics")
+    if isinstance(holdout_metrics, pd.DataFrame) and not holdout_metrics.empty:
+        st.dataframe(holdout_metrics, use_container_width=True)
     if st.button("Запустить: текущий vs рекомендованный vs консервативный", use_container_width=True):
         st.session_state.scenario_table = run_scenario_set(r["_trained_bundle"], build_default_scenario_inputs(float(r["current_price"]), int(r.get("forecast_horizon_days", 30)), r["_trained_bundle"]["base_ctx"])[:3], run_v1_what_if_projection)
     if st.session_state.get("scenario_table") is not None:
         st.dataframe(st.session_state.scenario_table, use_container_width=True)
-    explanation = generate_explanation(r, data_quality=r.get("data_quality", {}))
     with st.expander("Расширенная аналитика", expanded=False):
         st.write(explanation.get("summary", ""))
         if st.button("Запустить карту чувствительности", use_container_width=True):
@@ -191,7 +257,6 @@ def maybe_run_analysis(ctx: Dict[str, Any]) -> None:
         status.update(label="Анализ завершён", state="complete", expanded=False)
 
     st.session_state.active_page = "Результаты"
-    st.session_state.top_nav = "Результаты"
     st.rerun()
 
 
