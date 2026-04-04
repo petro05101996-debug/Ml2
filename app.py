@@ -22,7 +22,7 @@ from app_domain import (
 from app_presenters import build_main_decision_text
 from data_adapter import build_auto_mapping, normalize_transactions, objective_to_weights
 from data_schema import CANONICAL_FIELDS
-from pricing_core import CONFIG, OBJECTIVE_HINTS, OBJECTIVE_LABEL_TO_MODE, generate_explanation, run_v1_what_if_projection
+from pricing_core import CONFIG, OBJECTIVE_HINTS, OBJECTIVE_LABEL_TO_MODE, generate_explanation, run_v2_what_if_projection
 from ui_docs import render_docs
 from ui_overview import render_overview
 from ui_shell import apply_enterprise_styles, render_navigation
@@ -166,7 +166,7 @@ def render_scenario_lab(r: Dict[str, Any]) -> None:
             label = factor.replace("user_factor_num__", "", 1)
             user_factor_overrides[factor] = st.number_input(label, value=float(r["_trained_bundle"]["base_ctx"].get(factor, 0.0)), step=0.1)
 
-    w = run_v1_what_if_projection(
+    w = run_v2_what_if_projection(
         r["_trained_bundle"], manual_price=float(price), freight_multiplier=float(freight), demand_multiplier=float(demand), cost_multiplier=float(cost), horizon_days=int(horizon), stock_cap=float(stock),
         scenario={"name": "scenario_lab", "mode": "manual", "horizon_days": int(horizon), "factors": {"price": float(price), "discount": float(discount), "promotion": float(promo), "stock": float(stock), "review_score": float(review_score), "reviews_count": float(reviews_count), **user_factor_overrides}},
     )
@@ -230,13 +230,13 @@ def render_results_page(r: Dict[str, Any]) -> None:
         if not bool(diag_row.get("can_recommend_price", False)):
             st.warning("Ценовой сигнал недостаточен для надёжной рекомендации.")
     if st.button("Запустить: текущий vs рекомендованный vs консервативный", use_container_width=True):
-        st.session_state.scenario_table = run_scenario_set(r["_trained_bundle"], build_default_scenario_inputs(float(r["current_price"]), int(r.get("forecast_horizon_days", 30)), r["_trained_bundle"]["base_ctx"])[:3], run_v1_what_if_projection)
+        st.session_state.scenario_table = run_scenario_set(r["_trained_bundle"], build_default_scenario_inputs(float(r["current_price"]), int(r.get("forecast_horizon_days", 30)), r["_trained_bundle"]["base_ctx"])[:3], run_v2_what_if_projection)
     if st.session_state.get("scenario_table") is not None:
         st.dataframe(st.session_state.scenario_table, use_container_width=True)
     with st.expander("Расширенная аналитика", expanded=False):
         st.write(explanation.get("summary", ""))
         if st.button("Запустить карту чувствительности", use_container_width=True):
-            st.session_state.sensitivity_df = build_sensitivity_grid(r["_trained_bundle"], base_price=float(r["current_price"]), runner=run_v1_what_if_projection)
+            st.session_state.sensitivity_df = build_sensitivity_grid(r["_trained_bundle"], base_price=float(r["current_price"]), runner=run_v2_what_if_projection)
         if st.session_state.get("sensitivity_df") is not None:
             heat = px.density_heatmap(st.session_state.sensitivity_df, x="price", y="demand_multiplier", z="profit", template="plotly_dark")
             heat.update_layout(**_base_plotly_layout("Чувствительность: цена × спрос"))

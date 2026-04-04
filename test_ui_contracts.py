@@ -39,7 +39,7 @@ def test_scenario_lab_passes_cost_multiplier_to_projection(monkeypatch):
 
     monkeypatch.setattr(app, "st", _FakeSt())
     monkeypatch.setattr(app, "build_seller_scenario_presets", lambda *_a, **_k: {"Keep current price": {"price": 100.0, "demand_multiplier": 1.0, "freight_multiplier": 1.0, "horizon_days": 30, "cost_multiplier": 1.15, "stock_cap": 50.0}})
-    monkeypatch.setattr(app, "run_v1_what_if_projection", lambda *_a, **kwargs: captured.update(kwargs) or {"profit_total": 1, "revenue_total": 1, "demand_total": 1})
+    monkeypatch.setattr(app, "run_v2_what_if_projection", lambda *_a, **kwargs: captured.update(kwargs) or {"profit_total": 1, "revenue_total": 1, "demand_total": 1})
 
     app.render_scenario_lab({"current_price": 100.0, "current_profit": 1000.0, "forecast_horizon_days": 30, "forecast_current": pd.DataFrame({"price": [100.0], "pred_sales": [30.0]}), "_trained_bundle": {"base_ctx": {"stock": 50.0, "review_score": 4.5, "reviews_count": 100.0}, "feature_spec": {"user_numeric_features": []}}})
     assert captured.get("cost_multiplier") == 1.15
