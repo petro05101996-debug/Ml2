@@ -18,7 +18,7 @@ def run_scenario_set(trained_bundle: Dict[str, Any], scenario_rows: List[Dict[st
         if "discount" in row:
             factors["discount"] = float(row.get("discount", 0.0))
         for k, v in row.items():
-            if str(k).startswith("user_factor__"):
+            if str(k).startswith("user_factor_num__"):
                 factors[k] = float(v)
 
         result = runner(
