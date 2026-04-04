@@ -49,6 +49,25 @@ def _base_plotly_layout(title: str) -> Dict[str, Any]:
     return dict(title=title, template="plotly_dark")
 
 
+def _build_target_selection(universal_txn: Optional[pd.DataFrame]) -> Dict[str, Optional[str]]:
+    if universal_txn is None or universal_txn.empty:
+        return {"target_category": None, "target_sku": None, "category_options": [], "sku_options": []}
+
+    category_series = universal_txn.get("category", pd.Series(dtype=str)).dropna().astype(str).str.strip()
+    category_options = sorted([c for c in category_series.unique().tolist() if c])
+    if not category_options:
+        category_options = ["unknown"]
+
+    target_category = st.selectbox("Категория *", category_options)
+    scoped = universal_txn[universal_txn["category"].astype(str) == str(target_category)] if "category" in universal_txn.columns else universal_txn
+    sku_series = scoped.get("product_id", pd.Series(dtype=str)).dropna().astype(str).str.strip()
+    sku_options = sorted([sku for sku in sku_series.unique().tolist() if sku])
+    if not sku_options:
+        sku_options = sorted([sku for sku in universal_txn.get("product_id", pd.Series(dtype=str)).dropna().astype(str).str.strip().unique().tolist() if sku])
+    target_sku = st.selectbox("SKU *", sku_options) if sku_options else None
+    return {"target_category": target_category or None, "target_sku": target_sku or None, "category_options": category_options, "sku_options": sku_options}
+
+
 def render_setup_page() -> Dict[str, Any]:
     st.markdown("### Настройка")
     universal_file = st.file_uploader("Файл транзакций (универсальный CSV) *", type=["csv"], key="universal_file")
@@ -67,8 +86,13 @@ def render_setup_page() -> Dict[str, Any]:
         for w in quality.get("warnings", []):
             st.warning(w)
 
-    target_category = st.text_input("Категория *", value="")
-    target_sku = st.text_input("SKU *", value="")
+    target_selection = _build_target_selection(universal_txn)
+    if target_selection["target_category"] is None and target_selection["target_sku"] is None:
+        target_category = st.text_input("Категория *", value="")
+        target_sku = st.text_input("SKU *", value="")
+    else:
+        target_category = target_selection["target_category"]
+        target_sku = target_selection["target_sku"]
     selected_objective_label = st.selectbox("Цель оптимизации", list(OBJECTIVE_LABEL_TO_MODE.keys()))
     st.caption(OBJECTIVE_HINTS[selected_objective_label])
     objective_mode = OBJECTIVE_LABEL_TO_MODE[selected_objective_label]
