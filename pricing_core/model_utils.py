@@ -4,16 +4,40 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import PoissonRegressor
+
+try:
+    from xgboost import XGBRegressor  # type: ignore
+    HAS_XGBOOST = True
+except Exception:
+    HAS_XGBOOST = False
+    class XGBRegressor(HistGradientBoostingRegressor):  # type: ignore
+        def __init__(self, **kwargs):
+            self._xgb_params = dict(kwargs)
+            super().__init__(max_depth=kwargs.get("max_depth", 6), learning_rate=kwargs.get("learning_rate", 0.05), max_iter=kwargs.get("n_estimators", 250), random_state=kwargs.get("random_state", 42))
+
+        def get_params(self, deep: bool = True):
+            p = super().get_params(deep=deep)
+            p.update(self._xgb_params)
+            return p
 
 from .config import CONFIG
 
-try:
-    from catboost import CatBoostRegressor
-    CATBOOST_AVAILABLE = True
-except Exception:
-    CatBoostRegressor = None
-    CATBOOST_AVAILABLE = False
+
+def _prepare_xgb_input(X: pd.DataFrame, feature_names: List[str], cat_features: List[str]) -> pd.DataFrame:
+    out = X[feature_names].copy()
+    if HAS_XGBOOST:
+        for c in cat_features:
+            if c in out.columns:
+                out[c] = out[c].astype("category")
+        return out
+    for c in cat_features:
+        if c in out.columns:
+            out[c] = out[c].astype("category").cat.codes
+    for c in out.columns:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    return out
 
 
 def clean_feature_frame(
@@ -31,7 +55,7 @@ def clean_feature_frame(
         if c not in out.columns:
             out[c] = np.nan
         if c in cat_set:
-            out[c] = out[c].astype(str).replace({"nan": "unknown", "None": "unknown"}).fillna("unknown")
+            out[c] = out[c].astype(object).fillna("unknown").astype("category")
         else:
             out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
             fallback = float(stats.get(c, 0.0)) if isinstance(stats, dict) else 0.0
@@ -44,16 +68,6 @@ def clean_feature_frame(
     return out
 
 
-def _numeric_for_non_catboost(X: pd.DataFrame, cat_features: List[str]) -> pd.DataFrame:
-    out = X.copy()
-    for c in cat_features:
-        if c in out.columns:
-            out[c] = out[c].astype("category").cat.codes.astype(float)
-    for c in out.columns:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
-    return out
-
-
 def build_models(
     X: pd.DataFrame,
     y: pd.Series,
@@ -63,63 +77,54 @@ def build_models(
     small_mode: bool = False,
     cat_features: Optional[List[str]] = None,
     sample_weight: Optional[pd.Series] = None,
-    loss_function: str = "RMSE",
+    loss_function: str = "MAE",
 ) -> List[Any]:
-    _ = kind
+    _ = (kind, loss_function)
     cat_features = cat_features or []
     if len(X) == 0:
         raise ValueError("Пустая обучающая выборка.")
 
+    monotone_map = {"price": -1, "freight_value": -1, "review_score": 1}
+    monotone_constraints_tuple = tuple(monotone_map.get(f, 0) for f in feature_names)
+
     ensemble: List[Any] = []
-    weights = np.ones(len(X)) if sample_weight is None else pd.to_numeric(sample_weight, errors="coerce").fillna(1.0).values
-
-    mono = {}
-    for k, v in {"price": -1, "freight_value": -1, "review_score": 1}.items():
-        if k in feature_names:
-            mono[k] = v
-
     for i in range(int(n_models)):
-        if CATBOOST_AVAILABLE:
-            model = CatBoostRegressor(
-                loss_function="MAE" if str(loss_function).upper() == "MAE" else "RMSE",
-                iterations=300 if small_mode else 500,
-                depth=5 if small_mode else 6,
-                learning_rate=0.03,
-                l2_leaf_reg=3.0,
-                subsample=0.8,
-                bootstrap_type="Bernoulli",
-                verbose=False,
-                random_seed=42 + i,
-                monotone_constraints=mono if mono else None,
-            )
-            model.fit(X[feature_names], y, cat_features=[c for c in cat_features if c in feature_names], sample_weight=weights)
-            model.is_fallback = False
-            ensemble.append(model)
-        else:
-            criterion = "absolute_error" if str(loss_function).upper() == "MAE" else "squared_error"
-            model = RandomForestRegressor(
-                n_estimators=int(CONFIG["RF_TREES"]),
-                max_depth=int(CONFIG["RF_DEPTH"] if not small_mode else max(4, int(CONFIG["RF_DEPTH"]) // 2)),
-                random_state=42 + i,
-                n_jobs=1,
-                criterion=criterion,
-            )
-            model.fit(_numeric_for_non_catboost(X[feature_names], cat_features), y, sample_weight=weights)
-            model.is_fallback = True
-            ensemble.append(model)
+        model = XGBRegressor(
+            objective="count:poisson",
+            eval_metric="poisson-nloglik",
+            tree_method="hist",
+            enable_categorical=True,
+            n_estimators=400 if not small_mode else 250,
+            max_depth=6 if not small_mode else 5,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=5,
+            reg_lambda=1.0,
+            reg_alpha=0.0,
+            random_state=42 + i,
+            monotone_constraints=monotone_constraints_tuple,
+        )
+        fit_kwargs = {}
+        if sample_weight is not None:
+            fit_kwargs["sample_weight"] = pd.to_numeric(sample_weight, errors="coerce").fillna(1.0).values
+        model.fit(_prepare_xgb_input(X, feature_names, cat_features), y, **fit_kwargs)
+        model.is_fallback = False
+        ensemble.append(model)
     return ensemble
+
+
+def build_poisson_fallback(X_num: pd.DataFrame, y: pd.Series) -> PoissonRegressor:
+    model = PoissonRegressor(alpha=0.0001, max_iter=1000)
+    model.fit(X_num, y)
+    model.is_fallback = True
+    return model
 
 
 def ensemble_predict(models_local: List[Any], X_local: pd.DataFrame, feature_names: Optional[List[str]] = None, cat_features: Optional[List[str]] = None) -> Tuple[np.ndarray, np.ndarray]:
     if len(models_local) == 0:
         raise ValueError("No models in ensemble")
     feature_names = feature_names or list(X_local.columns)
-    cat_features = cat_features or []
-    preds = []
-    for m in models_local:
-        if getattr(m, "is_fallback", False):
-            preds.append(m.predict(_numeric_for_non_catboost(X_local[feature_names], cat_features)))
-        else:
-            preds.append(m.predict(X_local[feature_names]))
+    preds = [m.predict(_prepare_xgb_input(X_local, feature_names, cat_features or [])) for m in models_local]
     mat = np.vstack(preds)
     return mat.mean(axis=0), mat.std(axis=0, ddof=0)

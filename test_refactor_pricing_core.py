@@ -60,7 +60,7 @@ def _normalized(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def test_catboost_build_models_and_cat_features():
+def test_xgboost_build_models_and_cat_features():
     df = _normalized(_dataset("strong"))
     panel = build_v1_panel_feature_matrix(build_daily_panel_from_transactions(df))
     spec = derive_v1_feature_spec(panel)
@@ -74,7 +74,7 @@ def test_catboost_build_models_and_cat_features():
         n_models=1,
     )
     assert models
-    assert hasattr(models[0], "get_param")
+    assert hasattr(models[0], "get_params")
 
 
 def test_feature_spec_numeric_and_categorical_user_factors():
@@ -111,7 +111,8 @@ def test_recursive_holdout_uses_predicted_lags():
         def predict(self, X):
             return pd.to_numeric(X["sales_lag1"], errors="coerce").fillna(0.0).values
 
-    out = run_v1_recursive_holdout(train, test, [Dummy()], spec)
+    trained = {"main_models": [Dummy()], "fallback_model": Dummy()}
+    out = run_v1_recursive_holdout(train, test, trained, spec)
     assert out["pred_sales"].iloc[1] == out["pred_sales"].iloc[0]
 
 

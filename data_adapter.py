@@ -187,7 +187,11 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
         full["category"] = g["category"].mode().iloc[0] if not g["category"].mode().empty else "unknown"
         m = full.merge(g, on=["date", "product_id", "category"], how="left")
 
-        for c in ["sales", "revenue"] + num_mean_cols:
+        for c in ["sales", "revenue"]:
+            if c not in m.columns:
+                m[c] = np.nan
+            m[c] = pd.to_numeric(m[c], errors="coerce").fillna(0.0)
+        for c in num_mean_cols:
             if c not in m.columns:
                 m[c] = np.nan
             m[c] = pd.to_numeric(m[c], errors="coerce").ffill().bfill().fillna(0.0)

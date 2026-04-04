@@ -53,6 +53,24 @@ def get_projection_safe_user_categorical_factors(df: pd.DataFrame) -> list[str]:
     return sorted(out)
 
 
+def _numeric_is_usable(df: pd.DataFrame, feature: str) -> bool:
+    s = pd.to_numeric(df.get(feature, np.nan), errors="coerce")
+    if int(s.nunique(dropna=True)) <= 1:
+        return False
+    if _freq_dominance(s) > 0.98:
+        return False
+    return True
+
+
+def _categorical_is_usable(df: pd.DataFrame, feature: str) -> bool:
+    s = df.get(feature, pd.Series(dtype=object)).astype(str).replace("nan", np.nan)
+    if int(s.nunique(dropna=True)) <= 1:
+        return False
+    if _freq_dominance(s) > 0.98:
+        return False
+    return True
+
+
 def build_v1_panel_feature_matrix(panel_daily: pd.DataFrame) -> pd.DataFrame:
     out = panel_daily.copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
@@ -75,11 +93,12 @@ def build_v1_panel_feature_matrix(panel_daily: pd.DataFrame) -> pd.DataFrame:
     out["sales_lag1"] = g["sales"].shift(1)
     out["sales_lag7"] = g["sales"].shift(7)
     out["sales_lag28"] = g["sales"].shift(28)
-    out["sales_ma7"] = g["sales"].shift(1).rolling(7, min_periods=1).mean().reset_index(level=0, drop=True)
-    out["sales_ma14"] = g["sales"].shift(1).rolling(14, min_periods=1).mean().reset_index(level=0, drop=True)
-    out["sales_ma28"] = g["sales"].shift(1).rolling(28, min_periods=1).mean().reset_index(level=0, drop=True)
+    shifted = out.groupby("product_id")["sales"].shift(1)
+    out["sales_ma7"] = shifted.groupby(out["product_id"]).transform(lambda s: s.rolling(7, min_periods=1).mean())
+    out["sales_ma14"] = shifted.groupby(out["product_id"]).transform(lambda s: s.rolling(14, min_periods=1).mean())
+    out["sales_ma28"] = shifted.groupby(out["product_id"]).transform(lambda s: s.rolling(28, min_periods=1).mean())
     out["sales_trend_gap_7_28"] = out["sales_ma7"] - out["sales_ma28"]
-    out["sales_std28"] = g["sales"].shift(1).rolling(28, min_periods=1).std().reset_index(level=0, drop=True).fillna(0.0)
+    out["sales_std28"] = shifted.groupby(out["product_id"]).transform(lambda s: s.rolling(28, min_periods=1).std(ddof=0)).fillna(0.0)
 
     out["dow"] = out["date"].dt.dayofweek.astype(int)
     out["is_weekend"] = (out["dow"] >= 5).astype(float)
@@ -103,8 +122,15 @@ def build_v1_feature_matrix(daily: pd.DataFrame) -> pd.DataFrame:
 def derive_v1_feature_spec(df: pd.DataFrame) -> Dict[str, Any]:
     user_num = get_projection_safe_user_numeric_factors(df)
     user_cat = get_projection_safe_user_categorical_factors(df)
-    numeric_demand = LAG_FEATURES + CAL_FEATURES + BUILTIN_NUMERIC + user_num
-    categorical_demand = [c for c in BUILTIN_CATEGORICAL + user_cat if c in df.columns]
+    raw_numeric = LAG_FEATURES + CAL_FEATURES + BUILTIN_NUMERIC + user_num
+    keep_always = set(LAG_FEATURES + CAL_FEATURES + ["price"])
+    numeric_demand = []
+    for c in raw_numeric:
+        if c not in df.columns:
+            continue
+        if c in keep_always or _numeric_is_usable(df, c):
+            numeric_demand.append(c)
+    categorical_demand = [c for c in BUILTIN_CATEGORICAL + user_cat if c in df.columns and _categorical_is_usable(df, c)]
     scenario_features = [c for c in SCENARIO_BASE if c in df.columns] + [c for c in user_num if c in df.columns]
     demand_features = numeric_demand + categorical_demand
     return {
