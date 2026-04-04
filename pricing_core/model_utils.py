@@ -78,6 +78,7 @@ def build_models(
     cat_features: Optional[List[str]] = None,
     sample_weight: Optional[pd.Series] = None,
     loss_function: str = "MAE",
+    training_profile: str = "final",
 ) -> List[Any]:
     _ = (kind, loss_function)
     cat_features = cat_features or []
@@ -88,20 +89,24 @@ def build_models(
     monotone_constraints_tuple = tuple(monotone_map.get(f, 0) for f in feature_names)
 
     ensemble: List[Any] = []
+    n_estimators = 700 if not small_mode else 400
+    if str(training_profile) == "backtest":
+        n_estimators = 350 if not small_mode else 200
     for i in range(int(n_models)):
         model = XGBRegressor(
             objective="count:poisson",
             eval_metric="poisson-nloglik",
             tree_method="hist",
             enable_categorical=True,
-            n_estimators=400 if not small_mode else 250,
-            max_depth=6 if not small_mode else 5,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=5,
-            reg_lambda=1.0,
-            reg_alpha=0.0,
+            n_estimators=n_estimators,
+            max_depth=4 if not small_mode else 3,
+            learning_rate=0.03,
+            subsample=0.9,
+            colsample_bytree=0.65,
+            min_child_weight=12,
+            reg_lambda=4.0,
+            reg_alpha=1.0,
+            max_cat_to_onehot=8,
             random_state=42 + i,
             monotone_constraints=monotone_constraints_tuple,
         )

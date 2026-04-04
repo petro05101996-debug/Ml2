@@ -6,8 +6,8 @@ from unittest.mock import patch
 from data_adapter import build_daily_panel_from_transactions
 from pricing_core.model_utils import XGBRegressor
 from pricing_core.v1_features import build_v1_panel_feature_matrix, derive_v1_feature_spec
-from pricing_core.v1_forecast import train_v1_demand_model
-from pricing_core.v1_orchestrator import run_full_pricing_analysis_universal_v1
+from pricing_core.v1_forecast import _build_demand_sample_weights, train_v1_demand_model
+from pricing_core.v1_orchestrator import _build_weekday_calibration, _metrics, _summarize_diag, run_full_pricing_analysis_universal_v1, run_v1_rolling_backtest
 from pricing_core.v1_scenario import run_v1_what_if_projection
 
 
@@ -63,6 +63,99 @@ def test_fallback_is_poisson_regressor():
     spec = derive_v1_feature_spec(fm.iloc[:80].copy())
     trained = train_v1_demand_model(fm.iloc[:80].copy(), spec, small_mode=True)
     assert isinstance(trained["fallback_model"], PoissonRegressor)
+
+
+def test_default_feature_spec_excludes_short_lags_from_demand():
+    fm = build_v1_panel_feature_matrix(build_daily_panel_from_transactions(_txn(100)))
+    spec = derive_v1_feature_spec(fm.iloc[:80].copy())
+    numeric = set(spec["numeric_demand_features"])
+    assert "sales_lag1" not in numeric
+    assert "sales_ma7" not in numeric
+    assert "sales_ma14" not in numeric
+    assert "sales_trend_gap_7_28" not in numeric
+    assert "time_index_norm" not in numeric
+    assert {"sales_lag1", "sales_ma7", "sales_ma14", "sales_trend_gap_7_28", "time_index_norm"}.issubset(set(fm.columns))
+
+
+def test_weight_builder_non_uniform():
+    df = _txn(80)
+    panel = build_daily_panel_from_transactions(df)
+    fm = build_v1_panel_feature_matrix(panel)
+    fm.loc[fm.index[-8:], "sales"] = 120.0
+    fm.loc[fm.index[-10:], "promotion"] = 1.0
+    fm.loc[fm.index[-12:], "discount"] = 0.4
+    w = _build_demand_sample_weights(fm)
+    assert (w > 1.0).any()
+    assert float(w.min()) >= 1.0
+    assert float(w.max()) <= 2.3
+
+
+def test_metrics_use_pred_sales_not_main():
+    diag = pd.DataFrame(
+        {
+            "actual_sales": [100.0, 100.0, 100.0],
+            "pred_sales": [100.0, 100.0, 100.0],
+            "pred_sales_main": [10.0, 10.0, 10.0],
+            "month": ["2025-01", "2025-01", "2025-01"],
+        }
+    )
+    m = _metrics(diag["actual_sales"], diag["pred_sales"])
+    s = _summarize_diag(diag, "month").iloc[0].to_dict()
+    assert m["forecast_wape"] == 0.0
+    assert s["forecast_wape"] == 0.0
+
+
+def test_rolling_backtest_returns_up_to_three_windows():
+    fm = build_v1_panel_feature_matrix(build_daily_panel_from_transactions(_txn(220)))
+    out = run_v1_rolling_backtest(fm, "cat", "sku-1")
+    assert int(out["rolling_summary"]["n_valid_windows"]) >= 1
+    assert int(out["rolling_summary"]["n_valid_windows"]) <= 3
+
+
+def test_rolling_backtest_uses_freshest_window():
+    window_days = 28
+    fm = build_v1_panel_feature_matrix(build_daily_panel_from_transactions(_txn(220)))
+    out = run_v1_rolling_backtest(fm, "cat", "sku-1", n_windows=3, window_days=window_days)
+    rolling_metrics = out["rolling_metrics"]
+    assert len(rolling_metrics) >= 1
+    freshest_expected = pd.Timestamp(fm["date"].max()) - pd.Timedelta(days=window_days - 1)
+    assert pd.Timestamp(rolling_metrics["window_start"].max()) == freshest_expected
+
+
+def test_backtest_training_profile_is_lighter_than_final():
+    fm = build_v1_panel_feature_matrix(build_daily_panel_from_transactions(_txn(160)))
+    spec = derive_v1_feature_spec(fm.iloc[:120].copy())
+    trained_backtest = train_v1_demand_model(fm.iloc[:120].copy(), spec, small_mode=True, training_profile="backtest")
+    trained_final = train_v1_demand_model(fm.iloc[:120].copy(), spec, small_mode=True, training_profile="final")
+    n_est_bt = int(trained_backtest["main_models"][0].get_params()["n_estimators"])
+    n_est_final = int(trained_final["main_models"][0].get_params()["n_estimators"])
+    assert n_est_final > n_est_bt
+
+
+def test_weight_builder_not_overweighting_flat_sales():
+    df = _txn(80)
+    panel = build_daily_panel_from_transactions(df)
+    fm = build_v1_panel_feature_matrix(panel)
+    fm["sales"] = 50.0
+    fm.loc[fm.index[:3], "sales"] = [50.0, 51.0, 49.0]
+    fm["promotion"] = 0.0
+    fm["discount"] = 0.0
+    w = _build_demand_sample_weights(fm)
+    assert np.isclose(float(w.max()), 1.0)
+    assert np.isclose(float(w.min()), 1.0)
+
+
+def test_weekday_calibration_clipped():
+    diag = pd.DataFrame(
+        {
+            "date": pd.date_range("2025-01-01", periods=28, freq="D"),
+            "actual_sales": [300.0] * 14 + [10.0] * 14,
+            "pred_sales": [10.0] * 14 + [300.0] * 14,
+        }
+    )
+    factors = _build_weekday_calibration(diag)
+    assert set(factors.keys()) == set(range(7))
+    assert all(0.92 <= float(v) <= 1.08 for v in factors.values())
 
 
 def test_no_fake_sales_fill_for_missing_days():
