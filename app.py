@@ -168,8 +168,31 @@ def maybe_run_analysis(ctx: Dict[str, Any]) -> None:
     if ctx.get("target_category") is None or ctx.get("target_sku") is None:
         st.error("Выберите категорию и SKU.")
         return
-    st.session_state.results = run_analysis_from_context(ctx)
+
+    with st.status("Запускаем ценовой анализ…", expanded=True) as status:
+        st.write("Подготовка данных и обучение модели")
+        try:
+            result = run_analysis_from_context(ctx)
+        except Exception as exc:
+            status.update(label="Ошибка при запуске анализа", state="error", expanded=True)
+            st.error("Не удалось завершить анализ. Проверьте входные данные и попробуйте снова.")
+            st.exception(exc)
+            return
+
+        if not result or "_trained_bundle" not in result:
+            status.update(label="Анализ не вернул обученную модель", state="error", expanded=True)
+            st.error("Анализ завершился без обученной модели. Проверьте полноту исторических данных.")
+            return
+
+        st.session_state.results = result
+        reco_price = result.get("recommended_price")
+        if reco_price is not None:
+            st.write(f"Модель обучена. Рекомендованная цена: {float(reco_price):,.2f}")
+        status.update(label="Анализ завершён", state="complete", expanded=False)
+
     st.session_state.active_page = "Результаты"
+    st.session_state.top_nav = "Результаты"
+    st.rerun()
 
 
 apply_enterprise_styles()
