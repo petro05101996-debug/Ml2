@@ -12,6 +12,10 @@ CAL_FEATURES = ["dow", "is_weekend", "sin_doy", "cos_doy", "month_sin", "month_c
 BUILTIN_NUMERIC = ["price", "discount", "promotion", "stock", "freight_value", "review_score", "reviews_count"]
 BUILTIN_CATEGORICAL = ["product_id", "category", "region", "channel", "segment"]
 SCENARIO_BASE = ["price", "discount", "promotion", "stock", "freight_value", "review_score", "reviews_count"]
+DEFAULT_DEMAND_LAGS = ["sales_lag7", "sales_lag28", "sales_ma28", "sales_std28"]
+DEFAULT_DEMAND_CAL = ["dow", "is_weekend", "sin_doy", "cos_doy", "month_sin", "month_cos"]
+DEFAULT_DEMAND_DRIVERS = ["price", "discount", "promotion"]
+OPTIONAL_NUMERIC_DEMAND = ["stock", "freight_value", "review_score"]
 
 
 def _freq_dominance(s: pd.Series) -> float:
@@ -122,14 +126,19 @@ def build_v1_feature_matrix(daily: pd.DataFrame) -> pd.DataFrame:
 def derive_v1_feature_spec(df: pd.DataFrame) -> Dict[str, Any]:
     user_num = get_projection_safe_user_numeric_factors(df)
     user_cat = get_projection_safe_user_categorical_factors(df)
-    raw_numeric = LAG_FEATURES + CAL_FEATURES + BUILTIN_NUMERIC + user_num
-    keep_always = set(LAG_FEATURES + CAL_FEATURES + ["price"])
+
+    default_numeric = DEFAULT_DEMAND_LAGS + DEFAULT_DEMAND_CAL + DEFAULT_DEMAND_DRIVERS
     numeric_demand = []
-    for c in raw_numeric:
+    for c in default_numeric:
         if c not in df.columns:
             continue
-        if c in keep_always or _numeric_is_usable(df, c):
+        if c in DEFAULT_DEMAND_DRIVERS or _numeric_is_usable(df, c):
             numeric_demand.append(c)
+
+    for c in OPTIONAL_NUMERIC_DEMAND + user_num:
+        if c in df.columns and _numeric_is_usable(df, c):
+            numeric_demand.append(c)
+
     categorical_demand = [c for c in BUILTIN_CATEGORICAL + user_cat if c in df.columns and _categorical_is_usable(df, c)]
     scenario_features = [c for c in SCENARIO_BASE if c in df.columns] + [c for c in user_num if c in df.columns]
     demand_features = numeric_demand + categorical_demand
@@ -191,5 +200,7 @@ def build_v1_one_step_features(
     for c in feature_spec.get("categorical_demand_features", []):
         row[c] = str(merged_ctx.get(c, "unknown"))
 
-    out = {c: row.get(c, "unknown" if c in feature_spec.get("cat_features_demand", []) else 0.0) for c in feature_spec.get("demand_features", [])}
-    return pd.DataFrame([out])
+    for c in feature_spec.get("demand_features", []):
+        if c not in row:
+            row[c] = "unknown" if c in feature_spec.get("cat_features_demand", []) else 0.0
+    return pd.DataFrame([row])

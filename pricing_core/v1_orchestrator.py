@@ -39,7 +39,7 @@ def _summarize_diag(diag: pd.DataFrame, key: str) -> pd.DataFrame:
         return pd.DataFrame()
     rows: List[Dict[str, Any]] = []
     for val, g in diag.groupby(key, dropna=False):
-        m = _metrics(g["actual_sales"], g["pred_sales_main"])
+        m = _metrics(g["actual_sales"], g["pred_sales"])
         m[key] = val
         rows.append(m)
     return pd.DataFrame(rows)
@@ -65,6 +65,7 @@ def run_v1_recursive_holdout(
     feature_spec: dict[str, Any],
     calibration_factor: float = 1.0,
     forecast_mode: str = "strong_signal",
+    weekday_factors: Dict[int, float] | None = None,
 ) -> pd.DataFrame:
     history = train_df.copy().sort_values("date")
     rows: List[Dict[str, Any]] = []
@@ -77,7 +78,9 @@ def run_v1_recursive_holdout(
             step_ctx[c] = str(tr.get(c, "unknown"))
         step = build_v1_one_step_features(history, pd.Timestamp(tr["date"]), step_ctx, hdays, feature_spec)
         pred_row = predict_v1_demand(step, trained_models, feature_spec, forecast_mode=forecast_mode).iloc[0].to_dict()
-        pred_row = {k: max(0.0, float(v) * float(calibration_factor)) for k, v in pred_row.items()}
+        wd_factor = float(weekday_factors.get(int(pd.Timestamp(tr["date"]).dayofweek), 1.0)) if weekday_factors else 1.0
+        combined_factor = float(calibration_factor) * wd_factor
+        pred_row = {k: max(0.0, float(v) * combined_factor) for k, v in pred_row.items()}
         rows.append(
             {
                 "date": pd.Timestamp(tr["date"]),
@@ -96,6 +99,100 @@ def run_v1_recursive_holdout(
         out["residual"] = out["pred_sales"] - out["actual_sales"]
         out["abs_error"] = out["residual"].abs()
     return out
+
+
+def run_v1_rolling_backtest(
+    panel_train: pd.DataFrame,
+    target_category: str,
+    target_sku: str,
+    n_windows: int = 3,
+    window_days: int = 28,
+    min_train_days: int = 120,
+) -> Dict[str, Any]:
+    cols = ["date", "actual_sales", "pred_sales", "pred_sales_main", "pred_sales_fallback", "month", "dow_name", "window_id", "window_start", "window_end"]
+    target_hist = panel_train[(panel_train["product_id"].astype(str) == str(target_sku)) & (panel_train["category"].astype(str) == str(target_category))].copy().sort_values("date")
+    if len(target_hist) == 0:
+        return {"rolling_diag": pd.DataFrame(columns=cols), "rolling_metrics": pd.DataFrame(), "rolling_summary": {"n_valid_windows": 0, "median_wape": np.nan, "median_bias_pct": np.nan, "median_sum_ratio": np.nan, "max_wape": np.nan, "min_sum_ratio": np.nan, "max_sum_ratio": np.nan}}
+
+    max_date = pd.Timestamp(target_hist["date"].max())
+    starts = [
+        max_date - pd.Timedelta(days=(window_days * (i + 1) - 1))
+        for i in range(int(n_windows))
+    ]
+    starts = sorted(starts)
+    rolling_diags: List[pd.DataFrame] = []
+    metrics_rows: List[Dict[str, Any]] = []
+
+    for idx, window_start in enumerate(starts, start=1):
+        window_end = window_start + pd.Timedelta(days=window_days)
+        panel_train_window = panel_train[panel_train["date"] < window_start].copy()
+        target_train_window = target_hist[target_hist["date"] < window_start].copy()
+        target_test_window = target_hist[(target_hist["date"] >= window_start) & (target_hist["date"] < window_end)].copy()
+        if len(target_test_window) == 0 or len(target_train_window) < int(min_train_days):
+            continue
+        if target_train_window["date"].nunique() < int(min_train_days):
+            continue
+
+        feature_spec_window = derive_v1_feature_spec(panel_train_window)
+        trained_window = train_v1_demand_model(
+            panel_train_window,
+            feature_spec_window,
+            small_mode=len(panel_train_window) < 200,
+            training_profile="backtest",
+        )
+
+        cal_factor_window = 1.0
+        cal_slice = target_train_window.tail(28).copy()
+        if len(cal_slice) >= 5:
+            seed_hist = target_train_window.iloc[:-len(cal_slice)].copy()
+            if len(seed_hist) >= 2:
+                cal_diag = run_v1_recursive_holdout(seed_hist, cal_slice, trained_window, feature_spec_window, calibration_factor=1.0, forecast_mode="strong_signal")
+                actual_sum = float(pd.to_numeric(cal_slice["sales"], errors="coerce").fillna(0.0).sum())
+                pred_sum = float(pd.to_numeric(cal_diag["pred_sales"], errors="coerce").fillna(0.0).sum())
+                if pred_sum > 1e-9:
+                    cal_factor_window = float(np.clip(actual_sum / pred_sum, 0.90, 1.20))
+
+        diag_window = run_v1_recursive_holdout(target_train_window, target_test_window, trained_window, feature_spec_window, calibration_factor=cal_factor_window, forecast_mode="strong_signal")
+        if len(diag_window) == 0:
+            continue
+        diag_window["window_id"] = idx
+        diag_window["window_start"] = pd.Timestamp(window_start)
+        diag_window["window_end"] = pd.Timestamp(window_end)
+        rolling_diags.append(diag_window)
+        metrics_rows.append({"window_id": idx, "window_start": pd.Timestamp(window_start), "window_end": pd.Timestamp(window_end), **_metrics(diag_window["actual_sales"], diag_window["pred_sales"])})
+
+    rolling_diag = pd.concat(rolling_diags, ignore_index=True) if rolling_diags else pd.DataFrame(columns=cols)
+    rolling_metrics = pd.DataFrame(metrics_rows)
+    rolling_summary = {
+        "n_valid_windows": int(len(rolling_metrics)),
+        "median_wape": float(rolling_metrics["forecast_wape"].median()) if len(rolling_metrics) else np.nan,
+        "median_bias_pct": float(rolling_metrics["bias_pct"].median()) if len(rolling_metrics) else np.nan,
+        "median_sum_ratio": float(rolling_metrics["sum_ratio"].median()) if len(rolling_metrics) else np.nan,
+        "max_wape": float(rolling_metrics["forecast_wape"].max()) if len(rolling_metrics) else np.nan,
+        "min_sum_ratio": float(rolling_metrics["sum_ratio"].min()) if len(rolling_metrics) else np.nan,
+        "max_sum_ratio": float(rolling_metrics["sum_ratio"].max()) if len(rolling_metrics) else np.nan,
+    }
+    return {"rolling_diag": rolling_diag, "rolling_metrics": rolling_metrics, "rolling_summary": rolling_summary}
+
+
+def _build_weekday_calibration(diag: pd.DataFrame) -> Dict[int, float]:
+    factors = {i: 1.0 for i in range(7)}
+    if len(diag) == 0 or "date" not in diag.columns:
+        return factors
+    local = diag.copy()
+    local["date"] = pd.to_datetime(local["date"], errors="coerce")
+    local["dow"] = local["date"].dt.dayofweek
+    for dow, g in local.groupby("dow"):
+        if len(g) < 2:
+            factors[int(dow)] = 1.0
+            continue
+        actual_sum = float(pd.to_numeric(g["actual_sales"], errors="coerce").fillna(0.0).sum())
+        pred_sum = float(pd.to_numeric(g["pred_sales"], errors="coerce").fillna(0.0).sum())
+        if pred_sum <= 1e-9:
+            factors[int(dow)] = 1.0
+        else:
+            factors[int(dow)] = float(np.clip(actual_sum / pred_sum, 0.92, 1.08))
+    return factors
 
 
 def assess_factor_identifiability(target_history: pd.DataFrame, feature_spec: dict) -> dict:
@@ -285,8 +382,18 @@ def run_full_pricing_analysis_universal_v1(normalized_txn: pd.DataFrame, target_
     panel_test = panel_features[panel_features["date"] >= holdout_start].copy()
     feature_spec = derive_v1_feature_spec(panel_train)
 
-    trained_models_bt = train_v1_demand_model(panel_train, feature_spec, small_mode=len(panel_train) < 200)
-    trained_models_final = train_v1_demand_model(panel_features, feature_spec, small_mode=len(panel_features) < 200)
+    trained_models_bt = train_v1_demand_model(
+        panel_train,
+        feature_spec,
+        small_mode=len(panel_train) < 200,
+        training_profile="backtest",
+    )
+    trained_models_final = train_v1_demand_model(
+        panel_features,
+        feature_spec,
+        small_mode=len(panel_features) < 200,
+        training_profile="final",
+    )
 
     target_train_history = target_history[target_history["date"] < holdout_start].copy()
     target_test_history = target_history[target_history["date"] >= holdout_start].copy()
@@ -299,12 +406,18 @@ def run_full_pricing_analysis_universal_v1(normalized_txn: pd.DataFrame, target_
             base_ctx_cal = _build_base_ctx(seed_hist, feature_spec, target_category, target_sku)
             cal_diag = run_v1_recursive_holdout(seed_hist, cal_slice, trained_models_bt, feature_spec, calibration_factor=1.0, forecast_mode="strong_signal")
             actual_sum = float(pd.to_numeric(cal_slice["sales"], errors="coerce").fillna(0.0).sum())
-            pred_sum = float(pd.to_numeric(cal_diag["pred_sales_main"], errors="coerce").fillna(0.0).sum())
+            pred_sum = float(pd.to_numeric(cal_diag["pred_sales"], errors="coerce").fillna(0.0).sum())
             if pred_sum > 1e-9:
                 cal_factor = float(np.clip(actual_sum / pred_sum, 0.90, 1.20))
 
-    holdout_diag = run_v1_recursive_holdout(target_train_history, target_test_history, trained_models_bt, feature_spec, calibration_factor=cal_factor, forecast_mode="strong_signal") if len(target_test_history) else pd.DataFrame(columns=["date", "actual_sales", "pred_sales", "pred_sales_main", "pred_sales_fallback", "month", "dow_name"])
-    metrics = _metrics(holdout_diag.get("actual_sales", pd.Series(dtype=float)), holdout_diag.get("pred_sales_main", pd.Series(dtype=float)))
+    rolling_backtest = run_v1_rolling_backtest(panel_train, target_category, target_sku, n_windows=3, window_days=28, min_train_days=120)
+    rolling_diag = rolling_backtest["rolling_diag"]
+    rolling_metrics = rolling_backtest["rolling_metrics"]
+    rolling_summary = rolling_backtest["rolling_summary"]
+    weekday_factors = _build_weekday_calibration(rolling_diag) if int(rolling_summary.get("n_valid_windows", 0)) >= 2 else {i: 1.0 for i in range(7)}
+
+    holdout_diag = run_v1_recursive_holdout(target_train_history, target_test_history, trained_models_bt, feature_spec, calibration_factor=cal_factor, forecast_mode="strong_signal", weekday_factors=weekday_factors) if len(target_test_history) else pd.DataFrame(columns=["date", "actual_sales", "pred_sales", "pred_sales_main", "pred_sales_fallback", "month", "dow_name"])
+    metrics = _metrics(holdout_diag.get("actual_sales", pd.Series(dtype=float)), holdout_diag.get("pred_sales", pd.Series(dtype=float)))
 
     holdout_by_month = _summarize_diag(holdout_diag, "month")
     holdout_by_dow = _summarize_diag(holdout_diag, "dow_name")
@@ -325,12 +438,26 @@ def run_full_pricing_analysis_universal_v1(normalized_txn: pd.DataFrame, target_
 
     recommendation_reasons: List[str] = []
     can_recommend = True
-    if metrics["forecast_wape"] > 35:
-        can_recommend = False
-        recommendation_reasons.append("high_wape")
-    if not (0.9 <= metrics["sum_ratio"] <= 1.1):
-        can_recommend = False
-        recommendation_reasons.append("sum_ratio_outside_bounds")
+    if int(rolling_summary.get("n_valid_windows", 0)) >= 2:
+        if float(rolling_summary.get("median_wape", np.inf)) > 28:
+            can_recommend = False
+            recommendation_reasons.append("rolling_wape_too_high")
+        if abs(float(rolling_summary.get("median_bias_pct", np.inf))) > 0.05:
+            can_recommend = False
+            recommendation_reasons.append("rolling_bias_too_high")
+        if not (0.95 <= float(rolling_summary.get("median_sum_ratio", 0.0)) <= 1.05):
+            can_recommend = False
+            recommendation_reasons.append("rolling_sum_ratio_outside_bounds")
+    else:
+        if metrics["forecast_wape"] > 30:
+            can_recommend = False
+            recommendation_reasons.append("high_wape")
+        if abs(metrics["bias_pct"]) > 0.05:
+            can_recommend = False
+            recommendation_reasons.append("bias_too_high")
+        if not (0.95 <= metrics["sum_ratio"] <= 1.05):
+            can_recommend = False
+            recommendation_reasons.append("sum_ratio_outside_bounds")
     if not factor_diag["price_signal_ok"]:
         can_recommend = False
         recommendation_reasons.append("price_signal_weak")
@@ -364,11 +491,11 @@ def run_full_pricing_analysis_universal_v1(normalized_txn: pd.DataFrame, target_
         recommendation_reasons.append("main_fallback_disagreement")
 
     latest_row = dict(base_ctx)
-    rec = recommend_v1_price_horizon(latest_row, trained_models_final, target_history, base_ctx, feature_spec, n_days=int(horizon_days), objective_mode=objective_mode, risk_lambda=float(risk_lambda), can_recommend=can_recommend, price_signal_ok=factor_diag["price_signal_ok"], calibration_factor=cal_factor, forecast_mode=forecast_mode)
+    rec = recommend_v1_price_horizon(latest_row, trained_models_final, target_history, base_ctx, feature_spec, n_days=int(horizon_days), objective_mode=objective_mode, risk_lambda=float(risk_lambda), can_recommend=can_recommend, price_signal_ok=factor_diag["price_signal_ok"], calibration_factor=cal_factor, forecast_mode=forecast_mode, weekday_factors=weekday_factors)
 
-    current_sim = simulate_v1_horizon_profit(latest_row, base_ctx["price"], future_dates, trained_models_final, target_history, base_ctx, feature_spec, risk_lambda=float(risk_lambda), calibration_factor=cal_factor, forecast_mode=forecast_mode)
+    current_sim = simulate_v1_horizon_profit(latest_row, base_ctx["price"], future_dates, trained_models_final, target_history, base_ctx, feature_spec, risk_lambda=float(risk_lambda), calibration_factor=cal_factor, forecast_mode=forecast_mode, weekday_factors=weekday_factors)
     optimal_price = float(rec.get("best_price", base_ctx["price"]))
-    optimal_sim = simulate_v1_horizon_profit(latest_row, optimal_price, future_dates, trained_models_final, target_history, base_ctx, feature_spec, risk_lambda=float(risk_lambda), calibration_factor=cal_factor, forecast_mode=forecast_mode)
+    optimal_sim = simulate_v1_horizon_profit(latest_row, optimal_price, future_dates, trained_models_final, target_history, base_ctx, feature_spec, risk_lambda=float(risk_lambda), calibration_factor=cal_factor, forecast_mode=forecast_mode, weekday_factors=weekday_factors)
 
     biz_rec = build_business_recommendation(current_price=float(base_ctx["price"]), recommended_price=float(optimal_price if can_recommend else base_ctx["price"]), current_profit=float(current_sim["total_profit"]), recommended_profit=float(optimal_sim["total_profit"] if can_recommend else current_sim["total_profit"]), current_revenue=float(current_sim["total_revenue"]), recommended_revenue=float(optimal_sim["total_revenue"] if can_recommend else current_sim["total_revenue"]), current_volume=float(current_sim["total_volume"]), recommended_volume=float(optimal_sim["total_volume"] if can_recommend else current_sim["total_volume"]), confidence=0.7 if can_recommend else 0.4, elasticity=-1.0, history_days=hist_days, data_quality={"label": forecast_mode, "issues": recommendation_reasons}, base_ctx=base_ctx, reason_hints={})
 
@@ -381,10 +508,28 @@ def run_full_pricing_analysis_universal_v1(normalized_txn: pd.DataFrame, target_
         holdout_by_month.to_excel(writer, sheet_name="holdout_by_month", index=False)
         holdout_by_dow.to_excel(writer, sheet_name="holdout_by_dow", index=False)
         pd.DataFrame([metrics]).to_excel(writer, sheet_name="metrics", index=False)
+        rolling_diag.to_excel(writer, sheet_name="rolling_diag", index=False)
+        rolling_metrics.to_excel(writer, sheet_name="rolling_metrics", index=False)
+        pd.DataFrame([rolling_summary]).to_excel(writer, sheet_name="rolling_summary", index=False)
+        pd.DataFrame([{"dow": k, "factor": v} for k, v in sorted(weekday_factors.items())]).to_excel(writer, sheet_name="weekday_calibration", index=False)
     excel_buffer.seek(0)
 
     holdout_metrics = dict(metrics)
-    holdout_metrics.update({"price_signal_ok": factor_diag["price_signal_ok"], "weak_factors": factor_diag["weak_factors"], "ood_flags": ood_flags, "forecast_mode": forecast_mode, "can_recommend_price": can_recommend})
+    holdout_metrics.update(
+        {
+            "price_signal_ok": factor_diag["price_signal_ok"],
+            "weak_factors": factor_diag["weak_factors"],
+            "ood_flags": ood_flags,
+            "forecast_mode": forecast_mode,
+            "can_recommend_price": can_recommend,
+            "rolling_n_windows": int(rolling_summary.get("n_valid_windows", 0)),
+            "rolling_median_wape": float(rolling_summary.get("median_wape", np.nan)),
+            "rolling_median_bias_pct": float(rolling_summary.get("median_bias_pct", np.nan)),
+            "rolling_median_sum_ratio": float(rolling_summary.get("median_sum_ratio", np.nan)),
+            "model_backend": str(trained_models_final.get("model_backend", "unknown")),
+            "weekday_calibration_enabled": bool(int(rolling_summary.get("n_valid_windows", 0)) >= 2),
+        }
+    )
 
     return {
         "daily": target_history,
@@ -421,8 +566,14 @@ def run_full_pricing_analysis_universal_v1(normalized_txn: pd.DataFrame, target_
             "base_ctx": base_ctx,
             "future_dates": future_dates,
             "calibration_factor": cal_factor,
+            "weekday_factors": weekday_factors,
+            "rolling_backtest": rolling_backtest,
             "factor_diagnostics": factor_diag,
             "model_price_effect_sign": sign_diag,
+            "model_backend": str(trained_models_final.get("model_backend", "unknown")),
+            "training_weight_min": float(trained_models_final.get("training_weight_min", 1.0)),
+            "training_weight_max": float(trained_models_final.get("training_weight_max", 1.0)),
+            "training_weight_mean": float(trained_models_final.get("training_weight_mean", 1.0)),
             "data_quality": {"label": forecast_mode, "issues": recommendation_reasons},
             "forecast_mode": forecast_mode,
             "can_recommend_price": can_recommend,
