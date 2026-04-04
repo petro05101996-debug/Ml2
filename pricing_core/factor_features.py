@@ -27,6 +27,9 @@ def _usable_numeric(df: pd.DataFrame, col: str) -> bool:
     vc = s.dropna().value_counts(normalize=True)
     if not vc.empty and float(vc.iloc[0]) > 0.98:
         return False
+    non_zero = s.fillna(0.0).abs() > 1e-12
+    if float(non_zero.mean()) < 0.02:
+        return False
     return True
 
 

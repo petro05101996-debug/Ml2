@@ -50,6 +50,30 @@ def _base_plotly_layout(title: str) -> Dict[str, Any]:
 
 
 def _format_report(r: Dict[str, Any], explanation: Dict[str, Any]) -> str:
+    if r.get("analysis_engine") == "v2_decomposed_baseline_factor_shock":
+        c = r.get("v2_result_contract", {})
+        lines = [
+            "# Отчёт v2 сценарного анализа",
+            "",
+            "## Краткий итог",
+            f"- Действие: {c.get('headline_action', '—')}",
+            f"- Обоснование: {c.get('headline_reason', '—')}",
+            f"- Режим: {c.get('mode', 'baseline_only')}",
+            f"- Overall confidence: {c.get('overall_confidence', 'low')}",
+            f"- Baseline demand: {float(c.get('baseline_total_demand', 0.0)):,.2f}",
+            f"- Scenario demand: {float(c.get('scenario_total_demand', 0.0)):,.2f}",
+            f"- Demand delta: {float(c.get('demand_delta_pct', 0.0)):+.2%}",
+            f"- Revenue delta: {float(c.get('revenue_delta_pct', 0.0)):+.2%}",
+            f"- Profit delta: {float(c.get('profit_delta_pct', 0.0)):+.2%}",
+            "",
+            "## OOD flags",
+            ", ".join([str(x) for x in c.get("ood_flags", [])]) if c.get("ood_flags") else "нет",
+            "",
+            "## Пояснение модели",
+            str(explanation.get("summary", "Нет дополнительного пояснения.")),
+        ]
+        return "\n".join(lines)
+
     decision = build_main_decision_text(r)
     objective = r.get("objective_mode", "—")
     current_price = float(r.get("current_price", 0.0))
@@ -174,8 +198,17 @@ def render_scenario_lab(r: Dict[str, Any]) -> None:
 
 
 def render_results_page(r: Dict[str, Any]) -> None:
-    decision = build_main_decision_text(r)
-    st.markdown(f"### {decision.get('action', '—')}")
+    if r.get("analysis_engine") == "v2_decomposed_baseline_factor_shock":
+        contract = r.get("v2_result_contract", {})
+        st.markdown(f"### {contract.get('headline_action', 'Сценарный анализ v2')}")
+        st.caption(contract.get("headline_reason", ""))
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Спрос Δ", f"{float(contract.get('demand_delta_pct', 0.0)):+.2%}")
+        k2.metric("Выручка Δ", f"{float(contract.get('revenue_delta_pct', 0.0)):+.2%}")
+        k3.metric("Прибыль Δ", f"{float(contract.get('profit_delta_pct', 0.0)):+.2%}")
+    else:
+        decision = build_main_decision_text(r)
+        st.markdown(f"### {decision.get('action', '—')}")
     explanation = generate_explanation(r, data_quality=r.get("data_quality", {}))
     col_excel, col_md = st.columns(2)
     excel_buffer = r.get("excel_buffer")
@@ -201,15 +234,24 @@ def render_results_page(r: Dict[str, Any]) -> None:
         use_container_width=True,
     )
     dq = r.get("data_quality", {}) or {}
-    st.caption(
-        f"Качество анализа: {dq.get('label', '—')}. "
-        f"Уровень: {dq.get('level', '—')}. "
-        "Метрика качества прогноза рассчитывается через WAPE на holdout-периоде."
-    )
-    if dq.get("issues"):
-        st.warning("Ограничения качества данных: " + "; ".join([str(x) for x in dq.get("issues", [])]))
+    if r.get("analysis_engine") == "v2_decomposed_baseline_factor_shock":
+        conf = r.get("confidence", {})
+        st.caption(
+            f"v2 confidence: overall={conf.get('overall_confidence', 'low')}; "
+            f"intervals_available={bool(r.get('intervals_available', False))}."
+        )
+        if conf.get("issues"):
+            st.warning("Ограничения confidence: " + "; ".join([str(x) for x in conf.get("issues", [])]))
+    else:
+        st.caption(
+            f"Качество анализа: {dq.get('label', '—')}. "
+            f"Уровень: {dq.get('level', '—')}. "
+            "Метрика качества прогноза рассчитывается через WAPE на holdout-периоде."
+        )
+        if dq.get("issues"):
+            st.warning("Ограничения качества данных: " + "; ".join([str(x) for x in dq.get("issues", [])]))
     holdout_metrics = r.get("holdout_metrics")
-    if isinstance(holdout_metrics, pd.DataFrame) and not holdout_metrics.empty:
+    if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and isinstance(holdout_metrics, pd.DataFrame) and not holdout_metrics.empty:
         st.dataframe(holdout_metrics, use_container_width=True)
         diag_row = holdout_metrics.iloc[0].to_dict()
         st.markdown("#### Диагностика модели")
@@ -229,15 +271,15 @@ def render_results_page(r: Dict[str, Any]) -> None:
         )
         if not bool(diag_row.get("can_recommend_price", False)):
             st.warning("Ценовой сигнал недостаточен для надёжной рекомендации.")
-    if st.button("Запустить: текущий vs рекомендованный vs консервативный", use_container_width=True):
+    if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.button("Запустить: текущий vs рекомендованный vs консервативный", use_container_width=True):
         st.session_state.scenario_table = run_scenario_set(r["_trained_bundle"], build_default_scenario_inputs(float(r["current_price"]), int(r.get("forecast_horizon_days", 30)), r["_trained_bundle"]["base_ctx"])[:3], run_v2_what_if_projection)
-    if st.session_state.get("scenario_table") is not None:
+    if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.session_state.get("scenario_table") is not None:
         st.dataframe(st.session_state.scenario_table, use_container_width=True)
     with st.expander("Расширенная аналитика", expanded=False):
         st.write(explanation.get("summary", ""))
-        if st.button("Запустить карту чувствительности", use_container_width=True):
+        if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.button("Запустить карту чувствительности", use_container_width=True):
             st.session_state.sensitivity_df = build_sensitivity_grid(r["_trained_bundle"], base_price=float(r["current_price"]), runner=run_v2_what_if_projection)
-        if st.session_state.get("sensitivity_df") is not None:
+        if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.session_state.get("sensitivity_df") is not None:
             heat = px.density_heatmap(st.session_state.sensitivity_df, x="price", y="demand_multiplier", z="profit", template="plotly_dark")
             heat.update_layout(**_base_plotly_layout("Чувствительность: цена × спрос"))
             st.plotly_chart(heat, use_container_width=True)
@@ -269,9 +311,14 @@ def maybe_run_analysis(ctx: Dict[str, Any]) -> None:
             return
 
         st.session_state.results = result
-        reco_price = result.get("recommended_price")
-        if reco_price is not None:
-            st.write(f"Модель обучена. Рекомендованная цена: {float(reco_price):,.2f}")
+        if result.get("analysis_engine") == "v2_decomposed_baseline_factor_shock":
+            action_line = (result.get("v2_result_contract") or {}).get("headline_action")
+            if action_line:
+                st.write(action_line)
+        else:
+            reco_price = result.get("recommended_price")
+            if reco_price is not None:
+                st.write(f"Модель обучена. Рекомендованная цена: {float(reco_price):,.2f}")
         status.update(label="Анализ завершён", state="complete", expanded=False)
 
     st.session_state.active_page = "Результаты"

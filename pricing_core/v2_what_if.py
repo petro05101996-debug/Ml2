@@ -44,7 +44,7 @@ def run_v2_what_if_projection(
         trained_factor=trained_bundle.get("trained_factor"),
         base_history=target_history,
         future_dates_df=future_dates,
-        baseline_feature_spec=trained_bundle.get("baseline_feature_spec_final", {}),
+        baseline_feature_spec=trained_bundle.get("baseline_feature_spec_full", trained_bundle.get("baseline_feature_spec_final", {})),
         factor_feature_spec=trained_bundle.get("factor_feature_spec"),
         scenario_overrides=overrides,
         shocks=(scenario or {}).get("shocks"),

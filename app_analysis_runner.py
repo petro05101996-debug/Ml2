@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from pricing_core import run_full_pricing_analysis_v2
+from pricing_core import build_v2_result_contract, run_full_pricing_analysis_v2
 
 
 UNIVERSAL_LOAD_MODES = {"Universal CSV", "Универсальный CSV"}
@@ -24,4 +24,6 @@ def run_analysis_from_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
     )
     result["analysis_route"] = "runner_to_v2_decomposed"
     result["ui_load_mode"] = str(load_mode if load_mode in UNIVERSAL_LOAD_MODES else "Universal CSV")
+    if result.get("analysis_engine") == "v2_decomposed_baseline_factor_shock":
+        result["v2_result_contract"] = build_v2_result_contract(result)
     return result

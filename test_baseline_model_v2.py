@@ -53,3 +53,10 @@ def test_baseline_oof_has_no_future_leakage():
 def test_baseline_fallback_works_on_tiny_history():
     fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(10)))
     assert len(fm) == 10
+
+
+def test_dense_oof_produces_enough_baseline_oof_rows():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(280)))
+    oof = build_baseline_oof_predictions(fm, "cat", "sku-1")
+    coverage = float(oof["baseline_oof"].notna().mean())
+    assert coverage >= 0.45

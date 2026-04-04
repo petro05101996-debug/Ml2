@@ -87,49 +87,84 @@ def _price_sign_stability(df: pd.DataFrame, trained_factor: Dict[str, Any], feat
     return float(np.mean(up <= base + 1e-9))
 
 
-def build_factor_ood_flags(target_history: pd.DataFrame, scenario_frame: pd.DataFrame, feature_spec: Dict[str, Any]) -> List[str]:
+def build_factor_ood_flags(target_history: pd.DataFrame, factor_future_df: pd.DataFrame, feature_spec: Dict[str, Any]) -> List[str]:
     flags: List[str] = []
-
     hist = target_history.copy()
+
     if "price_rel_to_recent_median_28" not in hist.columns and "price" in hist.columns:
-        ph = pd.to_numeric(hist.get("price"), errors="coerce")
-        ref = float(ph.tail(28).median()) if ph.notna().any() else 1.0
-        if not np.isfinite(ref) or ref <= 0:
-            ref = 1.0
-        hist["price_rel_to_recent_median_28"] = ph / ref - 1.0
+        ph = pd.to_numeric(hist.get("price"), errors="coerce").dropna()
+        recent_ref = float(ph.tail(28).median()) if len(ph) else np.nan
+        if not np.isfinite(recent_ref) or recent_ref <= 0:
+            recent_ref = float(ph.median()) if len(ph) else 1.0
+        if not np.isfinite(recent_ref) or recent_ref <= 0:
+            recent_ref = 1.0
+        hist["price_rel_to_recent_median_28"] = pd.to_numeric(hist.get("price"), errors="coerce") / recent_ref - 1.0
+
     if "discount_rate" not in hist.columns and "discount" in hist.columns:
         hist["discount_rate"] = pd.to_numeric(hist.get("discount"), errors="coerce")
 
-    numeric = ["price_rel_to_recent_median_28", "discount_rate", "stock"]
-    for c in numeric:
-        if c not in hist.columns or c not in scenario_frame.columns:
+    for c in ["price_rel_to_recent_median_28", "discount_rate", "stock"]:
+        if c not in hist.columns or c not in factor_future_df.columns:
             continue
         h = pd.to_numeric(hist[c], errors="coerce").dropna()
-        s = pd.to_numeric(scenario_frame[c], errors="coerce").dropna()
+        s = pd.to_numeric(factor_future_df[c], errors="coerce").dropna()
         if h.empty or s.empty:
             continue
         lo, hi = float(h.quantile(0.01)), float(h.quantile(0.99))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            continue
         if ((s < lo) | (s > hi)).any():
             flags.append(f"ood_numeric:{c}")
 
-    cat_cols = [
-        c for c in ["region", "channel", "segment"] + [x for x in feature_spec.get("factor_categorical_features", []) if str(x).startswith("user_factor_cat__")]
-        if c in hist.columns and c in scenario_frame.columns
-    ]
-    for c in cat_cols:
-        known = set(hist[c].astype(str).dropna().unique())
-        incoming = set(scenario_frame[c].astype(str).dropna().unique())
-        if any(v not in known for v in incoming):
+    default_cats = ["category", "region", "channel", "segment"]
+    user_cats = [c for c in feature_spec.get("factor_categorical_features", []) if str(c).startswith("user_factor_cat__")]
+    for c in default_cats + user_cats:
+        if c not in hist.columns or c not in factor_future_df.columns:
+            continue
+        known = set(hist[c].dropna().astype(str).unique())
+        incoming = set(factor_future_df[c].dropna().astype(str).unique())
+        if known and any(v not in known for v in incoming):
             flags.append(f"ood_category:{c}")
+
     return sorted(set(flags))
 
+
+
+def _estimate_window_ood_share(train_df: pd.DataFrame, test_df: pd.DataFrame) -> float:
+    if test_df.empty or train_df.empty:
+        return 0.0
+    flags = pd.Series(False, index=test_df.index)
+
+    for col in ["price_rel_to_recent_median_28", "discount_rate", "stock"]:
+        if col not in train_df.columns or col not in test_df.columns:
+            continue
+        h = pd.to_numeric(train_df[col], errors="coerce").dropna()
+        s = pd.to_numeric(test_df[col], errors="coerce")
+        if h.empty or s.dropna().empty:
+            continue
+        lo, hi = float(h.quantile(0.01)), float(h.quantile(0.99))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            continue
+        flags = flags | ((s < lo) | (s > hi)).fillna(False)
+
+    for col in ["category", "region", "channel", "segment"] + [c for c in test_df.columns if str(c).startswith("user_factor_cat__")]:
+        if col not in train_df.columns or col not in test_df.columns:
+            continue
+        known = set(train_df[col].dropna().astype(str).unique())
+        if not known:
+            continue
+        incoming = test_df[col].astype(str)
+        flags = flags | (~incoming.isin(known))
+
+    return float(flags.mean()) if len(flags) else 0.0
 
 def run_factor_rolling_backtest(factor_train_df: pd.DataFrame, feature_spec: Dict[str, Any], n_windows: int = 3, window_days: int = 28, min_train_days: int = 60) -> Dict[str, Any]:
     df = factor_train_df.copy().sort_values("date")
     if df.empty:
-        return {"trained": False, "n_valid_windows": 0}
+        return {"trained": False, "n_valid_windows": 0, "factor_ood_share": 0.0}
     max_date = pd.Timestamp(df["date"].max())
     starts = sorted([max_date - pd.Timedelta(days=(window_days * (i + 1) - 1)) for i in range(int(n_windows))])
+
     rows = []
     for ws in starts:
         we = ws + pd.Timedelta(days=window_days)
@@ -137,27 +172,31 @@ def run_factor_rolling_backtest(factor_train_df: pd.DataFrame, feature_spec: Dic
         te = df[(df["date"] >= ws) & (df["date"] < we)].copy()
         if tr["date"].nunique() < int(min_train_days) or te.empty:
             continue
-        model = train_factor_model(tr, feature_spec, small_mode=len(tr) < 200, training_profile="backtest")
-        pred = predict_factor_effect(te, model, feature_spec)
+
+        trained = train_factor_model(tr, feature_spec, small_mode=len(tr) < 200, training_profile="backtest")
+        pred = predict_factor_effect(te, trained, feature_spec)
         y = pd.to_numeric(te["factor_target"], errors="coerce").fillna(0.0)
         e = y - pred["factor_log_effect"]
-        rows.append({
-            "rmse": float(np.sqrt(np.mean(np.square(e)))),
-            "mae": float(np.mean(np.abs(e))),
-            "price_sign_stability": _price_sign_stability(te, model, feature_spec),
-            "factor_multiplier_median": float(pred["factor_multiplier"].median()),
-            "factor_multiplier_p95": float(pred["factor_multiplier"].quantile(0.95)),
-            "factor_ood_share": float(pd.to_numeric(te.get("ood_flag", pd.Series(0, index=te.index)), errors="coerce").fillna(0).mean()),
-        })
-    n_valid = len(rows)
-    if n_valid == 0:
-        return {"trained": False, "n_valid_windows": 0}
+        rows.append(
+            {
+                "factor_target_rmse": float(np.sqrt(np.mean(np.square(e)))),
+                "factor_target_mae": float(np.mean(np.abs(e))),
+                "price_sign_stability": _price_sign_stability(te, trained, feature_spec),
+                "factor_multiplier_median": float(pred["factor_multiplier"].median()),
+                "factor_multiplier_p95": float(pred["factor_multiplier"].quantile(0.95)),
+                "factor_ood_share": _estimate_window_ood_share(tr, te),
+            }
+        )
+
+    if not rows:
+        return {"trained": False, "n_valid_windows": 0, "factor_ood_share": 0.0}
+
     m = pd.DataFrame(rows)
     return {
         "trained": True,
-        "n_valid_windows": n_valid,
-        "median_factor_target_rmse": float(m["rmse"].median()),
-        "median_factor_target_mae": float(m["mae"].median()),
+        "n_valid_windows": int(len(m)),
+        "median_factor_target_rmse": float(m["factor_target_rmse"].median()),
+        "median_factor_target_mae": float(m["factor_target_mae"].median()),
         "price_sign_stability": float(m["price_sign_stability"].mean()),
         "factor_multiplier_median": float(m["factor_multiplier_median"].median()),
         "factor_multiplier_p95": float(m["factor_multiplier_p95"].median()),
@@ -166,7 +205,7 @@ def run_factor_rolling_backtest(factor_train_df: pd.DataFrame, feature_spec: Dic
 
 
 def run_factor_backtest(df: pd.DataFrame, trained_factor: Dict[str, Any], feature_spec: Dict[str, Any]) -> Dict[str, Any]:
-    # kept for compatibility
+    # kept for compatibility and local sanity checks
     pred = predict_factor_effect(df, trained_factor, feature_spec)
     y = pd.to_numeric(df.get("factor_target", 0.0), errors="coerce").fillna(0.0)
     e = y - pred["factor_log_effect"]

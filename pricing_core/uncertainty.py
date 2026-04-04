@@ -32,9 +32,10 @@ def build_factor_confidence_state(factor_backtest_summary, ood_flags) -> Dict[st
     n_train = int(factor_backtest_summary.get("n_train_rows", 0) or 0)
     n_windows = int(factor_backtest_summary.get("n_valid_windows", 0) or 0)
     price_unique = int(factor_backtest_summary.get("price_unique_count", 0) or 0)
-    n_var = int(factor_backtest_summary.get("n_variative_controllable_features", 0) or 0)
+    n_var = int(factor_backtest_summary.get("variative_controllable_count", factor_backtest_summary.get("n_variative_controllable_features", 0)) or 0)
+    train_scope = str(factor_backtest_summary.get("train_scope", "none"))
 
-    if pss >= 0.75 and ood_share <= 0.10 and n_windows >= 1 and n_train >= 60:
+    if pss >= 0.75 and ood_share <= 0.10 and n_windows >= 1 and n_train >= 80 and price_unique >= 4:
         lvl = "high"
     elif pss >= 0.55 and n_windows >= 1:
         lvl = "medium"
@@ -44,12 +45,20 @@ def build_factor_confidence_state(factor_backtest_summary, ood_flags) -> Dict[st
     if n_windows < 1:
         issues.append("factor_backtest_missing")
         lvl = "low"
-    if n_train < 60:
+    if n_train < 45:
         issues.append("factor_train_too_small")
         lvl = "low"
-    if price_unique < 4 and n_var <= 1:
+    if price_unique < 3 and n_var < 2:
         issues.append("factor_variation_weak")
         lvl = "low"
+    if n_train < 80 or price_unique < 4:
+        if lvl == "high":
+            lvl = "medium"
+        issues.append("factor_data_limited")
+    if train_scope == "pooled":
+        if lvl == "high":
+            lvl = "medium"
+        issues.append("factor_trained_on_pooled_scope")
     if ood_flags:
         issues.append("factor_ood_detected")
         if lvl == "high":
