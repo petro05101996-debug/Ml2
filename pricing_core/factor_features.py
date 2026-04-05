@@ -36,7 +36,7 @@ def _usable_numeric(df: pd.DataFrame, col: str) -> bool:
 
 
 def derive_factor_feature_spec(df: pd.DataFrame) -> Dict[str, Any]:
-    base_num = ["price", "discount", "promotion", "price_rel_to_recent_median_28", "discount_rate", "promo_flag"]
+    base_num = ["price", "discount", "promotion", "cost", "freight_value", "price_rel_to_recent_median_28", "discount_rate", "promo_flag"]
     user_num = [c for c in df.columns if c.startswith("user_factor_num__") and _usable_numeric(df, c)]
     factor_numeric = base_num + user_num
 

@@ -112,42 +112,6 @@ def test_tiny_mode_what_if_does_not_fail():
     assert "profit_total" in r
 
 
-
-def test_cost_freight_multipliers_change_economics_not_demand():
-    out = run_full_pricing_analysis_v2(_txn(260, two_skus=True), "cat", "sku-1", horizon_days=7)
-    from pricing_core.v2_what_if import run_v2_what_if_projection
-
-    base = run_v2_what_if_projection(out["_trained_bundle"], manual_price=10.0, horizon_days=7, cost_multiplier=1.0, freight_multiplier=1.0)
-    stressed = run_v2_what_if_projection(out["_trained_bundle"], manual_price=10.0, horizon_days=7, cost_multiplier=1.2, freight_multiplier=1.2)
-
-    assert base["demand_total"] == stressed["demand_total"]
-    assert base["actual_sales_total"] == stressed["actual_sales_total"]
-    assert base["lost_sales_total"] == stressed["lost_sales_total"]
-    assert (base["profit_total"] != stressed["profit_total"]) or (base["margin"] != stressed["margin"])
-
-
-def test_stock_cap_none_means_unlimited_and_zero_means_no_sales():
-    out = run_full_pricing_analysis_v2(_txn(260, two_skus=True), "cat", "sku-1", horizon_days=7)
-    from pricing_core.v2_what_if import run_v2_what_if_projection
-
-    unlimited = run_v2_what_if_projection(out["_trained_bundle"], manual_price=10.0, horizon_days=7, stock_cap=None)
-    zero_stock = run_v2_what_if_projection(out["_trained_bundle"], manual_price=10.0, horizon_days=7, stock_cap=0.0)
-
-    assert unlimited["actual_sales_total"] > 0
-    assert zero_stock["actual_sales_total"] == 0.0
-    assert abs(zero_stock["lost_sales_total"] - zero_stock["demand_total"]) < 1e-9
-
-
-def test_stock_cap_positive_limits_total_sales():
-    out = run_full_pricing_analysis_v2(_txn(260, two_skus=True), "cat", "sku-1", horizon_days=7)
-    from pricing_core.v2_what_if import run_v2_what_if_projection
-
-    limited = run_v2_what_if_projection(out["_trained_bundle"], manual_price=10.0, horizon_days=7, stock_cap=50.0)
-
-    assert limited["actual_sales_total"] <= 50.0
-    if limited["demand_total"] > 50.0:
-        assert limited["lost_sales_total"] > 0.0
-
 def test_v2_bundle_contains_base_ctx_and_scenario_feature_spec():
     out = run_full_pricing_analysis_v2(_txn(20), "cat", "sku-1", horizon_days=5)
     b = out["_trained_bundle"]

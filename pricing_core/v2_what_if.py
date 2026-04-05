@@ -36,7 +36,7 @@ def run_v2_what_if_projection(
         "cost": float(base_ctx.get("cost", 0.0)) * float(cost_multiplier),
         "freight_value": float(base_ctx.get("freight_value", 0.0)) * float(freight_multiplier),
     }
-    if stock_cap is not None:
+    if stock_cap > 0:
         overrides["stock_total_horizon"] = float(stock_cap)
 
     for k, v in factors.items():

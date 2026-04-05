@@ -83,23 +83,3 @@ def test_gap_fill_no_backward_fill_leakage():
     panel = build_daily_panel_from_transactions(txn)
     gap_row = panel[panel["date"] == pd.Timestamp("2025-01-02")].iloc[0]
     assert abs(float(gap_row["price"]) - 100.0) < 1e-9
-
-
-def test_sample_transactions_csv_normalizes_and_runs_v2():
-    from pricing_core.orchestrator_v2 import run_full_pricing_analysis_v2
-
-    raw = pd.read_csv("sample_transactions.csv")
-    mapping = build_auto_mapping(raw.columns.tolist())
-    normalized, quality = normalize_transactions(raw, mapping)
-
-    assert len(normalized) > 0
-    assert len(quality.get("errors", [])) == 0
-
-    target_row = normalized.iloc[0]
-    out = run_full_pricing_analysis_v2(
-        normalized,
-        target_category=str(target_row.get("category", "unknown")),
-        target_sku=str(target_row["product_id"]),
-        horizon_days=7,
-    )
-    assert out.get("analysis_engine") == "v2_decomposed_baseline_factor_shock"

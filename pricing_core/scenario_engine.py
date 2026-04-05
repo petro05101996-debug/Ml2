@@ -150,9 +150,8 @@ def run_scenario_forecast(
     out["shock_multiplier"] = pd.to_numeric(out["shock_multiplier"], errors="coerce").fillna(1.0).clip(0.2, 5.0)
     out["scenario_demand_raw"] = (out["baseline_pred"] * out["factor_multiplier"] * out["shock_multiplier"] * float(demand_multiplier)).clip(lower=0.0)
 
-    stock_cap_explicit = bool(scenario_overrides is not None and "stock_total_horizon" in scenario_overrides)
     total_stock = float(pd.to_numeric(pd.Series([scenario_ctx.get("stock_total_horizon", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
-    if stock_cap_explicit and np.isfinite(total_stock):
+    if np.isfinite(total_stock) and total_stock > 0:
         cap_df = apply_total_stock_cap(out["scenario_demand_raw"], total_stock)
         out = pd.concat([out.reset_index(drop=True), cap_df], axis=1)
     else:

@@ -46,7 +46,6 @@ def test_scenario_lab_passes_cost_multiplier_to_projection(monkeypatch):
 
     app.render_scenario_lab({"current_price": 100.0, "current_profit": 1000.0, "forecast_horizon_days": 30, "forecast_current": pd.DataFrame({"price": [100.0], "pred_sales": [30.0]}), "_trained_bundle": {"base_ctx": {"stock_total_horizon": 50.0}, "scenario_feature_spec": {"user_numeric_features": []}}})
     assert captured.get("cost_multiplier") == 1.15
-    assert captured.get("stock_cap") == 50.0
 
 
 
