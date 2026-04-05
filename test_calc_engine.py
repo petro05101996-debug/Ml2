@@ -7,18 +7,18 @@ def test_unit_economics_revenue_and_profit_formula():
     daily = pd.DataFrame({"price": [100.0], "cost": [60.0], "pred_sales": [10.0], "discount": [0.1]})
     out, checks = compute_daily_unit_economics(daily)
     assert checks["sanity_warnings"] == []
-    assert float(out.loc[0, "effective_unit_price"]) == 90.0
-    assert float(out.loc[0, "total_revenue"]) == 900.0
+    assert float(out.loc[0, "effective_unit_price"]) == 100.0
+    assert float(out.loc[0, "total_revenue"]) == 1000.0
     assert float(out.loc[0, "total_cost"]) == 600.0
-    assert float(out.loc[0, "profit"]) == 300.0
+    assert float(out.loc[0, "profit"]) == 400.0
 
 
-def test_stock_cap_keeps_formula_consistent():
+def test_quantity_drives_formula_without_stock_capping_in_economics():
     daily = pd.DataFrame({"price": [120.0], "cost": [70.0], "pred_sales": [25.0], "discount": [0.0]})
     out, _ = compute_daily_unit_economics(daily, stock_cap=8.0)
-    assert float(out.loc[0, "pred_quantity"]) == 8.0
-    assert float(out.loc[0, "total_revenue"]) == 960.0
-    assert float(out.loc[0, "profit"]) == 400.0
+    assert float(out.loc[0, "actual_quantity"]) == 25.0
+    assert float(out.loc[0, "total_revenue"]) == 3000.0
+    assert float(out.loc[0, "profit"]) == 1250.0
 
 
 def test_discount_sanitized_to_supported_range():

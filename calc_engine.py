@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+from df_utils import get_numeric_series
+
 
 def sanitize_discount(discount: Any) -> float:
     val = float(pd.to_numeric(pd.Series([discount]), errors="coerce").fillna(0.0).iloc[0])
@@ -28,28 +30,25 @@ def compute_daily_unit_economics(
     stock_cap: float = 0.0,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = daily.copy()
-    out["unit_price"] = pd.to_numeric(out.get(unit_price_col, 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
-    out["unit_cost"] = pd.to_numeric(out.get(unit_cost_col, 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
-    out["pred_quantity"] = pd.to_numeric(out.get(quantity_col, 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
-    out["raw_discount_rate"] = pd.to_numeric(out.get(discount_col, 0.0), errors="coerce").fillna(0.0)
+    out["unit_price"] = get_numeric_series(out, unit_price_col, 0.0).fillna(0.0).clip(lower=0.0)
+    out["unit_cost"] = get_numeric_series(out, unit_cost_col, 0.0).fillna(0.0).clip(lower=0.0)
+    out["actual_quantity"] = get_numeric_series(out, quantity_col, 0.0).fillna(0.0).clip(lower=0.0)
+    out["pred_quantity"] = out["actual_quantity"]
+    out["raw_discount_rate"] = get_numeric_series(out, discount_col, 0.0).fillna(0.0)
     out["discount_rate"] = out["raw_discount_rate"].clip(lower=0.0, upper=0.95)
-    freight_raw = out[freight_col] if freight_col in out.columns else pd.Series(0.0, index=out.index)
-    out["freight_value"] = pd.to_numeric(freight_raw, errors="coerce").fillna(0.0).clip(lower=0.0)
+    out["freight_value"] = get_numeric_series(out, freight_col, 0.0).fillna(0.0).clip(lower=0.0)
 
-    if stock_cap and stock_cap > 0:
-        out["pred_quantity"] = np.minimum(out["pred_quantity"], float(stock_cap))
-
-    out["effective_unit_price"] = out["unit_price"] * (1.0 - out["discount_rate"])
-    out["total_revenue"] = out["effective_unit_price"] * out["pred_quantity"]
+    out["effective_unit_price"] = out["unit_price"]
+    out["total_revenue"] = out["effective_unit_price"] * out["actual_quantity"]
     out["unit_variable_cost"] = out["unit_cost"] + out["freight_value"]
-    out["total_cost"] = out["unit_variable_cost"] * out["pred_quantity"]
+    out["total_cost"] = out["unit_variable_cost"] * out["actual_quantity"]
     out["profit"] = out["total_revenue"] - out["total_cost"]
     out["margin"] = np.where(out["total_revenue"] > 0, out["profit"] / out["total_revenue"], 0.0)
 
     checks: List[str] = []
     if (out["total_revenue"] < -1e-9).any():
         checks.append("negative_revenue")
-    if (out["pred_quantity"] < -1e-9).any():
+    if (out["actual_quantity"] < -1e-9).any():
         checks.append("negative_quantity")
     if ((out["raw_discount_rate"] < 0) | (out["raw_discount_rate"] > 0.95)).any():
         checks.append("discount_raw_out_of_range")

@@ -39,8 +39,8 @@ def _tiny_baseline_fallback(target_history: pd.DataFrame, future_dates: pd.DataF
         {
             "date": pd.to_datetime(future_dates["date"]),
             "baseline_pred": max(0.0, base),
-            "baseline_lower": max(0.0, base),
-            "baseline_upper": max(0.0, base),
+            "baseline_lower": np.nan,
+            "baseline_upper": np.nan,
         }
     )
 
@@ -119,7 +119,7 @@ def _build_pooled_factor_train(panel_train: pd.DataFrame, target_category: str, 
     return {"factor_train": factor_train, "pooled_skus_used": used_skus, "pooled_rows_used": int(len(factor_train))}
 
 
-def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: str, target_sku: str, horizon_days: int = 30, scenario_overrides: Dict[str, Any] | None = None, shocks: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: str, target_sku: str, horizon_days: int = 30, scenario_overrides: Dict[str, Any] | None = None, shocks: List[Dict[str, Any]] | None = None, objective_mode: str = "maximize_profit") -> Dict[str, Any]:
     panel_daily = build_daily_panel_from_transactions(normalized_txn)
     panel_features_baseline = build_baseline_feature_matrix(panel_daily)
     target_history = panel_features_baseline[(panel_features_baseline["category"].astype(str) == str(target_category)) & (panel_features_baseline["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
@@ -155,8 +155,8 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
             for c in baseline_feature_spec_full.get("baseline_context_features", [])
         }
         baseline_forecast = recursive_baseline_forecast(trained_baseline_final, target_history, future_dates, base_ctx, baseline_feature_spec_full)
-        baseline_forecast["baseline_lower"] = baseline_forecast["baseline_pred"]
-        baseline_forecast["baseline_upper"] = baseline_forecast["baseline_pred"]
+        baseline_forecast["baseline_lower"] = np.nan
+        baseline_forecast["baseline_upper"] = np.nan
 
         baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku)
         baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku)
@@ -255,7 +255,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
     s_input["discount"] = float(scn_ctx.get("discount", b_input["discount"].iloc[0]))
     s_input["cost"] = float(scn_ctx.get("cost", b_input["cost"].iloc[0]))
     s_input["freight_value"] = float(scn_ctx.get("freight_value", b_input["freight_value"].iloc[0]))
-    scenario_economics, _ = compute_daily_unit_economics(s_input, quantity_col="final_demand")
+    scenario_economics, _ = compute_daily_unit_economics(s_input, quantity_col="actual_sales")
 
     demand_delta = compute_scenario_delta(baseline_forecast, scenario_forecast)
     baseline_total_revenue = float(baseline_economics["total_revenue"].sum())
@@ -272,7 +272,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
     delta_summary["profit_delta_abs"] = scenario_total_profit - baseline_total_profit
     delta_summary["profit_delta_pct"] = 0.0 if abs(baseline_total_profit) < 1e-9 else (scenario_total_profit - baseline_total_profit) / baseline_total_profit
 
-    factor_contributions = compute_factor_contributions(target_history, future_dates, base_ctx, scn_ctx, trained_factor, factor_feature_spec if factor_model_trained else {"controllable_features": []}) if factor_model_trained else pd.DataFrame(columns=["factor_name", "contribution_abs", "contribution_pct", "confidence", "note"])
+    factor_contributions = compute_factor_contributions(target_history, future_dates, base_ctx, scn_ctx, trained_factor, factor_feature_spec if factor_model_trained else {"controllable_features": []}) if factor_model_trained else pd.DataFrame(columns=["factor_name", "multiplier_delta", "contribution_pct", "confidence", "note"])
 
     baseline_conf = build_baseline_confidence_state(baseline_rolling.get("rolling_summary", {}))
     factor_conf = build_factor_confidence_state(factor_backtest, ood_flags=scenario_result.get("ood_flags", []))
@@ -298,6 +298,13 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
     ood_flags = scenario_result.get("ood_flags", [])
     intervals_available = False
 
+
+    scenario_feature_spec = {
+        "user_numeric_features": [c for c in (factor_feature_spec or {}).get("controllable_features", []) if str(c).startswith("user_factor_num__")],
+        "user_categorical_features": [c for c in (factor_feature_spec or {}).get("controllable_features", []) if str(c).startswith("user_factor_cat__")],
+        "supported_controls": list((factor_feature_spec or {}).get("controllable_features", [])),
+    }
+
     bundle = build_model_bundle(
         trained_baseline_bt=trained_baseline_bt,
         trained_baseline_final=trained_baseline_final,
@@ -322,6 +329,13 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         intervals_available=intervals_available,
         pooled_skus_used=pooled_skus_used,
         pooled_rows_used=pooled_rows_used,
+        base_ctx=base_ctx,
+        baseline_forecast=baseline_forecast[["date", "baseline_pred", "baseline_lower", "baseline_upper"]].copy(),
+        scenario_feature_spec=scenario_feature_spec,
+        feature_spec=scenario_feature_spec,
+        current_price=float(base_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])),
+        forecast_horizon_days=int(horizon_days),
+        objective_mode=str(objective_mode),
     )
 
     return {
