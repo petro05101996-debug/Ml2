@@ -28,7 +28,7 @@ def build_base_scenario_context(target_history: pd.DataFrame, factor_feature_spe
         else:
             out[c] = 0.0
 
-    for c in ["product_id", "category"] + SCENARIO_CATEGORICAL_KEYS + user_cat:
+    for c in ["series_id", "product_id", "category", "region", "channel", "segment"] + SCENARIO_CATEGORICAL_KEYS + user_cat:
         if c in target_history.columns:
             s = target_history[c].dropna().astype(str)
             out[c] = str(s.iloc[-1]) if len(s) else "unknown"
@@ -119,7 +119,16 @@ def run_scenario_forecast(
     baseline_override_df: pd.DataFrame | None = None,
     demand_multiplier: float = 1.0,
 ) -> Dict[str, Any]:
-    base_ctx = {c: (base_history[c].dropna().astype(str).iloc[-1] if c in ["product_id", "category"] and c in base_history else 0.0) for c in baseline_feature_spec.get("baseline_context_features", [])}
+    base_ctx = {}
+    for c in baseline_feature_spec.get("baseline_context_features", []):
+        if c in base_history.columns:
+            s = base_history[c].dropna()
+            if len(s):
+                base_ctx[c] = str(s.astype(str).iloc[-1]) if not pd.api.types.is_numeric_dtype(base_history[c]) else float(pd.to_numeric(s, errors="coerce").dropna().iloc[-1])
+            else:
+                base_ctx[c] = "unknown"
+        else:
+            base_ctx[c] = "unknown"
 
     if baseline_override_df is not None:
         baseline_df = baseline_override_df[["date", "baseline_pred"]].copy()
@@ -130,23 +139,50 @@ def run_scenario_forecast(
 
     feature_spec = factor_feature_spec or {
         "controllable_features": ["price", "discount", "promotion"],
-        "context_features": ["product_id", "category"],
+        "context_features": ["series_id", "product_id", "category", "region", "channel", "segment"],
         "factor_numeric_features": ["price", "discount", "promotion", "price_rel_to_recent_median_28", "discount_rate", "promo_flag"],
         "factor_features": ["price", "discount", "promotion", "price_rel_to_recent_median_28", "discount_rate", "promo_flag", "price_rel_to_recent_median_28_x_promo_flag", "price_rel_to_recent_median_28_x_is_weekend"],
-        "factor_categorical_features": ["product_id", "category"],
+        "factor_categorical_features": ["series_id", "product_id", "category", "region", "channel", "segment"],
     }
     base_scn_ctx = build_base_scenario_context(base_history, feature_spec)
     scenario_ctx = apply_user_overrides(base_scn_ctx, scenario_overrides)
     factor_future = build_future_factor_frame(base_history, future_dates_df, scenario_ctx, feature_spec)
     ood_flags = build_factor_ood_flags(base_history, factor_future, feature_spec)
 
+    scenario_effect_source = "ml_factor_model"
     if trained_factor is not None and factor_feature_spec is not None:
         factor_pred = predict_factor_effect(factor_future, trained_factor, factor_feature_spec)
         factor_mult = factor_pred["factor_multiplier"].values
         mode = "baseline_plus_scenario"
     else:
-        factor_mult = np.ones(len(baseline_df))
-        mode = "baseline_only"
+        hist = base_history.copy()
+        hist["price"] = pd.to_numeric(hist.get("price", np.nan), errors="coerce")
+        hist["sales"] = pd.to_numeric(hist.get("sales", np.nan), errors="coerce")
+        if "stockout_flag" in hist.columns:
+            stockout_mask = pd.to_numeric(hist["stockout_flag"], errors="coerce").fillna(0.0) > 0
+            if stockout_mask.any():
+                hist = hist[~stockout_mask].copy()
+        hist = hist.dropna(subset=["price", "sales"])
+        price_ref = float(hist["price"].tail(28).median()) if len(hist) else 1.0
+        if not np.isfinite(price_ref) or price_ref <= 0:
+            price_ref = 1.0
+        price_new = float(pd.to_numeric(pd.Series([scenario_ctx.get("price", price_ref)]), errors="coerce").fillna(price_ref).iloc[0])
+        discount_new = float(pd.to_numeric(pd.Series([scenario_ctx.get("discount", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        promotion_new = float(pd.to_numeric(pd.Series([scenario_ctx.get("promotion", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+
+        elasticity = -1.1
+        if len(hist) >= 20 and hist["price"].nunique() > 2:
+            log_p = np.log(hist["price"].clip(lower=1e-6))
+            log_q = np.log(hist["sales"].clip(lower=1e-6))
+            beta = np.polyfit(log_p.values, log_q.values, 1)[0]
+            if np.isfinite(beta):
+                elasticity = float(np.clip(beta, -3.0, -0.05))
+        price_mult = float(np.clip((max(price_new, 1e-6) / price_ref) ** elasticity, 0.25, 4.0))
+        promo_mult = 1.1 if promotion_new > 0 else 1.0
+        discount_mult = float(np.clip(1.0 + max(discount_new, 0.0) * 0.25, 1.0, 1.3))
+        factor_mult = np.full(len(baseline_df), float(np.clip(price_mult * promo_mult * discount_mult, 0.2, 5.0)))
+        mode = "fallback_elasticity"
+        scenario_effect_source = "fallback_elasticity"
 
     shock_df = build_shock_profile(shocks, future_dates_df) if shocks else build_default_no_shock_profile(future_dates_df)
     out = baseline_df.merge(shock_df, on="date", how="left")
@@ -167,13 +203,36 @@ def run_scenario_forecast(
     out["final_demand"] = out["actual_sales"]
     out["scenario_lower"] = np.nan
     out["scenario_upper"] = np.nan
+    warnings = list(scenario_ctx.get("_warnings", []))
+    if "stockout_flag" in base_history.columns and (pd.to_numeric(base_history["stockout_flag"], errors="coerce").fillna(0.0) > 0).any():
+        warnings.append("stockout_history_present")
+    if len(base_history) < 30:
+        warnings.append("low_history_depth")
+    price_hist = pd.to_numeric(base_history.get("price", np.nan), errors="coerce").dropna()
+    if len(price_hist) and "price" in scenario_ctx:
+        pmin, pmax = float(price_hist.min()), float(price_hist.max())
+        pnew = float(pd.to_numeric(pd.Series([scenario_ctx.get("price")]), errors="coerce").fillna(np.nan).iloc[0])
+        if np.isfinite(pnew) and (pnew < pmin * 0.7 or pnew > pmax * 1.3):
+            warnings.append("price_override_out_of_history_range")
+    dnew = float(pd.to_numeric(pd.Series([scenario_ctx.get("discount", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    if dnew > 0.7:
+        warnings.append("extreme_discount")
+    if mode == "fallback_elasticity":
+        if len(hist) < 20:
+            warnings.append("fallback_elasticity_low_sample")
+        if hist["price"].nunique(dropna=True) <= 2:
+            warnings.append("weak_price_variation_for_elasticity")
+        warnings.append("weak_factor_trainability")
+
     return {
         "scenario_forecast": out[["date", "baseline_pred", "factor_multiplier", "shock_multiplier", "scenario_demand_raw", "actual_sales", "lost_sales", "remaining_stock", "final_demand", "scenario_lower", "scenario_upper"]],
         "base_ctx": base_scn_ctx,
         "scenario_ctx": scenario_ctx,
-        "warnings": scenario_ctx.get("_warnings", []),
+        "warnings": warnings,
         "ood_flags": ood_flags,
         "mode": mode,
+        "scenario_mode": mode,
+        "scenario_effect_source": scenario_effect_source,
     }
 
 

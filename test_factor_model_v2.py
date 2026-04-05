@@ -107,3 +107,29 @@ def test_user_factor_cat_override_applied_to_future_frame():
     fut = pd.DataFrame({"date": pd.date_range(df["date"].max() + pd.Timedelta(days=1), periods=2, freq="D")})
     frame = build_future_factor_frame(df, fut, {"price": 100.0, "discount": 0.05, "promotion": 0.0, "product_id": "sku-1", "category": "cat", "user_factor_cat__campaign": "B"}, spec)
     assert set(frame["user_factor_cat__campaign"].astype(str).unique()) == {"B"}
+
+
+def test_price_rel_median_is_series_scoped():
+    d = pd.date_range("2025-01-01", periods=35, freq="D")
+    df = pd.DataFrame(
+        {
+            "date": list(d) + list(d),
+            "product_id": ["sku-1"] * 70,
+            "category": ["cat"] * 70,
+            "region": ["US"] * 35 + ["EU"] * 35,
+            "channel": ["online"] * 70,
+            "segment": ["retail"] * 70,
+            "series_id": ["sku-1|US|online|retail"] * 35 + ["sku-1|EU|online|retail"] * 35,
+            "price": [100.0] * 35 + [200.0] * 35,
+            "discount": [0.0] * 70,
+            "promotion": [0.0] * 70,
+            "sales": [10.0] * 70,
+            "baseline_oof": [10.0] * 70,
+        }
+    )
+    spec = derive_factor_feature_spec(df)
+    ff = build_factor_feature_matrix(df, spec)
+    us = ff[ff["series_id"] == "sku-1|US|online|retail"].tail(1).iloc[0]
+    eu = ff[ff["series_id"] == "sku-1|EU|online|retail"].tail(1).iloc[0]
+    assert abs(float(us["price_rel_to_recent_median_28"])) < 1e-9
+    assert abs(float(eu["price_rel_to_recent_median_28"])) < 1e-9

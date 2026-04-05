@@ -1,6 +1,6 @@
 import pandas as pd
 
-from data_adapter import build_auto_mapping, build_daily_panel_from_transactions, normalize_transactions
+from data_adapter import build_auto_mapping, build_daily_from_transactions, build_daily_panel_from_transactions, normalize_transactions
 
 
 def test_normalize_transactions_missing_optional_columns_does_not_crash():
@@ -83,3 +83,45 @@ def test_gap_fill_no_backward_fill_leakage():
     panel = build_daily_panel_from_transactions(txn)
     gap_row = panel[panel["date"] == pd.Timestamp("2025-01-02")].iloc[0]
     assert abs(float(gap_row["price"]) - 100.0) < 1e-9
+
+
+def test_daily_panel_preserves_scope_and_series_id():
+    txn = pd.DataFrame(
+        {
+            "date": ["2025-01-01", "2025-01-01"],
+            "product_id": ["sku-1", "sku-1"],
+            "category": ["cat", "cat"],
+            "region": ["US", "EU"],
+            "channel": ["online", "online"],
+            "segment": ["retail", "retail"],
+            "quantity": [1.0, 1.0],
+            "price": [100.0, 120.0],
+            "cost": [60.0, 70.0],
+            "discount_rate": [0.0, 0.0],
+            "revenue": [100.0, 120.0],
+        }
+    )
+    panel = build_daily_panel_from_transactions(txn)
+    assert panel["series_id"].nunique() == 2
+
+
+def test_build_daily_from_transactions_uses_single_series_id():
+    txn = pd.DataFrame(
+        {
+            "date": ["2025-01-01", "2025-01-01"],
+            "product_id": ["sku-1", "sku-1"],
+            "category": ["cat", "cat"],
+            "region": ["US", "EU"],
+            "channel": ["online", "offline"],
+            "segment": ["retail", "retail"],
+            "quantity": [1.0, 2.0],
+            "price": [100.0, 80.0],
+            "cost": [60.0, 50.0],
+            "revenue": [100.0, 160.0],
+        }
+    )
+    panel = build_daily_panel_from_transactions(txn)
+    sid = panel["series_id"].iloc[0]
+    daily = build_daily_from_transactions(txn, sid)
+    assert daily["series_id"].nunique() == 1
+    assert str(daily["series_id"].iloc[0]) == str(sid)

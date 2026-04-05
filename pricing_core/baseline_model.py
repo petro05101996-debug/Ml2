@@ -87,7 +87,7 @@ def recursive_baseline_forecast(trained_baseline: Dict[str, Any], base_history: 
         step = build_baseline_one_step_features(hist, dt, base_ctx, feature_spec)
         pred = float(predict_baseline(step, trained_baseline, feature_spec).iloc[0])
         rows.append({"date": pd.Timestamp(dt), "baseline_pred": max(0.0, pred)})
-        hist = pd.concat([hist, pd.DataFrame([{"date": pd.Timestamp(dt), "sales": max(0.0, pred), **{k: v for k, v in base_ctx.items() if k in ["product_id", "category", "region", "channel", "segment"]}}])], ignore_index=True)
+        hist = pd.concat([hist, pd.DataFrame([{"date": pd.Timestamp(dt), "sales": max(0.0, pred), **{k: v for k, v in base_ctx.items() if k in ["series_id", "product_id", "category", "region", "channel", "segment"]}}])], ignore_index=True)
     return pd.DataFrame(rows)
 
 
@@ -286,6 +286,7 @@ def run_baseline_rolling_backtest(
     panel_train: pd.DataFrame,
     target_category: str,
     target_sku: str,
+    target_series_id: str | None = None,
     n_windows: int = 3,
     window_days: int = 28,
     min_train_days: int = 120,
@@ -293,7 +294,10 @@ def run_baseline_rolling_backtest(
 ) -> Dict[str, Any]:
     from pricing_core.baseline_features import derive_baseline_feature_spec
 
-    target = panel_train[(panel_train["category"].astype(str) == str(target_category)) & (panel_train["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
+    if target_series_id is not None and "series_id" in panel_train.columns:
+        target = panel_train[panel_train["series_id"].astype(str) == str(target_series_id)].copy().sort_values("date")
+    else:
+        target = panel_train[(panel_train["category"].astype(str) == str(target_category)) & (panel_train["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
     max_date = pd.Timestamp(target["date"].max()) if len(target) else pd.Timestamp("1970-01-01")
     starts = sorted([max_date - pd.Timedelta(days=(window_days * (i + 1) - 1)) for i in range(int(n_windows))])
     diag_rows, metric_rows = [], []
@@ -305,7 +309,7 @@ def run_baseline_rolling_backtest(
         if train_t["date"].nunique() < int(min_train_days) or test_t.empty:
             continue
         spec = derive_baseline_feature_spec(panel_w)
-        base_ctx = {k: (train_t[k].dropna().astype(str).iloc[-1] if k in ["product_id", "category", "region", "channel", "segment"] and k in train_t else "unknown") for k in ["product_id", "category", "region", "channel", "segment"]}
+        base_ctx = {k: (train_t[k].dropna().astype(str).iloc[-1] if k in ["series_id", "product_id", "category", "region", "channel", "segment"] and k in train_t else "unknown") for k in ["series_id", "product_id", "category", "region", "channel", "segment"]}
         fut = pd.DataFrame({"date": test_t["date"].values})
         trained = train_baseline_model(panel_w, spec, small_mode=len(panel_w) < 200, training_profile="backtest") if strategy == "xgb_recursive" else None
         fc = forecast_baseline_by_strategy(strategy, trained, train_t, fut, base_ctx, spec)
@@ -332,6 +336,7 @@ def select_best_baseline_strategy(
     panel_train: pd.DataFrame,
     target_category: str,
     target_sku: str,
+    target_series_id: str | None = None,
     n_windows: int = 3,
     window_days: int = 28,
     min_train_days: int = 120,
@@ -345,6 +350,7 @@ def select_best_baseline_strategy(
             panel_train=panel_train,
             target_category=target_category,
             target_sku=target_sku,
+            target_series_id=target_series_id,
             n_windows=n_windows,
             window_days=window_days,
             min_train_days=min_train_days,
@@ -485,6 +491,7 @@ def select_best_baseline_plan(
     panel_train: pd.DataFrame,
     target_category: str,
     target_sku: str,
+    target_series_id: str | None = None,
     n_windows: int = 3,
     window_days: int = 28,
     min_train_days: int = 120,
@@ -493,11 +500,15 @@ def select_best_baseline_plan(
         panel_train=panel_train,
         target_category=target_category,
         target_sku=target_sku,
+        target_series_id=target_series_id,
         n_windows=n_windows,
         window_days=window_days,
         min_train_days=min_train_days,
     )
-    target = panel_train[(panel_train["category"].astype(str) == str(target_category)) & (panel_train["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
+    if target_series_id is not None and "series_id" in panel_train.columns:
+        target = panel_train[panel_train["series_id"].astype(str) == str(target_series_id)].copy().sort_values("date")
+    else:
+        target = panel_train[(panel_train["category"].astype(str) == str(target_category)) & (panel_train["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
     weekly_selection = run_weekly_baseline_rolling_backtest(
         target_daily_history=target,
         n_windows=n_windows,
@@ -542,6 +553,7 @@ def build_baseline_oof_predictions(
     panel_train: pd.DataFrame,
     target_category: str,
     target_sku: str,
+    target_series_id: str | None = None,
     min_train_days: int = 84,
     step_days: int = 7,
     horizon_days: int = 7,
@@ -549,7 +561,10 @@ def build_baseline_oof_predictions(
 ) -> pd.DataFrame:
     from pricing_core.baseline_features import derive_baseline_feature_spec
 
-    target = panel_train[(panel_train["category"].astype(str) == str(target_category)) & (panel_train["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
+    if target_series_id is not None and "series_id" in panel_train.columns:
+        target = panel_train[panel_train["series_id"].astype(str) == str(target_series_id)].copy().sort_values("date")
+    else:
+        target = panel_train[(panel_train["category"].astype(str) == str(target_category)) & (panel_train["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
     out = target[["date", "sales"]].copy()
     out["baseline_oof"] = np.nan
     if target.empty:
@@ -574,8 +589,8 @@ def build_baseline_oof_predictions(
 
         spec_w = derive_baseline_feature_spec(panel_w)
         base_ctx_w = {
-            k: (target_w[k].dropna().astype(str).iloc[-1] if k in target_w.columns and k in ["product_id", "category", "region", "channel", "segment"] else "unknown")
-            for k in ["product_id", "category", "region", "channel", "segment"]
+            k: (target_w[k].dropna().astype(str).iloc[-1] if k in target_w.columns and k in ["series_id", "product_id", "category", "region", "channel", "segment"] else "unknown")
+            for k in ["series_id", "product_id", "category", "region", "channel", "segment"]
         }
         trained_w = train_baseline_model(panel_w, spec_w, small_mode=len(panel_w) < 200, training_profile="backtest") if strategy == "xgb_recursive" else None
         fc_w = forecast_baseline_by_strategy(strategy, trained_w, target_w, test_dates_df, base_ctx_w, spec_w)

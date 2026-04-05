@@ -10,10 +10,26 @@ from df_utils import get_numeric_series, get_text_series
 
 USER_FACTOR_NUM_PREFIX = "user_factor_num__"
 USER_FACTOR_CAT_PREFIX = "user_factor_cat__"
+SERIES_SCOPE_COLS = ["product_id", "region", "channel", "segment"]
 
 
 def _norm_col(c: str) -> str:
     return str(c).strip().lower().replace(" ", "_")
+
+
+def build_series_id(df: pd.DataFrame) -> pd.Series:
+    x = df.copy()
+    for c in SERIES_SCOPE_COLS:
+        x[c] = get_text_series(x, c, "unknown")
+    return (
+        x["product_id"].astype(str)
+        + "|"
+        + x["region"].astype(str)
+        + "|"
+        + x["channel"].astype(str)
+        + "|"
+        + x["segment"].astype(str)
+    )
 
 
 def suggest_column(columns: List[str], aliases: List[str]) -> Optional[str]:
@@ -181,6 +197,7 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
 
     numeric_covariates = ["price", "cost", "discount_rate", "freight_value", "stock", "promotion", "review_score", "reviews_count"] + [c for c in df.columns if c.startswith(USER_FACTOR_NUM_PREFIX)]
     cat_mode_cols = ["region", "channel", "segment"] + [c for c in df.columns if c.startswith(USER_FACTOR_CAT_PREFIX)]
+    series_keys = SERIES_SCOPE_COLS
 
     for c in ["product_id", "category"] + cat_mode_cols:
         df[c] = get_text_series(df, c, "unknown")
@@ -188,11 +205,15 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
         df[c] = get_numeric_series(df, c, np.nan)
 
     grouped = []
-    for (dt, pid, cat), g in df.groupby([pd.Grouper(key="date", freq="D"), "product_id", "category"], dropna=False):
+    for keys, g in df.groupby([pd.Grouper(key="date", freq="D"), "category"] + series_keys, dropna=False):
+        dt, cat, pid, region, channel, segment = keys
         row: Dict[str, Any] = {
             "date": pd.Timestamp(dt),
             "product_id": str(pid),
             "category": str(cat),
+            "region": str(region),
+            "channel": str(channel),
+            "segment": str(segment),
             "sales": float(pd.to_numeric(g["quantity"], errors="coerce").fillna(0.0).sum()),
             "revenue": float(pd.to_numeric(g["revenue"], errors="coerce").fillna(0.0).sum()),
             "price": _weighted_mean_by_quantity(g["price"], g["quantity"]),
@@ -216,41 +237,78 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
 
     pieces = []
     num_fill_cols = ["price", "cost", "discount_rate", "freight_value", "stock", "promotion", "review_score", "reviews_count"] + [c for c in panel.columns if c.startswith(USER_FACTOR_NUM_PREFIX)]
-    for _, g in panel.groupby("product_id", dropna=False):
+    for _, g in panel.groupby(["category"] + series_keys, dropna=False):
         g = g.sort_values("date").reset_index(drop=True)
         full = pd.DataFrame({"date": pd.date_range(g["date"].min(), g["date"].max(), freq="D")})
-        full["product_id"] = g["product_id"].iloc[0]
-        full["category"] = g["category"].mode().iloc[0] if not g["category"].mode().empty else "unknown"
-        m = full.merge(g, on=["date", "product_id", "category"], how="left")
+        for key in ["category"] + series_keys:
+            full[key] = g[key].iloc[0] if key in g.columns else "unknown"
+        m = full.merge(g, on=["date", "category"] + series_keys, how="left")
+        m["has_observation_flag"] = get_numeric_series(m, "sales", np.nan).notna().astype(int)
 
         for c in ["sales", "revenue"]:
             m[c] = get_numeric_series(m, c, 0.0).fillna(0.0)
-        for c in num_fill_cols:
-            m[c] = get_numeric_series(m, c, np.nan).ffill()
+        for c in ["price", "cost", "freight_value"]:
+            if c in m.columns:
+                m[c] = get_numeric_series(m, c, np.nan).ffill(limit=7)
+        for c in ["discount_rate", "promotion"]:
+            if c in m.columns:
+                m[c] = get_numeric_series(m, c, 0.0).fillna(0.0).clip(lower=0.0)
+        if "stock" in m.columns:
+            m["stock"] = get_numeric_series(m, "stock", 0.0).fillna(0.0).clip(lower=0.0)
+        for c in [c for c in num_fill_cols if c.startswith(USER_FACTOR_NUM_PREFIX)]:
+            m[c] = get_numeric_series(m, c, np.nan)
         for c in cat_mode_cols:
             m[c] = get_text_series(m, c, "unknown").ffill().fillna("unknown")
+        m["stockout_flag"] = (get_numeric_series(m, "stock", 0.0).fillna(0.0) <= 0.0).astype(int)
         pieces.append(m)
 
     out = pd.concat(pieces, ignore_index=True)
     out["discount"] = get_numeric_series(out, "discount_rate", 0.0).fillna(0.0)
-    return out.sort_values(["product_id", "date"]).reset_index(drop=True)
+    out["series_id"] = build_series_id(out)
+    return out.sort_values(["series_id", "date"]).reset_index(drop=True)
 
 
-def build_daily_from_transactions(txn: pd.DataFrame, sku_id: str) -> pd.DataFrame:
+def build_daily_from_transactions(txn: pd.DataFrame, series_id: str) -> pd.DataFrame:
     panel = build_daily_panel_from_transactions(txn)
-    daily = panel[panel["product_id"].astype(str) == str(sku_id)].copy()
+    daily = panel[panel["series_id"].astype(str) == str(series_id)].copy()
     if daily.empty:
-        raise ValueError("Нет данных по выбранному SKU.")
-    daily["sku_id"] = str(sku_id)
+        raise ValueError("Нет данных по выбранной series_id.")
+    daily["sku_id"] = str(daily["product_id"].iloc[0]) if "product_id" in daily.columns else "unknown"
     daily["price_median"] = daily["price"]
     return daily.reset_index(drop=True)
 
 
-def build_daily_from_transactions_scoped(txn: pd.DataFrame, sku_id: str, category: Optional[str] = None) -> pd.DataFrame:
-    mask = txn["product_id"].astype(str) == str(sku_id)
-    if category is not None and "category" in txn.columns:
-        mask &= txn["category"].astype(str) == str(category)
-    return build_daily_from_transactions(txn[mask].copy(), sku_id)
+def build_daily_from_transactions_scoped(
+    txn: pd.DataFrame,
+    series_id: Optional[str] = None,
+    sku_id: Optional[str] = None,
+    category: Optional[str] = None,
+    region: Optional[str] = None,
+    channel: Optional[str] = None,
+    segment: Optional[str] = None,
+) -> pd.DataFrame:
+    panel = build_daily_panel_from_transactions(txn)
+    if series_id is not None:
+        scoped = panel[panel["series_id"].astype(str) == str(series_id)].copy()
+        if scoped.empty:
+            raise ValueError("Нет данных по выбранной series_id.")
+        return scoped.reset_index(drop=True)
+
+    mask = pd.Series(True, index=panel.index)
+    if sku_id is not None:
+        mask &= panel["product_id"].astype(str) == str(sku_id)
+    if category is not None and "category" in panel.columns:
+        mask &= panel["category"].astype(str) == str(category)
+    if region is not None and "region" in panel.columns:
+        mask &= panel["region"].astype(str) == str(region)
+    if channel is not None and "channel" in panel.columns:
+        mask &= panel["channel"].astype(str) == str(channel)
+    if segment is not None and "segment" in panel.columns:
+        mask &= panel["segment"].astype(str) == str(segment)
+    scoped = panel[mask].copy()
+    if scoped.empty:
+        raise ValueError("Нет данных по выбранному scope.")
+    return scoped.reset_index(drop=True)
 
 
 def objective_to_weights(mode: str) -> Dict[str, float]:

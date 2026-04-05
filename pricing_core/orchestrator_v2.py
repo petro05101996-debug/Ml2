@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from calc_engine import compute_daily_unit_economics
-from data_adapter import build_daily_panel_from_transactions
+from data_adapter import SERIES_SCOPE_COLS, build_daily_panel_from_transactions, build_series_id
 from pricing_core.baseline_features import build_baseline_feature_matrix, derive_baseline_feature_spec
 from pricing_core.baseline_model import (
     build_baseline_oof_predictions,
@@ -94,15 +94,15 @@ def _build_empty_baseline_rolling() -> Dict[str, Any]:
     }
 
 
-def _build_pooled_factor_train(panel_train: pd.DataFrame, target_category: str, max_skus: int = 8) -> Dict[str, Any]:
+def _build_pooled_factor_train(panel_train: pd.DataFrame, target_category: str, max_series: int = 8) -> Dict[str, Any]:
     rows = []
-    used_skus: List[str] = []
+    used_series: List[str] = []
     scope_panel = panel_train[panel_train["category"].astype(str) == str(target_category)].copy()
     if scope_panel.empty:
-        return {"factor_train": pd.DataFrame(), "pooled_skus_used": [], "pooled_rows_used": 0}
+        return {"factor_train": pd.DataFrame(), "pooled_series_used": [], "pooled_rows_used": 0}
 
     sku_rank = (
-        scope_panel.groupby("product_id", dropna=False)
+        scope_panel.groupby("series_id", dropna=False)
         .agg(
             n_rows=("date", "size"),
             price_unique=("price", lambda s: pd.to_numeric(s, errors="coerce").nunique(dropna=True)),
@@ -112,33 +112,62 @@ def _build_pooled_factor_train(panel_train: pd.DataFrame, target_category: str, 
     )
     sku_rank = sku_rank.sort_values(["price_unique", "n_rows", "non_na_share"], ascending=False)
 
-    for sku in sku_rank["product_id"].astype(str).dropna().head(max_skus):
-        selected = select_best_baseline_plan(scope_panel, target_category, sku)
+    for series_id in sku_rank["series_id"].astype(str).dropna().head(max_series):
+        series_hist = scope_panel[scope_panel["series_id"].astype(str) == str(series_id)].copy()
+        if series_hist.empty:
+            continue
+        sku = str(series_hist["product_id"].astype(str).iloc[0])
+        selected = select_best_baseline_plan(scope_panel, target_category, sku, target_series_id=str(series_id))
         sku_strategy = str(selected.get("selected_strategy", "xgb_recursive"))
         sku_granularity = str(selected.get("granularity", "daily"))
-        sku_hist = scope_panel[scope_panel["product_id"].astype(str) == str(sku)].copy()
+        sku_hist = series_hist.copy()
         if sku_granularity == "weekly":
             oof = build_weekly_baseline_oof_predictions(sku_hist, strategy=sku_strategy)
         else:
-            oof = build_baseline_oof_predictions(scope_panel, target_category, sku, strategy=sku_strategy)
+            oof = build_baseline_oof_predictions(scope_panel, target_category, sku, target_series_id=str(series_id), strategy=sku_strategy)
         if oof.empty:
             continue
         merged = sku_hist.merge(oof[["date", "baseline_oof"]], on="date", how="left")
         if merged["baseline_oof"].notna().sum() < 10:
             continue
         rows.append(merged)
-        used_skus.append(str(sku))
+        used_series.append(str(series_id))
 
     factor_train = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    return {"factor_train": factor_train, "pooled_skus_used": used_skus, "pooled_rows_used": int(len(factor_train))}
+    return {"factor_train": factor_train, "pooled_series_used": used_series, "pooled_rows_used": int(len(factor_train))}
 
 
-def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: str, target_sku: str, horizon_days: int = 30, scenario_overrides: Dict[str, Any] | None = None, shocks: List[Dict[str, Any]] | None = None, objective_mode: str = "maximize_profit") -> Dict[str, Any]:
+def run_full_pricing_analysis_v2(
+    normalized_txn: pd.DataFrame,
+    target_category: str,
+    target_sku: str,
+    horizon_days: int = 30,
+    scenario_overrides: Dict[str, Any] | None = None,
+    shocks: List[Dict[str, Any]] | None = None,
+    objective_mode: str = "maximize_profit",
+    target_series_id: str | None = None,
+    unit_price_input_type: str = "net",
+    economics_mode: str = "net_price",
+) -> Dict[str, Any]:
     panel_daily = build_daily_panel_from_transactions(normalized_txn)
+    if "series_id" not in panel_daily.columns:
+        panel_daily["series_id"] = build_series_id(panel_daily)
     panel_features_baseline = build_baseline_feature_matrix(panel_daily)
-    target_history = panel_features_baseline[(panel_features_baseline["category"].astype(str) == str(target_category)) & (panel_features_baseline["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
+    if target_series_id is None:
+        selector = panel_features_baseline[
+            (panel_features_baseline["category"].astype(str) == str(target_category))
+            & (panel_features_baseline["product_id"].astype(str) == str(target_sku))
+        ].copy()
+        if selector.empty:
+            raise ValueError("Target history is empty")
+        target_series_id = str(selector["series_id"].astype(str).mode().iloc[0])
+    target_history = panel_features_baseline[
+        panel_features_baseline["series_id"].astype(str) == str(target_series_id)
+    ].copy().sort_values("date")
     if target_history.empty:
         raise ValueError("Target history is empty")
+    target_category = str(target_history["category"].astype(str).iloc[0]) if "category" in target_history.columns else str(target_category)
+    target_sku = str(target_history["product_id"].astype(str).iloc[0]) if "product_id" in target_history.columns else str(target_sku)
 
     unique_dates = sorted(panel_features_baseline["date"].dropna().unique())
     holdout_n = max(1, int(np.ceil(len(unique_dates) * 0.2)))
@@ -181,7 +210,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         }
         baseline_strategy_selection["best_strategy"] = best_baseline_strategy
     else:
-        baseline_plan_selection = select_best_baseline_plan(panel_train, target_category, target_sku)
+        baseline_plan_selection = select_best_baseline_plan(panel_train, target_category, target_sku, target_series_id=str(target_series_id))
         baseline_granularity = str(baseline_plan_selection.get("granularity", "daily"))
         best_baseline_strategy = str(baseline_plan_selection.get("selected_strategy", "xgb_recursive"))
         baseline_selector_reason = str(baseline_plan_selection.get("selector_reason", "daily selected"))
@@ -190,7 +219,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         best_weekly_strategy = str(baseline_plan_selection.get("best_weekly_strategy", best_weekly_strategy))
 
         base_ctx = {
-            c: (target_history[c].dropna().astype(str).iloc[-1] if c in ["product_id", "category", "region", "channel", "segment"] and c in target_history else "unknown")
+            c: (target_history[c].dropna().astype(str).iloc[-1] if c in ["series_id", "product_id", "category", "region", "channel", "segment"] and c in target_history else "unknown")
             for c in baseline_feature_spec_full.get("baseline_context_features", [])
         }
         if baseline_granularity == "weekly":
@@ -207,14 +236,14 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
             trained_baseline_bt = train_baseline_model(panel_train, baseline_feature_spec_train, small_mode=len(panel_train) < 200, training_profile="backtest")
             trained_baseline_final = train_baseline_model(panel_features_baseline, baseline_feature_spec_full, small_mode=len(panel_features_baseline) < 200, training_profile="final")
             baseline_forecast = recursive_baseline_forecast(trained_baseline_final, target_history, future_dates, base_ctx, baseline_feature_spec_full)
-            baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
-            baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
+            baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, target_series_id=str(target_series_id), strategy=best_baseline_strategy)
+            baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, target_series_id=str(target_series_id), strategy=best_baseline_strategy)
         else:
             trained_baseline_bt = None
             trained_baseline_final = None
             baseline_forecast = forecast_baseline_by_strategy(best_baseline_strategy, None, target_history, future_dates, base_ctx, baseline_feature_spec_full)
-            baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
-            baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
+            baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, target_series_id=str(target_series_id), strategy=best_baseline_strategy)
+            baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, target_series_id=str(target_series_id), strategy=best_baseline_strategy)
         baseline_forecast["baseline_lower"] = np.nan
         baseline_forecast["baseline_upper"] = np.nan
 
@@ -223,6 +252,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
     factor_train_target = build_factor_feature_matrix(factor_train_target, factor_feature_spec_target)
     factor_train_target = factor_train_target[factor_train_target["baseline_oof"].notna()].copy()
     factor_train_target["factor_target"] = build_factor_target(factor_train_target)
+    factor_train_target = factor_train_target[pd.to_numeric(factor_train_target["factor_target"], errors="coerce").notna()].copy()
     target_assess = _assess_factor_trainability(factor_train_target, factor_feature_spec_target)
 
     use_target_direct = (
@@ -234,7 +264,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
     factor_train_scope = "none"
     factor_train = pd.DataFrame()
     factor_feature_spec = factor_feature_spec_target
-    pooled_skus_used: List[str] = []
+    pooled_series_used: List[str] = []
     pooled_rows_used = 0
 
     if target_assess["trainable"] and use_target_direct:
@@ -243,13 +273,14 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
     else:
         pooled_info = _build_pooled_factor_train(panel_train, target_category)
         pooled_candidate = pooled_info.get("factor_train", pd.DataFrame())
-        pooled_skus_used = pooled_info.get("pooled_skus_used", [])
+        pooled_series_used = pooled_info.get("pooled_series_used", [])
         pooled_rows_used = int(pooled_info.get("pooled_rows_used", 0))
         if not pooled_candidate.empty:
             factor_feature_spec = derive_factor_feature_spec(pooled_candidate)
             pooled_candidate = build_factor_feature_matrix(pooled_candidate, factor_feature_spec)
             pooled_candidate = pooled_candidate[pooled_candidate["baseline_oof"].notna()].copy()
             pooled_candidate["factor_target"] = build_factor_target(pooled_candidate)
+            pooled_candidate = pooled_candidate[pd.to_numeric(pooled_candidate["factor_target"], errors="coerce").notna()].copy()
             pooled_assess = _assess_factor_trainability(pooled_candidate, factor_feature_spec)
             if pooled_assess["trainable"]:
                 factor_train_scope = "pooled"
@@ -279,7 +310,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
             "price_unique_count": int(factor_train_stats["price_unique_count"]),
             "variative_controllable_count": int(factor_train_stats["variative_controllable_count"]),
             "train_scope": factor_train_scope,
-            "pooled_skus_used": pooled_skus_used,
+            "pooled_series_used": pooled_series_used,
             "pooled_rows_used": pooled_rows_used,
         }
     )
@@ -306,14 +337,24 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
     b_input["discount"] = float(base_ctx.get("discount", target_history.get("discount", pd.Series([0.0])).iloc[-1]))
     b_input["cost"] = float(base_ctx.get("cost", target_history.get("cost", pd.Series([0.0])).iloc[-1]))
     b_input["freight_value"] = float(base_ctx.get("freight_value", target_history.get("freight_value", pd.Series([0.0])).iloc[-1]))
-    baseline_economics, _ = compute_daily_unit_economics(b_input, quantity_col="baseline_pred")
+    baseline_economics, _ = compute_daily_unit_economics(
+        b_input,
+        quantity_col="baseline_pred",
+        unit_price_input_type=unit_price_input_type,
+        economics_mode=economics_mode,
+    )
 
     s_input = scenario_forecast.copy()
     s_input["price"] = max(float(scn_ctx.get("price", b_input["price"].iloc[0])), 1e-6)
     s_input["discount"] = float(scn_ctx.get("discount", b_input["discount"].iloc[0]))
     s_input["cost"] = float(scn_ctx.get("cost", b_input["cost"].iloc[0]))
     s_input["freight_value"] = float(scn_ctx.get("freight_value", b_input["freight_value"].iloc[0]))
-    scenario_economics, _ = compute_daily_unit_economics(s_input, quantity_col="actual_sales")
+    scenario_economics, _ = compute_daily_unit_economics(
+        s_input,
+        quantity_col="actual_sales",
+        unit_price_input_type=unit_price_input_type,
+        economics_mode=economics_mode,
+    )
 
     demand_delta = compute_scenario_delta(baseline_forecast, scenario_forecast)
     baseline_total_revenue = float(baseline_economics["total_revenue"].sum())
@@ -392,9 +433,15 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         mode=mode,
         ood_flags=ood_flags,
         intervals_available=intervals_available,
-        pooled_skus_used=pooled_skus_used,
+        pooled_series_used=pooled_series_used,
         pooled_rows_used=pooled_rows_used,
         base_ctx=base_ctx,
+        scenario_mode=scenario_result.get("scenario_mode", mode),
+        scenario_effect_source=scenario_result.get("scenario_effect_source", mode),
+        target_series_id=str(target_series_id),
+        series_scope={c: str(target_history[c].iloc[-1]) if c in target_history.columns else "unknown" for c in SERIES_SCOPE_COLS},
+        unit_price_input_type=str(unit_price_input_type),
+        economics_mode=str(economics_mode),
         baseline_forecast=baseline_forecast[["date", "baseline_pred", "baseline_lower", "baseline_upper"]].copy(),
         scenario_feature_spec=scenario_feature_spec,
         feature_spec=scenario_feature_spec,
@@ -425,7 +472,12 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         "baseline_selector_reason": baseline_selector_reason,
         "baseline_strategy_selection": baseline_strategy_selection,
         "mode": mode,
+        "scenario_mode": scenario_result.get("scenario_mode", mode),
+        "scenario_effect_source": scenario_result.get("scenario_effect_source", mode),
         "ood_flags": ood_flags,
         "intervals_available": intervals_available,
+        "target_series_id": str(target_series_id),
+        "unit_price_input_type": str(unit_price_input_type),
+        "economics_mode": str(economics_mode),
         "_trained_bundle": bundle,
     }

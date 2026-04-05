@@ -40,7 +40,7 @@ def derive_factor_feature_spec(df: pd.DataFrame) -> Dict[str, Any]:
     user_num = [c for c in df.columns if c.startswith("user_factor_num__") and _usable_numeric(df, c)]
     factor_numeric = base_num + user_num
 
-    base_cat = ["product_id", "category"]
+    base_cat = ["series_id", "product_id", "category", "region", "channel", "segment"]
     user_cat = [c for c in df.columns if c.startswith("user_factor_cat__") and _usable_cat(df, c)]
     factor_cat = [c for c in base_cat if _usable_cat(df, c)] + user_cat
 
@@ -52,15 +52,18 @@ def derive_factor_feature_spec(df: pd.DataFrame) -> Dict[str, Any]:
         "factor_categorical_features": factor_cat,
         "factor_features": features,
         "controllable_features": controllable,
-        "context_features": [c for c in ["product_id", "category"] if c in df.columns],
+        "context_features": [c for c in base_cat if c in df.columns],
         "interaction_features": interactions,
     }
 
 
 def build_factor_feature_matrix(panel_with_baseline: pd.DataFrame, feature_spec: Dict[str, Any]) -> pd.DataFrame:
-    out = panel_with_baseline.copy().sort_values(["product_id", "date"]).reset_index(drop=True)
+    out = panel_with_baseline.copy()
+    if "series_id" not in out.columns:
+        out["series_id"] = out.get("product_id", "unknown").astype(str)
+    out = out.sort_values(["series_id", "date"]).reset_index(drop=True)
     out["price"] = get_numeric_series(out, "price", 0.0)
-    rolling_median = out.groupby("product_id", dropna=False)["price"].shift(1).groupby(out["product_id"]).rolling(28, min_periods=1).median().reset_index(level=0, drop=True)
+    rolling_median = out.groupby("series_id", dropna=False)["price"].shift(1).groupby(out["series_id"]).rolling(28, min_periods=1).median().reset_index(level=0, drop=True)
     price_hist_med = float(out["price"].replace(0, pd.NA).dropna().median()) if out["price"].replace(0, pd.NA).dropna().notna().any() else 1.0
     denom = rolling_median.replace(0, pd.NA).fillna(price_hist_med if pd.notna(price_hist_med) and price_hist_med > 0 else 1.0)
     out["price_rel_to_recent_median_28"] = (out["price"].fillna(0.0) / denom) - 1.0
@@ -78,4 +81,10 @@ def build_factor_feature_matrix(panel_with_baseline: pd.DataFrame, feature_spec:
 def build_factor_target(df: pd.DataFrame) -> pd.Series:
     sales = pd.to_numeric(df.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
     baseline_oof = pd.to_numeric(df.get("baseline_oof", pd.NA), errors="coerce").clip(lower=0.0)
-    return np.log((sales + 1.0) / (baseline_oof + 1.0))
+    y = np.log((sales + 1.0) / (baseline_oof + 1.0))
+    if "stockout_flag" in df.columns:
+        mask = pd.to_numeric(df["stockout_flag"], errors="coerce").fillna(0.0) > 0.0
+        y = pd.Series(y, index=df.index)
+        y.loc[mask] = np.nan
+        return y
+    return y
