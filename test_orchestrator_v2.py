@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
 
+from data_adapter import build_auto_mapping, normalize_transactions
 from pricing_core.orchestrator_v2 import run_full_pricing_analysis_v2
 from pricing_core.v2_presenter import build_v2_result_contract
+from pricing_core.v2_what_if import run_v2_what_if_projection
 
 
 def _txn(n=180, with_user_cat=False, two_skus=False):
@@ -48,10 +50,15 @@ def test_v2_excel_contains_required_sheets():
 def test_v2_uses_final_baseline_model_for_forecast():
     out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
     b = out["_trained_bundle"]
-    assert b.get("trained_baseline_bt") is not None
-    assert b.get("trained_baseline_final") is not None
-    assert b["trained_baseline_bt"]["training_profile"] == "backtest"
-    assert b["trained_baseline_final"]["training_profile"] == "final"
+    assert b.get("baseline_strategy") in {"xgb_recursive", "median7", "mean28", "dow_median8w"}
+    if b.get("baseline_strategy") == "xgb_recursive":
+        assert b.get("trained_baseline_bt") is not None
+        assert b.get("trained_baseline_final") is not None
+        assert b["trained_baseline_bt"]["training_profile"] == "backtest"
+        assert b["trained_baseline_final"]["training_profile"] == "final"
+    else:
+        assert b.get("trained_baseline_bt") is None
+        assert b.get("trained_baseline_final") is None
     assert b["baseline_feature_spec_train"] is not None
     assert b["baseline_feature_spec_full"] is not None
 
@@ -117,3 +124,41 @@ def test_v2_bundle_contains_base_ctx_and_scenario_feature_spec():
     b = out["_trained_bundle"]
     assert "base_ctx" in b
     assert "scenario_feature_spec" in b
+
+
+def test_cost_and_freight_do_not_change_demand_v2():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7)
+    bundle = out["_trained_bundle"]
+    base = run_v2_what_if_projection(bundle, manual_price=10.0, horizon_days=7, cost_multiplier=1.0, freight_multiplier=1.0)
+    stressed = run_v2_what_if_projection(bundle, manual_price=10.0, horizon_days=7, cost_multiplier=1.3, freight_multiplier=1.3)
+    assert base["demand_total"] == stressed["demand_total"]
+    assert base["actual_sales_total"] == stressed["actual_sales_total"]
+    assert base["lost_sales_total"] == stressed["lost_sales_total"]
+    assert base["profit_total"] != stressed["profit_total"]
+
+
+def test_stock_cap_none_means_unlimited():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7)
+    bundle = out["_trained_bundle"]
+    w = run_v2_what_if_projection(bundle, manual_price=10.0, horizon_days=7, stock_cap=None)
+    assert w["lost_sales_total"] == 0.0
+    assert w["actual_sales_total"] == w["demand_total"]
+
+
+def test_stock_cap_zero_means_zero_inventory():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7)
+    bundle = out["_trained_bundle"]
+    w = run_v2_what_if_projection(bundle, manual_price=10.0, horizon_days=7, stock_cap=0.0)
+    assert w["actual_sales_total"] == 0.0
+    assert w["lost_sales_total"] == w["demand_total"]
+
+
+def test_sample_transactions_end_to_end_v2_runs():
+    tx = pd.read_csv("sample_transactions.csv")
+    mapping = build_auto_mapping(list(tx.columns))
+    normalized, _ = normalize_transactions(tx, mapping)
+    target_row = normalized.dropna(subset=["category", "product_id"]).iloc[0]
+    out = run_full_pricing_analysis_v2(normalized, str(target_row["category"]), str(target_row["product_id"]), horizon_days=7)
+    assert "baseline_forecast" in out
+    assert "scenario_forecast" in out
+    assert "overall_confidence" in out["confidence"]

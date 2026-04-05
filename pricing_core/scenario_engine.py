@@ -35,7 +35,8 @@ def build_base_scenario_context(target_history: pd.DataFrame, factor_feature_spe
         else:
             out[c] = "unknown"
 
-    out["stock_total_horizon"] = float(pd.to_numeric(pd.Series([last.get("stock", np.nan)]), errors="coerce").fillna(0.0).iloc[0])
+    out["stock_total_horizon"] = np.nan
+    out["use_stock_cap"] = False
     out["daily_stock_cap"] = np.nan
     return out
 
@@ -46,6 +47,9 @@ def apply_user_overrides(base_ctx: Dict[str, Any], scenario_overrides: Dict[str,
     for k, v in (scenario_overrides or {}).items():
         if k not in scenario:
             warnings.append(f"unknown_override_ignored:{k}")
+            continue
+        if k == "use_stock_cap":
+            scenario[k] = bool(v)
             continue
         if isinstance(scenario.get(k), str):
             scenario[k] = str(v)
@@ -150,8 +154,9 @@ def run_scenario_forecast(
     out["shock_multiplier"] = pd.to_numeric(out["shock_multiplier"], errors="coerce").fillna(1.0).clip(0.2, 5.0)
     out["scenario_demand_raw"] = (out["baseline_pred"] * out["factor_multiplier"] * out["shock_multiplier"] * float(demand_multiplier)).clip(lower=0.0)
 
+    use_stock_cap = bool(scenario_ctx.get("use_stock_cap", False))
     total_stock = float(pd.to_numeric(pd.Series([scenario_ctx.get("stock_total_horizon", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
-    if np.isfinite(total_stock) and total_stock > 0:
+    if use_stock_cap and np.isfinite(total_stock) and total_stock >= 0:
         cap_df = apply_total_stock_cap(out["scenario_demand_raw"], total_stock)
         out = pd.concat([out.reset_index(drop=True), cap_df], axis=1)
     else:

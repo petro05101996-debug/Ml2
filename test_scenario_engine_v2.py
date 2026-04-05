@@ -51,7 +51,7 @@ def test_shock_multiplier_applies_after_factor_multiplier():
 def test_stock_total_horizon_caps_cumulatively():
     tr, spec, fm = _trained_baseline()
     fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
-    out = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"stock_total_horizon": 5})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"use_stock_cap": True, "stock_total_horizon": 5})
     sf = out["scenario_forecast"]
     assert float(sf["actual_sales"].sum()) <= 5.0
 
@@ -59,7 +59,7 @@ def test_stock_total_horizon_caps_cumulatively():
 def test_lost_sales_is_positive_when_stock_binding():
     tr, spec, fm = _trained_baseline()
     fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
-    out = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"stock_total_horizon": 5})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"use_stock_cap": True, "stock_total_horizon": 5})
     sf = out["scenario_forecast"]
     assert float(sf["lost_sales"].sum()) > 0.0
 
@@ -115,7 +115,7 @@ def test_stock_cap_zero_is_binding_when_explicitly_set():
         spec,
         None,
         baseline_override_df=pd.DataFrame({"date": fut["date"], "baseline_pred": [4.0, 5.0, 6.0]}),
-        scenario_overrides={"stock_total_horizon": 0.0},
+        scenario_overrides={"use_stock_cap": True, "stock_total_horizon": 0.0},
     )
     sf = out["scenario_forecast"]
     assert float(sf["actual_sales"].sum()) == 0.0
