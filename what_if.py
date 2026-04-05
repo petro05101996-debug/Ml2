@@ -6,20 +6,29 @@ import numpy as np
 import pandas as pd
 
 
+def _objective_score(objective_mode: str, sales: float, revenue: float, profit: float) -> float:
+    if objective_mode == "maximize_revenue":
+        return revenue
+    if objective_mode == "protect_volume":
+        return sales
+    return profit
+
+
 def run_scenario_set(trained_bundle: Dict[str, Any], scenario_rows: List[Dict[str, Any]], runner: Callable[..., Dict[str, Any]]) -> pd.DataFrame:
     records: List[Dict[str, Any]] = []
+    objective_mode = str(trained_bundle.get("objective_mode", "maximize_profit"))
     for row in scenario_rows:
         factors = {
             "price": float(row["price"]),
             "promotion": float(row.get("promotion", 0.0)),
-            "review_score": float(row.get("review_score", row.get("rating", 4.5))),
-            "reviews_count": float(row.get("reviews_count", 0.0)),
         }
         if "discount" in row:
             factors["discount"] = float(row.get("discount", 0.0))
         for k, v in row.items():
             if str(k).startswith("user_factor_num__"):
                 factors[k] = float(v)
+            if str(k).startswith("user_factor_cat__"):
+                factors[k] = str(v)
 
         result = runner(
             trained_bundle,
@@ -29,13 +38,28 @@ def run_scenario_set(trained_bundle: Dict[str, Any], scenario_rows: List[Dict[st
             horizon_days=int(row["horizon_days"]),
             discount_multiplier=float(row.get("discount_multiplier", 1.0)),
             cost_multiplier=float(row.get("cost_multiplier", 1.0)),
-            stock_cap=float(row.get("stock_cap", 0.0)),
+            stock_cap=(None if row.get("stock_cap", None) is None else float(row.get("stock_cap"))),
             scenario={"name": str(row.get("name", "scenario")), "mode": "manual", "horizon_days": int(row["horizon_days"]), "factors": factors},
         )
-        sales = float(result.get("demand_total", 0.0))
+        raw_demand = float(result.get("demand_total", 0.0))
+        sales = float(result.get("actual_sales_total", raw_demand))
         revenue = float(result.get("revenue_total", 0.0))
         profit = float(result.get("profit_total", 0.0))
-        records.append({"scenario": row["name"], "price": float(row["price"]), "sales": sales, "actual_sales": float(result.get("actual_sales_total", sales)), "lost_sales": float(result.get("lost_sales_total", 0.0)), "revenue": revenue, "profit": profit, "margin": (profit / revenue) if revenue > 0 else 0.0, "confidence": float(result.get("confidence", 0.0)), "uncertainty": float(result.get("uncertainty", 1.0)), "score": profit * (0.7 + 0.3 * float(result.get("confidence", 0.0)))})
+        records.append({
+            "scenario": row["name"],
+            "price": float(row["price"]),
+            "raw_demand": raw_demand,
+            "sales": sales,
+            "actual_sales": sales,
+            "lost_sales": float(result.get("lost_sales_total", 0.0)),
+            "revenue": revenue,
+            "profit": profit,
+            "margin": (profit / revenue) if revenue > 0 else 0.0,
+            "confidence_label": str(result.get("confidence_label", "low")),
+            "confidence": float(result.get("confidence_score", 0.0)),
+            "uncertainty": float(result.get("uncertainty_score", 1.0)),
+            "score": _objective_score(objective_mode, sales=sales, revenue=revenue, profit=profit),
+        })
 
     df = pd.DataFrame(records)
     if len(df) == 0:
@@ -43,6 +67,10 @@ def run_scenario_set(trained_bundle: Dict[str, Any], scenario_rows: List[Dict[st
     base = (df[df["scenario"] == "Baseline"].iloc[0] if len(df[df["scenario"] == "Baseline"]) else df.iloc[0])
     for c in ["sales", "revenue", "profit", "margin"]:
         df[f"delta_{c}"] = df[c] - float(base[c])
+    if "score" in df.columns:
+        baseline_rows = df[df["scenario"] == "Baseline"].copy()
+        others = df[df["scenario"] != "Baseline"].sort_values("score", ascending=False)
+        df = pd.concat([baseline_rows, others], ignore_index=True) if not baseline_rows.empty else others.reset_index(drop=True)
     return df
 
 

@@ -30,7 +30,7 @@ def test_no_override_returns_baseline_when_factor_multiplier_is_one_and_no_shock
     fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=5, freq="D")})
     out = run_scenario_forecast(tr, None, fm, fut, spec, None)
     sf = out["scenario_forecast"]
-    assert (sf["final_demand"] == sf["baseline_pred"]).all()
+    assert (sf["actual_sales"] == sf["baseline_pred"]).all()
 
 
 def test_price_override_changes_factor_multiplier_not_baseline():
@@ -48,11 +48,20 @@ def test_shock_multiplier_applies_after_factor_multiplier():
     assert (out["scenario_forecast"]["shock_multiplier"] > 1.0).all()
 
 
-def test_stock_caps_final_demand():
+def test_stock_total_horizon_caps_cumulatively():
     tr, spec, fm = _trained_baseline()
     fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
-    out = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"stock": 5})
-    assert (out["scenario_forecast"]["final_demand"] <= 5).all()
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"stock_total_horizon": 5})
+    sf = out["scenario_forecast"]
+    assert float(sf["actual_sales"].sum()) <= 5.0
+
+
+def test_lost_sales_is_positive_when_stock_binding():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"stock_total_horizon": 5})
+    sf = out["scenario_forecast"]
+    assert float(sf["lost_sales"].sum()) > 0.0
 
 
 def test_missing_external_future_values_use_last_known():
@@ -84,3 +93,30 @@ def test_baseline_override_is_used_for_scenario_path():
     override = pd.DataFrame({"date": fut["date"], "baseline_pred": [11.0, 12.0, 13.0]})
     out = run_scenario_forecast(tr, None, fm, fut, spec, None, baseline_override_df=override)
     assert out["scenario_forecast"]["baseline_pred"].tolist() == [11.0, 12.0, 13.0]
+
+
+def test_stock_cap_none_means_unlimited_in_engine():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None, baseline_override_df=pd.DataFrame({"date": fut["date"], "baseline_pred": [4.0, 5.0, 6.0]}))
+    sf = out["scenario_forecast"]
+    assert float(sf["actual_sales"].sum()) == float(sf["scenario_demand_raw"].sum())
+    assert float(sf["lost_sales"].sum()) == 0.0
+
+
+def test_stock_cap_zero_is_binding_when_explicitly_set():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    out = run_scenario_forecast(
+        tr,
+        None,
+        fm,
+        fut,
+        spec,
+        None,
+        baseline_override_df=pd.DataFrame({"date": fut["date"], "baseline_pred": [4.0, 5.0, 6.0]}),
+        scenario_overrides={"stock_total_horizon": 0.0},
+    )
+    sf = out["scenario_forecast"]
+    assert float(sf["actual_sales"].sum()) == 0.0
+    assert float(sf["lost_sales"].sum()) == float(sf["scenario_demand_raw"].sum())

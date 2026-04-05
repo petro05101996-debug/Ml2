@@ -151,16 +151,20 @@ def render_setup_page() -> Dict[str, Any]:
         target_sku = target_selection["target_sku"]
     selected_objective_label = st.selectbox("Цель оптимизации", list(OBJECTIVE_LABEL_TO_MODE.keys()))
     st.caption(OBJECTIVE_HINTS[selected_objective_label])
+    st.caption("Цель влияет на ранжирование и выбор рекомендуемого сценария, а не на сам механизм прогноза спроса.")
     objective_mode = OBJECTIVE_LABEL_TO_MODE[selected_objective_label]
     forecast_horizon_days = st.select_slider("Горизонт, дней", options=HORIZON_OPTIONS, value=30)
-    caution_level = st.selectbox("Уровень осторожности", ["Низкий", "Средний", "Высокий"], index=1)
     run_requested = st.button("Запустить ценовой анализ", type="primary", use_container_width=True)
     _, objective_mode, objective_warning = resolve_objective_weights(objective_mode)
-    return {"load_mode": LOAD_MODE_UNIVERSAL, "universal_txn": universal_txn, "target_category": target_category or None, "target_sku": target_sku or None, "objective_mode": objective_mode, "objective_warning": objective_warning, "forecast_horizon_days": int(forecast_horizon_days), "caution_level": caution_level, "show_risk": True, "run_requested": run_requested}
+    return {"load_mode": LOAD_MODE_UNIVERSAL, "universal_txn": universal_txn, "target_category": target_category or None, "target_sku": target_sku or None, "objective_mode": objective_mode, "objective_warning": objective_warning, "forecast_horizon_days": int(forecast_horizon_days), "show_risk": True, "run_requested": run_requested}
 
 
 def render_scenario_lab(r: Dict[str, Any]) -> None:
-    presets = build_seller_scenario_presets(float(r["current_price"]), r["_trained_bundle"]["base_ctx"], int(r.get("forecast_horizon_days", 30)))
+    bundle = r.get("_trained_bundle", {})
+    base_ctx = bundle.get("base_ctx", {})
+    scenario_spec = bundle.get("scenario_feature_spec", bundle.get("feature_spec", {}))
+    current_price = float(r.get("current_price", bundle.get("current_price", base_ctx.get("price", 1.0))))
+    presets = build_seller_scenario_presets(current_price, base_ctx, int(r.get("forecast_horizon_days", bundle.get("forecast_horizon_days", 30))))
     quick_presets = {
         "Сохранить текущую цену": presets.get(PRESET_KEEP_CURRENT, list(presets.values())[0]),
         "Осторожное повышение": presets.get(PRESET_CAUTIOUS_INCREASE, list(presets.values())[0]),
@@ -173,26 +177,25 @@ def render_scenario_lab(r: Dict[str, Any]) -> None:
     selected_preset = st.selectbox("Быстрые бизнес-пресеты", list(quick_presets.keys()))
     base_preset = quick_presets[selected_preset]
     p1, p2, p3, p4 = st.columns(4)
-    price = p1.number_input("Цена", min_value=0.01, value=float(base_preset.get("price", r["current_price"])), step=1.0)
+    price = p1.number_input("Цена", min_value=0.01, value=float(base_preset.get("price", current_price)), step=1.0)
     demand = p2.slider("Множитель спроса", 0.7, 1.3, float(base_preset.get("demand_multiplier", 1.0)), 0.05)
     freight = p3.slider("Множитель логистики", 0.5, 1.5, float(base_preset.get("freight_multiplier", 1.0)), 0.05)
     horizon = p4.select_slider("Горизонт", options=HORIZON_OPTIONS, value=int(base_preset.get("horizon_days", 30)))
     with st.expander("Расширенный режим", expanded=False):
         discount = st.slider("Скидка", 0.0, 0.95, float(base_preset.get("discount", 0.0)), 0.01)
         promo = st.slider("Промо", 0.0, 1.0, float(base_preset.get("promotion", 0.0)), 0.05)
-        stock = st.number_input("Лимит запаса", min_value=0.0, value=float(base_preset.get("stock_cap", r["_trained_bundle"]["base_ctx"].get("stock", 0.0))), step=1.0)
-        review_score = st.slider("Рейтинг", 0.0, 5.0, float(r["_trained_bundle"]["base_ctx"].get("review_score", 4.5)), 0.1)
-        reviews_count = st.number_input("Количество отзывов", min_value=0.0, value=float(r["_trained_bundle"]["base_ctx"].get("reviews_count", 0.0)), step=1.0)
+        use_stock_cap = st.checkbox("Использовать ограничение запаса", value=("stock_cap" in base_preset))
+        stock = st.number_input("Лимит запаса", min_value=0.0, value=float(base_preset.get("stock_cap", base_ctx.get("stock_total_horizon", 0.0))), step=1.0, disabled=not use_stock_cap)
         cost = st.slider("Множитель себестоимости", 0.7, 1.3, float(base_preset.get("cost_multiplier", 1.0)), 0.05)
         st.markdown("**Дополнительные пользовательские факторы**")
         user_factor_overrides = {}
-        for factor in r["_trained_bundle"]["feature_spec"].get("user_numeric_features", []):
+        for factor in scenario_spec.get("user_numeric_features", []):
             label = factor.replace("user_factor_num__", "", 1)
-            user_factor_overrides[factor] = st.number_input(label, value=float(r["_trained_bundle"]["base_ctx"].get(factor, 0.0)), step=0.1)
+            user_factor_overrides[factor] = st.number_input(label, value=float(base_ctx.get(factor, 0.0)), step=0.1)
 
     w = run_v2_what_if_projection(
-        r["_trained_bundle"], manual_price=float(price), freight_multiplier=float(freight), demand_multiplier=float(demand), cost_multiplier=float(cost), horizon_days=int(horizon), stock_cap=float(stock),
-        scenario={"name": "scenario_lab", "mode": "manual", "horizon_days": int(horizon), "factors": {"price": float(price), "discount": float(discount), "promotion": float(promo), "stock": float(stock), "review_score": float(review_score), "reviews_count": float(reviews_count), **user_factor_overrides}},
+        r["_trained_bundle"], manual_price=float(price), freight_multiplier=float(freight), demand_multiplier=float(demand), cost_multiplier=float(cost), horizon_days=int(horizon), stock_cap=(float(stock) if use_stock_cap else None),
+        scenario={"name": "scenario_lab", "mode": "manual", "horizon_days": int(horizon), "factors": {"price": float(price), "discount": float(discount), "promotion": float(promo), **user_factor_overrides}},
     )
     st.session_state.what_if_result = w
 
@@ -209,7 +212,7 @@ def render_results_page(r: Dict[str, Any]) -> None:
     else:
         decision = build_main_decision_text(r)
         st.markdown(f"### {decision.get('action', '—')}")
-    explanation = generate_explanation(r, data_quality=r.get("data_quality", {}))
+    explanation = {} if r.get("analysis_engine") == "v2_decomposed_baseline_factor_shock" else generate_explanation(r, data_quality=r.get("data_quality", {}))
     col_excel, col_md = st.columns(2)
     excel_buffer = r.get("excel_buffer")
     if excel_buffer is not None:

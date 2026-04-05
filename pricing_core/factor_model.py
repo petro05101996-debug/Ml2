@@ -16,7 +16,7 @@ def _params(training_profile: str, small_mode: bool) -> Dict[str, Any]:
 
 
 def _monotone_tuple(feature_names: List[str]) -> tuple:
-    m = {"price_rel_to_recent_median_28": -1, "discount_rate": 1, "promo_flag": 1, "stock": 1}
+    m = {"price_rel_to_recent_median_28": -1, "discount_rate": 1, "promo_flag": 1}
     return tuple(int(m.get(f, 0)) for f in feature_names)
 
 
@@ -103,7 +103,7 @@ def build_factor_ood_flags(target_history: pd.DataFrame, factor_future_df: pd.Da
     if "discount_rate" not in hist.columns and "discount" in hist.columns:
         hist["discount_rate"] = pd.to_numeric(hist.get("discount"), errors="coerce")
 
-    for c in ["price_rel_to_recent_median_28", "discount_rate", "stock"]:
+    for c in ["price_rel_to_recent_median_28", "discount_rate"]:
         if c not in hist.columns or c not in factor_future_df.columns:
             continue
         h = pd.to_numeric(hist[c], errors="coerce").dropna()
@@ -116,7 +116,7 @@ def build_factor_ood_flags(target_history: pd.DataFrame, factor_future_df: pd.Da
         if ((s < lo) | (s > hi)).any():
             flags.append(f"ood_numeric:{c}")
 
-    default_cats = ["category", "region", "channel", "segment"]
+    default_cats = ["product_id", "category"]
     user_cats = [c for c in feature_spec.get("factor_categorical_features", []) if str(c).startswith("user_factor_cat__")]
     for c in default_cats + user_cats:
         if c not in hist.columns or c not in factor_future_df.columns:
@@ -135,7 +135,7 @@ def _estimate_window_ood_share(train_df: pd.DataFrame, test_df: pd.DataFrame) ->
         return 0.0
     flags = pd.Series(False, index=test_df.index)
 
-    for col in ["price_rel_to_recent_median_28", "discount_rate", "stock"]:
+    for col in ["price_rel_to_recent_median_28", "discount_rate"]:
         if col not in train_df.columns or col not in test_df.columns:
             continue
         h = pd.to_numeric(train_df[col], errors="coerce").dropna()
@@ -147,7 +147,7 @@ def _estimate_window_ood_share(train_df: pd.DataFrame, test_df: pd.DataFrame) ->
             continue
         flags = flags | ((s < lo) | (s > hi)).fillna(False)
 
-    for col in ["category", "region", "channel", "segment"] + [c for c in test_df.columns if str(c).startswith("user_factor_cat__")]:
+    for col in ["product_id", "category"] + [c for c in test_df.columns if str(c).startswith("user_factor_cat__")]:
         if col not in train_df.columns or col not in test_df.columns:
             continue
         known = set(train_df[col].dropna().astype(str).unique())
@@ -222,7 +222,7 @@ def run_factor_backtest(df: pd.DataFrame, trained_factor: Dict[str, Any], featur
 
 def compute_factor_contributions(target_history: pd.DataFrame, future_dates_df: pd.DataFrame, base_ctx: Dict[str, Any], scenario_ctx: Dict[str, Any], trained_factor: Dict[str, Any], feature_spec: Dict[str, Any]) -> pd.DataFrame:
     if trained_factor is None:
-        return pd.DataFrame(columns=["factor_name", "contribution_abs", "contribution_pct", "confidence", "note"])
+        return pd.DataFrame(columns=["factor_name", "multiplier_delta", "contribution_pct", "confidence", "note"])
     from pricing_core.scenario_engine import build_future_factor_frame
 
     base_frame = build_future_factor_frame(target_history, future_dates_df, base_ctx, feature_spec)
@@ -236,5 +236,5 @@ def compute_factor_contributions(target_history: pd.DataFrame, future_dates_df: 
         frame = build_future_factor_frame(target_history, future_dates_df, c, feature_spec)
         m = float(predict_factor_effect(frame, trained_factor, feature_spec)["factor_multiplier"].mean())
         pct = 0.0 if base_mult <= 1e-9 else (m / base_mult - 1.0)
-        rows.append({"factor_name": f, "contribution_abs": pct, "contribution_pct": pct, "confidence": "advisory", "note": "deterministic_delta"})
-    return pd.DataFrame(rows, columns=["factor_name", "contribution_abs", "contribution_pct", "confidence", "note"])
+        rows.append({"factor_name": f, "multiplier_delta": pct, "contribution_pct": pct, "confidence": "advisory", "note": "deterministic_one_factor_delta_not_shap"})
+    return pd.DataFrame(rows, columns=["factor_name", "multiplier_delta", "contribution_pct", "confidence", "note"])

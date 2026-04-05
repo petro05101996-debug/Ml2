@@ -21,10 +21,10 @@ def test_factor_target_uses_baseline_oof():
     assert np.isfinite(t).all()
 
 
-def test_factor_feature_spec_contains_price_rel_discount_promo_stock():
+def test_factor_feature_spec_contains_price_rel_discount_promo():
     df = _df()
     spec = derive_factor_feature_spec(df)
-    for c in ["price", "discount", "promotion", "stock", "price_rel_to_recent_median_28"]:
+    for c in ["price", "discount", "promotion", "price_rel_to_recent_median_28"]:
         assert c in spec["factor_numeric_features"] or c in spec["factor_features"]
 
 
@@ -84,7 +84,7 @@ def test_price_override_changes_factor_multiplier_with_trained_factor():
     ff = build_factor_feature_matrix(df, spec)
     ff["factor_target"] = build_factor_target(ff)
     trained = train_factor_model(ff, spec, small_mode=True)
-    base_ctx = {"price": 100.0, "discount": 0.05, "promotion": 0.0, "stock": 100.0, "category": "cat", "region": "US", "channel": "online", "segment": "retail"}
+    base_ctx = {"price": 100.0, "discount": 0.05, "promotion": 0.0, "product_id": "sku-1", "category": "cat"}
     fut = pd.DataFrame({"date": pd.date_range(df["date"].max() + pd.Timedelta(days=1), periods=5, freq="D")})
     base_frame = build_future_factor_frame(df, fut, base_ctx, spec)
     alt_ctx = dict(base_ctx)
@@ -93,3 +93,17 @@ def test_price_override_changes_factor_multiplier_with_trained_factor():
     base_mult = float(predict_factor_effect(base_frame, trained, spec)["factor_multiplier"].mean())
     alt_mult = float(predict_factor_effect(alt_frame, trained, spec)["factor_multiplier"].mean())
     assert alt_mult <= base_mult
+
+
+def test_promotion_override_keeps_intensity():
+    out = apply_user_overrides({"promotion": 0.0}, {"promotion": 0.2})
+    assert out["promotion"] == 0.2
+
+
+def test_user_factor_cat_override_applied_to_future_frame():
+    df = _df()
+    df["user_factor_cat__campaign"] = ["A" if i % 2 == 0 else "C" for i in range(len(df))]
+    spec = derive_factor_feature_spec(df)
+    fut = pd.DataFrame({"date": pd.date_range(df["date"].max() + pd.Timedelta(days=1), periods=2, freq="D")})
+    frame = build_future_factor_frame(df, fut, {"price": 100.0, "discount": 0.05, "promotion": 0.0, "product_id": "sku-1", "category": "cat", "user_factor_cat__campaign": "B"}, spec)
+    assert set(frame["user_factor_cat__campaign"].astype(str).unique()) == {"B"}
