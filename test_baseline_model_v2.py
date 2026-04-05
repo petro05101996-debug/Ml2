@@ -3,7 +3,13 @@ import pandas as pd
 
 from data_adapter import build_daily_panel_from_transactions
 from pricing_core.baseline_features import build_baseline_feature_matrix, derive_baseline_feature_spec
-from pricing_core.baseline_model import build_baseline_oof_predictions, recursive_baseline_forecast, run_baseline_rolling_backtest, train_baseline_model
+from pricing_core.baseline_model import (
+    build_baseline_oof_predictions,
+    recursive_baseline_forecast,
+    run_baseline_rolling_backtest,
+    select_best_baseline_strategy,
+    train_baseline_model,
+)
 
 
 def _txn(n=160):
@@ -60,3 +66,14 @@ def test_dense_oof_produces_enough_baseline_oof_rows():
     oof = build_baseline_oof_predictions(fm, "cat", "sku-1")
     coverage = float(oof["baseline_oof"].notna().mean())
     assert coverage >= 0.45
+
+
+def test_selected_baseline_is_not_worse_than_xgb():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(260)))
+    selected = select_best_baseline_strategy(fm, "cat", "sku-1")
+    xgb = run_baseline_rolling_backtest(fm, "cat", "sku-1", strategy="xgb_recursive")
+    summary = selected["strategy_summary"].copy()
+    picked = summary[summary["strategy"] == selected["best_strategy"]]
+    selected_wape = float(picked["median_wape"].iloc[0]) if len(picked) else np.inf
+    xgb_wape = float(xgb["rolling_summary"]["median_wape"])
+    assert selected_wape <= xgb_wape

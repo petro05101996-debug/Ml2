@@ -184,7 +184,9 @@ def render_scenario_lab(r: Dict[str, Any]) -> None:
     with st.expander("Расширенный режим", expanded=False):
         discount = st.slider("Скидка", 0.0, 0.95, float(base_preset.get("discount", 0.0)), 0.01)
         promo = st.slider("Промо", 0.0, 1.0, float(base_preset.get("promotion", 0.0)), 0.05)
-        stock = st.number_input("Лимит запаса", min_value=0.0, value=float(base_preset.get("stock_cap", base_ctx.get("stock_total_horizon", 0.0))), step=1.0)
+        use_stock_cap = st.checkbox("Использовать ограничение запаса", value=False)
+        stock_default = float(base_preset.get("stock_cap", 0.0))
+        stock = st.number_input("Лимит запаса", min_value=0.0, value=stock_default, step=1.0, disabled=not use_stock_cap)
         cost = st.slider("Множитель себестоимости", 0.7, 1.3, float(base_preset.get("cost_multiplier", 1.0)), 0.05)
         st.markdown("**Дополнительные пользовательские факторы**")
         user_factor_overrides = {}
@@ -193,7 +195,7 @@ def render_scenario_lab(r: Dict[str, Any]) -> None:
             user_factor_overrides[factor] = st.number_input(label, value=float(base_ctx.get(factor, 0.0)), step=0.1)
 
     w = run_v2_what_if_projection(
-        r["_trained_bundle"], manual_price=float(price), freight_multiplier=float(freight), demand_multiplier=float(demand), cost_multiplier=float(cost), horizon_days=int(horizon), stock_cap=float(stock),
+        r["_trained_bundle"], manual_price=float(price), freight_multiplier=float(freight), demand_multiplier=float(demand), cost_multiplier=float(cost), horizon_days=int(horizon), stock_cap=(float(stock) if use_stock_cap else None),
         scenario={"name": "scenario_lab", "mode": "manual", "horizon_days": int(horizon), "factors": {"price": float(price), "discount": float(discount), "promotion": float(promo), **user_factor_overrides}},
     )
     st.session_state.what_if_result = w

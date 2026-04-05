@@ -91,6 +91,61 @@ def recursive_baseline_forecast(trained_baseline: Dict[str, Any], base_history: 
     return pd.DataFrame(rows)
 
 
+def recursive_baseline_forecast_median7(base_history: pd.DataFrame, future_dates_df: pd.DataFrame) -> pd.DataFrame:
+    s = pd.to_numeric(base_history.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    base = float(s.tail(7).median()) if len(s) else 0.0
+    return pd.DataFrame({"date": pd.to_datetime(future_dates_df["date"]), "baseline_pred": max(0.0, base)})
+
+
+def recursive_baseline_forecast_mean28(base_history: pd.DataFrame, future_dates_df: pd.DataFrame) -> pd.DataFrame:
+    s = pd.to_numeric(base_history.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    base = float(s.tail(28).mean()) if len(s) else 0.0
+    return pd.DataFrame({"date": pd.to_datetime(future_dates_df["date"]), "baseline_pred": max(0.0, base)})
+
+
+def recursive_baseline_forecast_dow_median8w(base_history: pd.DataFrame, future_dates_df: pd.DataFrame) -> pd.DataFrame:
+    hist = base_history.copy()
+    hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
+    hist["sales"] = pd.to_numeric(hist.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    hist = hist.dropna(subset=["date"]).sort_values("date")
+    fallback = float(hist["sales"].tail(7).median()) if len(hist) else 0.0
+    if len(hist):
+        cutoff = pd.Timestamp(hist["date"].max()) - pd.Timedelta(weeks=8)
+        hist_8w = hist[hist["date"] >= cutoff].copy()
+    else:
+        hist_8w = hist
+
+    rows: List[Dict[str, Any]] = []
+    for dt in pd.to_datetime(future_dates_df["date"], errors="coerce"):
+        dow = int(pd.Timestamp(dt).dayofweek)
+        pool = hist_8w[hist_8w["date"].dt.dayofweek == dow]["sales"] if len(hist_8w) else pd.Series(dtype=float)
+        pred = float(pool.median()) if len(pool) else fallback
+        rows.append({"date": pd.Timestamp(dt), "baseline_pred": max(0.0, pred)})
+    return pd.DataFrame(rows)
+
+
+def forecast_baseline_by_strategy(
+    strategy: str,
+    trained_baseline: Dict[str, Any] | None,
+    base_history: pd.DataFrame,
+    future_dates_df: pd.DataFrame,
+    base_ctx: Dict[str, Any],
+    feature_spec: Dict[str, Any],
+) -> pd.DataFrame:
+    s = str(strategy or "xgb_recursive")
+    if s == "xgb_recursive":
+        if trained_baseline is None:
+            raise ValueError("trained_baseline is required for xgb_recursive strategy")
+        return recursive_baseline_forecast(trained_baseline, base_history, future_dates_df, base_ctx, feature_spec)
+    if s == "median7":
+        return recursive_baseline_forecast_median7(base_history, future_dates_df)
+    if s == "mean28":
+        return recursive_baseline_forecast_mean28(base_history, future_dates_df)
+    if s == "dow_median8w":
+        return recursive_baseline_forecast_dow_median8w(base_history, future_dates_df)
+    raise ValueError(f"Unknown baseline strategy: {s}")
+
+
 def run_baseline_holdout(actual: pd.Series, pred: pd.Series) -> Dict[str, float]:
     a = pd.to_numeric(actual, errors="coerce").fillna(0.0)
     p = pd.to_numeric(pred, errors="coerce").fillna(0.0)
@@ -104,7 +159,15 @@ def run_baseline_holdout(actual: pd.Series, pred: pd.Series) -> Dict[str, float]
     return {"forecast_wape": wape, "mae": mae, "rmse": rmse, "bias_pct": bias_pct, "sum_ratio": sum_ratio}
 
 
-def run_baseline_rolling_backtest(panel_train: pd.DataFrame, target_category: str, target_sku: str, n_windows: int = 3, window_days: int = 28, min_train_days: int = 120) -> Dict[str, Any]:
+def run_baseline_rolling_backtest(
+    panel_train: pd.DataFrame,
+    target_category: str,
+    target_sku: str,
+    n_windows: int = 3,
+    window_days: int = 28,
+    min_train_days: int = 120,
+    strategy: str = "xgb_recursive",
+) -> Dict[str, Any]:
     from pricing_core.baseline_features import derive_baseline_feature_spec
 
     target = panel_train[(panel_train["category"].astype(str) == str(target_category)) & (panel_train["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
@@ -119,10 +182,10 @@ def run_baseline_rolling_backtest(panel_train: pd.DataFrame, target_category: st
         if train_t["date"].nunique() < int(min_train_days) or test_t.empty:
             continue
         spec = derive_baseline_feature_spec(panel_w)
-        trained = train_baseline_model(panel_w, spec, small_mode=len(panel_w) < 200, training_profile="backtest")
         base_ctx = {k: (train_t[k].dropna().astype(str).iloc[-1] if k in ["product_id", "category", "region", "channel", "segment"] and k in train_t else "unknown") for k in ["product_id", "category", "region", "channel", "segment"]}
         fut = pd.DataFrame({"date": test_t["date"].values})
-        fc = recursive_baseline_forecast(trained, train_t, fut, base_ctx, spec)
+        trained = train_baseline_model(panel_w, spec, small_mode=len(panel_w) < 200, training_profile="backtest") if strategy == "xgb_recursive" else None
+        fc = forecast_baseline_by_strategy(strategy, trained, train_t, fut, base_ctx, spec)
         merged = test_t[["date", "sales"]].merge(fc, on="date", how="left")
         merged["window_id"] = i
         merged["window_start"] = ws
@@ -132,6 +195,7 @@ def run_baseline_rolling_backtest(panel_train: pd.DataFrame, target_category: st
     rolling_diag = pd.concat(diag_rows, ignore_index=True) if diag_rows else pd.DataFrame(columns=["date", "sales", "baseline_pred", "window_id", "window_start", "window_end"])
     rolling_metrics = pd.DataFrame(metric_rows)
     summary = {
+        "strategy": str(strategy),
         "n_valid_windows": int(len(rolling_metrics)),
         "median_wape": float(rolling_metrics["forecast_wape"].median()) if len(rolling_metrics) else np.nan,
         "median_bias_pct": float(rolling_metrics["bias_pct"].median()) if len(rolling_metrics) else np.nan,
@@ -141,6 +205,60 @@ def run_baseline_rolling_backtest(panel_train: pd.DataFrame, target_category: st
     return {"rolling_diag": rolling_diag, "rolling_metrics": rolling_metrics, "rolling_summary": summary}
 
 
+def select_best_baseline_strategy(
+    panel_train: pd.DataFrame,
+    target_category: str,
+    target_sku: str,
+    n_windows: int = 3,
+    window_days: int = 28,
+    min_train_days: int = 120,
+) -> Dict[str, Any]:
+    strategies = ["xgb_recursive", "median7", "mean28", "dow_median8w"]
+    metrics_rows: List[pd.DataFrame] = []
+    summary_rows: List[Dict[str, Any]] = []
+
+    for s in strategies:
+        bt = run_baseline_rolling_backtest(
+            panel_train=panel_train,
+            target_category=target_category,
+            target_sku=target_sku,
+            n_windows=n_windows,
+            window_days=window_days,
+            min_train_days=min_train_days,
+            strategy=s,
+        )
+        m = bt.get("rolling_metrics", pd.DataFrame()).copy()
+        if not m.empty:
+            m["strategy"] = s
+            metrics_rows.append(m)
+        rs = bt.get("rolling_summary", {}) or {}
+        summary_rows.append(
+            {
+                "strategy": s,
+                "n_valid_windows": int(rs.get("n_valid_windows", 0) or 0),
+                "median_wape": float(rs.get("median_wape", np.nan)),
+                "median_bias_pct": float(rs.get("median_bias_pct", np.nan)),
+                "median_sum_ratio": float(rs.get("median_sum_ratio", np.nan)),
+                "max_wape": float(rs.get("max_wape", np.nan)),
+            }
+        )
+
+    strategy_metrics = pd.concat(metrics_rows, ignore_index=True) if metrics_rows else pd.DataFrame()
+    strategy_summary = pd.DataFrame(summary_rows)
+    valid = strategy_summary[strategy_summary["n_valid_windows"] > 0].copy()
+    if valid.empty:
+        best_strategy = "xgb_recursive"
+    else:
+        valid["abs_median_bias_pct"] = valid["median_bias_pct"].abs()
+        valid = valid.sort_values(["median_wape", "abs_median_bias_pct"], ascending=[True, True])
+        best_strategy = str(valid.iloc[0]["strategy"])
+    return {
+        "best_strategy": best_strategy,
+        "strategy_metrics": strategy_metrics,
+        "strategy_summary": strategy_summary,
+    }
+
+
 def build_baseline_oof_predictions(
     panel_train: pd.DataFrame,
     target_category: str,
@@ -148,6 +266,7 @@ def build_baseline_oof_predictions(
     min_train_days: int = 84,
     step_days: int = 7,
     horizon_days: int = 7,
+    strategy: str = "xgb_recursive",
 ) -> pd.DataFrame:
     from pricing_core.baseline_features import derive_baseline_feature_spec
 
@@ -175,12 +294,12 @@ def build_baseline_oof_predictions(
             continue
 
         spec_w = derive_baseline_feature_spec(panel_w)
-        trained_w = train_baseline_model(panel_w, spec_w, small_mode=len(panel_w) < 200, training_profile="backtest")
         base_ctx_w = {
             k: (target_w[k].dropna().astype(str).iloc[-1] if k in target_w.columns and k in ["product_id", "category", "region", "channel", "segment"] else "unknown")
             for k in ["product_id", "category", "region", "channel", "segment"]
         }
-        fc_w = recursive_baseline_forecast(trained_w, target_w, test_dates_df, base_ctx_w, spec_w)
+        trained_w = train_baseline_model(panel_w, spec_w, small_mode=len(panel_w) < 200, training_profile="backtest") if strategy == "xgb_recursive" else None
+        fc_w = forecast_baseline_by_strategy(strategy, trained_w, target_w, test_dates_df, base_ctx_w, spec_w)
         pred_map = dict(zip(pd.to_datetime(fc_w["date"]), pd.to_numeric(fc_w["baseline_pred"], errors="coerce")))
 
         mask = out["date"].isin(test_slice["date"]) & out["baseline_oof"].isna()

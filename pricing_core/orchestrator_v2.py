@@ -11,8 +11,10 @@ from data_adapter import build_daily_panel_from_transactions
 from pricing_core.baseline_features import build_baseline_feature_matrix, derive_baseline_feature_spec
 from pricing_core.baseline_model import (
     build_baseline_oof_predictions,
+    forecast_baseline_by_strategy,
     recursive_baseline_forecast,
     run_baseline_rolling_backtest,
+    select_best_baseline_strategy,
     train_baseline_model,
 )
 from pricing_core.factor_features import build_factor_feature_matrix, build_factor_target, derive_factor_feature_spec
@@ -105,7 +107,9 @@ def _build_pooled_factor_train(panel_train: pd.DataFrame, target_category: str, 
     sku_rank = sku_rank.sort_values(["price_unique", "n_rows", "non_na_share"], ascending=False)
 
     for sku in sku_rank["product_id"].astype(str).dropna().head(max_skus):
-        oof = build_baseline_oof_predictions(scope_panel, target_category, sku)
+        selected = select_best_baseline_strategy(scope_panel, target_category, sku)
+        sku_strategy = str(selected.get("best_strategy", "xgb_recursive"))
+        oof = build_baseline_oof_predictions(scope_panel, target_category, sku, strategy=sku_strategy)
         if oof.empty:
             continue
         sku_hist = scope_panel[scope_panel["product_id"].astype(str) == str(sku)].copy()
@@ -140,26 +144,41 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
     tiny_mode = target_history["date"].nunique() < 14
     trained_baseline_bt = None
     trained_baseline_final = None
+    best_baseline_strategy = "xgb_recursive"
+    baseline_strategy_selection = {
+        "best_strategy": "xgb_recursive",
+        "strategy_metrics": pd.DataFrame(),
+        "strategy_summary": pd.DataFrame(),
+    }
 
     if tiny_mode:
         baseline_forecast = _tiny_baseline_fallback(target_history, future_dates)
         baseline_rolling = _build_empty_baseline_rolling()
         baseline_oof = target_train[["date", "sales"]].copy()
         baseline_oof["baseline_oof"] = np.nan
+        best_baseline_strategy = "median7"
+        baseline_strategy_selection["best_strategy"] = best_baseline_strategy
     else:
-        trained_baseline_bt = train_baseline_model(panel_train, baseline_feature_spec_train, small_mode=len(panel_train) < 200, training_profile="backtest")
-        trained_baseline_final = train_baseline_model(panel_features_baseline, baseline_feature_spec_full, small_mode=len(panel_features_baseline) < 200, training_profile="final")
+        baseline_strategy_selection = select_best_baseline_strategy(panel_train, target_category, target_sku)
+        best_baseline_strategy = str(baseline_strategy_selection.get("best_strategy", "xgb_recursive"))
 
         base_ctx = {
             c: (target_history[c].dropna().astype(str).iloc[-1] if c in ["product_id", "category", "region", "channel", "segment"] and c in target_history else "unknown")
             for c in baseline_feature_spec_full.get("baseline_context_features", [])
         }
-        baseline_forecast = recursive_baseline_forecast(trained_baseline_final, target_history, future_dates, base_ctx, baseline_feature_spec_full)
+        if best_baseline_strategy == "xgb_recursive":
+            trained_baseline_bt = train_baseline_model(panel_train, baseline_feature_spec_train, small_mode=len(panel_train) < 200, training_profile="backtest")
+            trained_baseline_final = train_baseline_model(panel_features_baseline, baseline_feature_spec_full, small_mode=len(panel_features_baseline) < 200, training_profile="final")
+            baseline_forecast = recursive_baseline_forecast(trained_baseline_final, target_history, future_dates, base_ctx, baseline_feature_spec_full)
+        else:
+            trained_baseline_bt = None
+            trained_baseline_final = None
+            baseline_forecast = forecast_baseline_by_strategy(best_baseline_strategy, None, target_history, future_dates, base_ctx, baseline_feature_spec_full)
         baseline_forecast["baseline_lower"] = np.nan
         baseline_forecast["baseline_upper"] = np.nan
 
-        baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku)
-        baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku)
+        baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
+        baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
 
     factor_train_target = target_train.merge(baseline_oof[["date", "baseline_oof"]], on="date", how="left")
     factor_feature_spec_target = derive_factor_feature_spec(factor_train_target)
@@ -227,6 +246,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         }
     )
 
+    use_baseline_override = tiny_mode or (best_baseline_strategy != "xgb_recursive")
     scenario_result = run_scenario_forecast(
         trained_baseline=trained_baseline_final,
         trained_factor=trained_factor,
@@ -236,7 +256,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         factor_feature_spec=factor_feature_spec if factor_model_trained else None,
         scenario_overrides=scenario_overrides,
         shocks=shocks,
-        baseline_override_df=baseline_forecast[["date", "baseline_pred"]] if tiny_mode else None,
+        baseline_override_df=baseline_forecast[["date", "baseline_pred"]] if use_baseline_override else None,
     )
     scenario_forecast = scenario_result["scenario_forecast"].copy()
 
@@ -324,6 +344,8 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         engine_version="v2_decomposed_baseline_factor_shock",
         factor_train_scope=factor_train_scope,
         factor_train_rows=int(len(factor_train)),
+        baseline_strategy=best_baseline_strategy,
+        baseline_strategy_selection=baseline_strategy_selection,
         mode=mode,
         ood_flags=ood_flags,
         intervals_available=intervals_available,
@@ -352,6 +374,8 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         "factor_model_trained": bool(factor_model_trained),
         "factor_train_scope": factor_train_scope,
         "factor_train_rows": int(len(factor_train)),
+        "baseline_strategy": best_baseline_strategy,
+        "baseline_strategy_selection": baseline_strategy_selection,
         "mode": mode,
         "ood_flags": ood_flags,
         "intervals_available": intervals_available,
