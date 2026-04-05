@@ -151,6 +151,7 @@ def render_setup_page() -> Dict[str, Any]:
         target_sku = target_selection["target_sku"]
     selected_objective_label = st.selectbox("Цель оптимизации", list(OBJECTIVE_LABEL_TO_MODE.keys()))
     st.caption(OBJECTIVE_HINTS[selected_objective_label])
+    st.caption("Цель влияет на ранжирование и выбор рекомендуемого сценария, а не на сам механизм прогноза спроса.")
     objective_mode = OBJECTIVE_LABEL_TO_MODE[selected_objective_label]
     forecast_horizon_days = st.select_slider("Горизонт, дней", options=HORIZON_OPTIONS, value=30)
     run_requested = st.button("Запустить ценовой анализ", type="primary", use_container_width=True)

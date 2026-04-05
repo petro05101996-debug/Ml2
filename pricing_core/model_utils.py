@@ -85,7 +85,7 @@ def build_models(
     if len(X) == 0:
         raise ValueError("Пустая обучающая выборка.")
 
-    monotone_map = {"price": -1, "freight_value": -1, "review_score": 1}
+    monotone_map = {"price": -1}
     monotone_constraints_tuple = tuple(monotone_map.get(f, 0) for f in feature_names)
 
     ensemble: List[Any] = []

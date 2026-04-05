@@ -20,6 +20,7 @@ def test_scenario_lab_passes_cost_multiplier_to_projection(monkeypatch):
 
     class _ColumnControl:
         def number_input(self, _label, **kwargs): return kwargs.get("value")
+        def checkbox(self, _label, **kwargs): return kwargs.get("value", False)
         def slider(self, _label, *args, **kwargs): return kwargs.get("value", args[2])
         def select_slider(self, _label, **kwargs): return kwargs.get("value")
 
@@ -31,9 +32,11 @@ def test_scenario_lab_passes_cost_multiplier_to_projection(monkeypatch):
         def __init__(self): self.session_state = _SessionState()
         def markdown(self, *_a, **_k): return None
         def warning(self, *_a, **_k): return None
+        def caption(self, *_a, **_k): return None
         def selectbox(self, _label, options, **_kwargs): return options[0]
         def slider(self, _label, *args, **kwargs): return kwargs.get("value", args[2])
         def number_input(self, _label, **kwargs): return kwargs.get("value")
+        def checkbox(self, _label, **kwargs): return kwargs.get("value", False)
         def columns(self, n): return [_ColumnControl() for _ in range(n)]
         def expander(self, *_args, **_kwargs): return _expander()
 

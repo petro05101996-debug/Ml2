@@ -38,7 +38,7 @@ def run_scenario_set(trained_bundle: Dict[str, Any], scenario_rows: List[Dict[st
             horizon_days=int(row["horizon_days"]),
             discount_multiplier=float(row.get("discount_multiplier", 1.0)),
             cost_multiplier=float(row.get("cost_multiplier", 1.0)),
-            stock_cap=float(row.get("stock_cap", 0.0)),
+            stock_cap=(None if row.get("stock_cap", None) is None else float(row.get("stock_cap"))),
             scenario={"name": str(row.get("name", "scenario")), "mode": "manual", "horizon_days": int(row["horizon_days"]), "factors": factors},
         )
         raw_demand = float(result.get("demand_total", 0.0))

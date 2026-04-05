@@ -20,7 +20,7 @@ def run_v2_what_if_projection(
     horizon_days: int = 30,
     discount_multiplier: float = 1.0,
     cost_multiplier: float = 1.0,
-    stock_cap: float = 0.0,
+    stock_cap: float | None = None,
     scenario: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     target_history = trained_bundle.get("target_history", pd.DataFrame())
