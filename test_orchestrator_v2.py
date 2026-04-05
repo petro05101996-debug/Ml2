@@ -50,8 +50,8 @@ def test_v2_excel_contains_required_sheets():
 def test_v2_uses_final_baseline_model_for_forecast():
     out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
     b = out["_trained_bundle"]
-    assert b.get("baseline_strategy") in {"xgb_recursive", "median7", "mean28", "dow_median8w"}
-    if b.get("baseline_strategy") == "xgb_recursive":
+    assert b.get("baseline_strategy") in {"xgb_recursive", "median7", "mean28", "dow_median8w", "weekly_median4w", "weekly_recent4_avg", "weekly_mean8w"}
+    if b.get("baseline_strategy") == "xgb_recursive" and b.get("baseline_granularity") != "weekly":
         assert b.get("trained_baseline_bt") is not None
         assert b.get("trained_baseline_final") is not None
         assert b["trained_baseline_bt"]["training_profile"] == "backtest"
@@ -162,3 +162,28 @@ def test_sample_transactions_end_to_end_v2_runs():
     assert "baseline_forecast" in out
     assert "scenario_forecast" in out
     assert "overall_confidence" in out["confidence"]
+
+
+def test_weekly_baseline_plan_returns_daily_forecast_contract():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=9)
+    bf = out["baseline_forecast"]
+    assert {"date", "baseline_pred"}.issubset(bf.columns)
+    assert len(bf) == 9
+
+
+def test_weekly_baseline_oof_is_daily_and_non_empty():
+    out = run_full_pricing_analysis_v2(_txn(280, two_skus=True), "cat", "sku-1", horizon_days=7)
+    bundle = out["_trained_bundle"]
+    oof = bundle.get("baseline_oof", pd.DataFrame())
+    assert {"date", "baseline_oof"}.issubset(oof.columns)
+    if str(out.get("baseline_granularity", "daily")) == "weekly":
+        assert oof["baseline_oof"].notna().sum() > 0
+        assert oof["date"].nunique() > 0
+        assert bundle.get("factor_train_rows", 0) >= 0
+
+
+def test_end_to_end_v2_runs_with_weekly_baseline_selection():
+    out = run_full_pricing_analysis_v2(_txn(300, two_skus=True), "cat", "sku-1", horizon_days=7)
+    assert "baseline_forecast" in out
+    assert "scenario_forecast" in out
+    assert out.get("baseline_granularity") in {"daily", "weekly"}

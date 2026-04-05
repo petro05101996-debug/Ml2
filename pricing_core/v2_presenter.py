@@ -37,6 +37,11 @@ def build_v2_result_contract(result_v2: Dict[str, Any]) -> Dict[str, Any]:
         "overall_confidence": conf.get("overall_confidence", "low"),
         "factor_model_trained": factor_model_trained,
         "mode": result_v2.get("mode", "baseline_only"),
+        "baseline_granularity": result_v2.get("baseline_granularity", "daily"),
+        "baseline_strategy": result_v2.get("baseline_strategy", "xgb_recursive"),
+        "baseline_selector_reason": result_v2.get("baseline_selector_reason", ""),
+        "best_daily_strategy": result_v2.get("best_daily_strategy"),
+        "best_weekly_strategy": result_v2.get("best_weekly_strategy"),
         "ood_flags": result_v2.get("ood_flags", []),
         "warnings": conf.get("issues", []),
     }

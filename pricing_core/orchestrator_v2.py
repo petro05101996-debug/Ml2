@@ -11,11 +11,17 @@ from data_adapter import build_daily_panel_from_transactions
 from pricing_core.baseline_features import build_baseline_feature_matrix, derive_baseline_feature_spec
 from pricing_core.baseline_model import (
     build_baseline_oof_predictions,
+    build_weekday_profile,
+    build_weekly_baseline_oof_predictions,
+    disaggregate_weekly_to_daily,
+    forecast_weekly_baseline_by_strategy,
     forecast_baseline_by_strategy,
+    aggregate_daily_to_weekly,
     recursive_baseline_forecast,
     run_baseline_rolling_backtest,
-    select_best_baseline_strategy,
+    select_best_baseline_plan,
     train_baseline_model,
+    week_start,
 )
 from pricing_core.factor_features import build_factor_feature_matrix, build_factor_target, derive_factor_feature_spec
 from pricing_core.factor_model import compute_factor_contributions, run_factor_rolling_backtest, train_factor_model
@@ -107,12 +113,16 @@ def _build_pooled_factor_train(panel_train: pd.DataFrame, target_category: str, 
     sku_rank = sku_rank.sort_values(["price_unique", "n_rows", "non_na_share"], ascending=False)
 
     for sku in sku_rank["product_id"].astype(str).dropna().head(max_skus):
-        selected = select_best_baseline_strategy(scope_panel, target_category, sku)
-        sku_strategy = str(selected.get("best_strategy", "xgb_recursive"))
-        oof = build_baseline_oof_predictions(scope_panel, target_category, sku, strategy=sku_strategy)
+        selected = select_best_baseline_plan(scope_panel, target_category, sku)
+        sku_strategy = str(selected.get("selected_strategy", "xgb_recursive"))
+        sku_granularity = str(selected.get("granularity", "daily"))
+        sku_hist = scope_panel[scope_panel["product_id"].astype(str) == str(sku)].copy()
+        if sku_granularity == "weekly":
+            oof = build_weekly_baseline_oof_predictions(sku_hist, strategy=sku_strategy)
+        else:
+            oof = build_baseline_oof_predictions(scope_panel, target_category, sku, strategy=sku_strategy)
         if oof.empty:
             continue
-        sku_hist = scope_panel[scope_panel["product_id"].astype(str) == str(sku)].copy()
         merged = sku_hist.merge(oof[["date", "baseline_oof"]], on="date", how="left")
         if merged["baseline_oof"].notna().sum() < 10:
             continue
@@ -145,11 +155,12 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
     trained_baseline_bt = None
     trained_baseline_final = None
     best_baseline_strategy = "xgb_recursive"
-    baseline_strategy_selection = {
-        "best_strategy": "xgb_recursive",
-        "strategy_metrics": pd.DataFrame(),
-        "strategy_summary": pd.DataFrame(),
-    }
+    baseline_granularity = "daily"
+    baseline_selector_reason = "daily selected: tiny_mode fallback"
+    baseline_plan_selection = {"granularity": "daily", "selected_strategy": "median7"}
+    baseline_strategy_selection = {"best_strategy": "xgb_recursive", "strategy_metrics": pd.DataFrame(), "strategy_summary": pd.DataFrame()}
+    best_daily_strategy = "xgb_recursive"
+    best_weekly_strategy = "weekly_median4w"
 
     if tiny_mode:
         baseline_forecast = _tiny_baseline_fallback(target_history, future_dates)
@@ -157,28 +168,55 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         baseline_oof = target_train[["date", "sales"]].copy()
         baseline_oof["baseline_oof"] = np.nan
         best_baseline_strategy = "median7"
+        baseline_granularity = "daily"
+        baseline_selector_reason = "daily selected: tiny_mode fallback"
+        baseline_plan_selection = {
+            "granularity": "daily",
+            "daily_selection": baseline_strategy_selection,
+            "weekly_selection": {"strategy_metrics": pd.DataFrame(), "strategy_summary": pd.DataFrame(), "best_strategy": best_weekly_strategy},
+            "best_daily_strategy": best_baseline_strategy,
+            "best_weekly_strategy": best_weekly_strategy,
+            "selected_strategy": best_baseline_strategy,
+            "selector_reason": baseline_selector_reason,
+        }
         baseline_strategy_selection["best_strategy"] = best_baseline_strategy
     else:
-        baseline_strategy_selection = select_best_baseline_strategy(panel_train, target_category, target_sku)
-        best_baseline_strategy = str(baseline_strategy_selection.get("best_strategy", "xgb_recursive"))
+        baseline_plan_selection = select_best_baseline_plan(panel_train, target_category, target_sku)
+        baseline_granularity = str(baseline_plan_selection.get("granularity", "daily"))
+        best_baseline_strategy = str(baseline_plan_selection.get("selected_strategy", "xgb_recursive"))
+        baseline_selector_reason = str(baseline_plan_selection.get("selector_reason", "daily selected"))
+        baseline_strategy_selection = baseline_plan_selection.get("daily_selection", baseline_strategy_selection)
+        best_daily_strategy = str(baseline_plan_selection.get("best_daily_strategy", baseline_strategy_selection.get("best_strategy", "xgb_recursive")))
+        best_weekly_strategy = str(baseline_plan_selection.get("best_weekly_strategy", best_weekly_strategy))
 
         base_ctx = {
             c: (target_history[c].dropna().astype(str).iloc[-1] if c in ["product_id", "category", "region", "channel", "segment"] and c in target_history else "unknown")
             for c in baseline_feature_spec_full.get("baseline_context_features", [])
         }
-        if best_baseline_strategy == "xgb_recursive":
+        if baseline_granularity == "weekly":
+            trained_baseline_bt = None
+            trained_baseline_final = None
+            weekly_history = aggregate_daily_to_weekly(target_history)
+            weekday_profile = build_weekday_profile(target_history)
+            future_week_starts = pd.DataFrame({"week_start": sorted(week_start(future_dates["date"]).dropna().unique())})
+            weekly_forecast = forecast_weekly_baseline_by_strategy(best_baseline_strategy, weekly_history, future_week_starts)
+            baseline_forecast = disaggregate_weekly_to_daily(weekly_forecast, future_dates[["date"]], weekday_profile)
+            baseline_oof = build_weekly_baseline_oof_predictions(target_train, strategy=best_baseline_strategy)
+            baseline_rolling = baseline_plan_selection.get("weekly_selection", _build_empty_baseline_rolling())
+        elif best_baseline_strategy == "xgb_recursive":
             trained_baseline_bt = train_baseline_model(panel_train, baseline_feature_spec_train, small_mode=len(panel_train) < 200, training_profile="backtest")
             trained_baseline_final = train_baseline_model(panel_features_baseline, baseline_feature_spec_full, small_mode=len(panel_features_baseline) < 200, training_profile="final")
             baseline_forecast = recursive_baseline_forecast(trained_baseline_final, target_history, future_dates, base_ctx, baseline_feature_spec_full)
+            baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
+            baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
         else:
             trained_baseline_bt = None
             trained_baseline_final = None
             baseline_forecast = forecast_baseline_by_strategy(best_baseline_strategy, None, target_history, future_dates, base_ctx, baseline_feature_spec_full)
+            baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
+            baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
         baseline_forecast["baseline_lower"] = np.nan
         baseline_forecast["baseline_upper"] = np.nan
-
-        baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
-        baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, strategy=best_baseline_strategy)
 
     factor_train_target = target_train.merge(baseline_oof[["date", "baseline_oof"]], on="date", how="left")
     factor_feature_spec_target = derive_factor_feature_spec(factor_train_target)
@@ -246,7 +284,7 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         }
     )
 
-    use_baseline_override = tiny_mode or (best_baseline_strategy != "xgb_recursive")
+    use_baseline_override = tiny_mode or (baseline_granularity == "weekly") or (best_baseline_strategy != "xgb_recursive")
     scenario_result = run_scenario_forecast(
         trained_baseline=trained_baseline_final,
         trained_factor=trained_factor,
@@ -346,6 +384,11 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         factor_train_rows=int(len(factor_train)),
         baseline_strategy=best_baseline_strategy,
         baseline_strategy_selection=baseline_strategy_selection,
+        baseline_granularity=baseline_granularity,
+        baseline_plan_selection=baseline_plan_selection,
+        best_daily_strategy=best_daily_strategy,
+        best_weekly_strategy=best_weekly_strategy,
+        baseline_selector_reason=baseline_selector_reason,
         mode=mode,
         ood_flags=ood_flags,
         intervals_available=intervals_available,
@@ -375,6 +418,11 @@ def run_full_pricing_analysis_v2(normalized_txn: pd.DataFrame, target_category: 
         "factor_train_scope": factor_train_scope,
         "factor_train_rows": int(len(factor_train)),
         "baseline_strategy": best_baseline_strategy,
+        "baseline_granularity": baseline_granularity,
+        "baseline_plan_selection": baseline_plan_selection,
+        "best_daily_strategy": best_daily_strategy,
+        "best_weekly_strategy": best_weekly_strategy,
+        "baseline_selector_reason": baseline_selector_reason,
         "baseline_strategy_selection": baseline_strategy_selection,
         "mode": mode,
         "ood_flags": ood_flags,

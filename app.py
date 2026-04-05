@@ -60,6 +60,11 @@ def _format_report(r: Dict[str, Any], explanation: Dict[str, Any]) -> str:
             f"- Обоснование: {c.get('headline_reason', '—')}",
             f"- Режим: {c.get('mode', 'baseline_only')}",
             f"- Overall confidence: {c.get('overall_confidence', 'low')}",
+            f"- Baseline granularity: {c.get('baseline_granularity', 'daily')}",
+            f"- Baseline strategy: {c.get('baseline_strategy', '—')}",
+            f"- Baseline selector reason: {c.get('baseline_selector_reason', '—')}",
+            f"- Daily best strategy: {c.get('best_daily_strategy', '—')}",
+            f"- Weekly best strategy: {c.get('best_weekly_strategy', '—')}",
             f"- Baseline demand: {float(c.get('baseline_total_demand', 0.0)):,.2f}",
             f"- Scenario demand: {float(c.get('scenario_total_demand', 0.0)):,.2f}",
             f"- Demand delta: {float(c.get('demand_delta_pct', 0.0)):+.2%}",
@@ -206,6 +211,13 @@ def render_results_page(r: Dict[str, Any]) -> None:
         contract = r.get("v2_result_contract", {})
         st.markdown(f"### {contract.get('headline_action', 'Сценарный анализ v2')}")
         st.caption(contract.get("headline_reason", ""))
+        st.caption(
+            f"baseline={contract.get('baseline_granularity', 'daily')}/{contract.get('baseline_strategy', 'xgb_recursive')}; "
+            f"daily_best={contract.get('best_daily_strategy', '—')}; "
+            f"weekly_best={contract.get('best_weekly_strategy', '—')}"
+        )
+        if contract.get("baseline_selector_reason"):
+            st.caption(f"selector: {contract.get('baseline_selector_reason')}")
         k1, k2, k3 = st.columns(3)
         k1.metric("Спрос Δ", f"{float(contract.get('demand_delta_pct', 0.0)):+.2%}")
         k2.metric("Выручка Δ", f"{float(contract.get('revenue_delta_pct', 0.0)):+.2%}")

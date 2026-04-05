@@ -4,11 +4,17 @@ import pandas as pd
 from data_adapter import build_daily_panel_from_transactions
 from pricing_core.baseline_features import build_baseline_feature_matrix, derive_baseline_feature_spec
 from pricing_core.baseline_model import (
+    aggregate_daily_to_weekly,
     build_baseline_oof_predictions,
+    build_weekday_profile,
+    disaggregate_weekly_to_daily,
     recursive_baseline_forecast,
+    run_weekly_baseline_rolling_backtest,
+    select_best_baseline_plan,
     run_baseline_rolling_backtest,
     select_best_baseline_strategy,
     train_baseline_model,
+    week_start,
 )
 
 
@@ -77,3 +83,59 @@ def test_selected_baseline_is_not_worse_than_xgb():
     selected_wape = float(picked["median_wape"].iloc[0]) if len(picked) else np.inf
     xgb_wape = float(xgb["rolling_summary"]["median_wape"])
     assert selected_wape <= xgb_wape
+
+
+def test_weekly_disaggregation_preserves_totals():
+    future_dates = pd.DataFrame({"date": pd.date_range("2025-03-06", periods=10, freq="D")})
+    weekly_fc = pd.DataFrame(
+        {
+            "week_start": [pd.Timestamp("2025-03-03"), pd.Timestamp("2025-03-10")],
+            "baseline_pred_weekly": [70.0, 35.0],
+        }
+    )
+    profile = pd.Series([0.1, 0.2, 0.15, 0.1, 0.15, 0.2, 0.1], index=range(7))
+    daily_fc = disaggregate_weekly_to_daily(weekly_fc, future_dates, profile)
+    daily_fc["week_start"] = week_start(daily_fc["date"])
+    by_week = daily_fc.groupby("week_start", as_index=False)["baseline_pred"].sum()
+    expected = pd.DataFrame(
+        {
+            "week_start": [pd.Timestamp("2025-03-03"), pd.Timestamp("2025-03-10")],
+            "expected_total": [70.0, 35.0],
+        }
+    )
+    merged = by_week.merge(expected, on="week_start", how="inner")
+    assert np.allclose(merged["baseline_pred"].values, merged["expected_total"].values)
+
+
+def test_weekly_plan_selected_only_when_margin_beats_daily():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(260)))
+    plan = select_best_baseline_plan(fm, "cat", "sku-1")
+    daily = plan["daily_selection"]["strategy_summary"]
+    weekly = plan["weekly_selection"]["strategy_summary"]
+    daily_wape = float(daily[daily["strategy"] == plan["best_daily_strategy"]]["median_wape"].iloc[0])
+    weekly_wape = float(weekly[weekly["strategy"] == plan["best_weekly_strategy"]]["median_wape"].iloc[0])
+    if weekly_wape + 2.0 < daily_wape:
+        assert plan["granularity"] == "weekly"
+    else:
+        assert plan["granularity"] == "daily"
+
+
+def test_weekly_backtest_returns_daily_oof_non_empty():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(260)))
+    target = fm[(fm["category"] == "cat") & (fm["product_id"] == "sku-1")].copy()
+    weekly = run_weekly_baseline_rolling_backtest(target)
+    oof = weekly["oof_daily"]
+    assert not oof.empty
+    assert {"date", "sales", "baseline_oof"}.issubset(oof.columns)
+    assert oof["date"].nunique() > 0
+    assert oof["baseline_oof"].notna().sum() > 0
+
+
+def test_weekly_aggregation_and_profile_contract():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(90)))
+    target = fm[(fm["category"] == "cat") & (fm["product_id"] == "sku-1")].copy()
+    weekly = aggregate_daily_to_weekly(target)
+    profile = build_weekday_profile(target)
+    assert {"week_start", "sales"}.issubset(weekly.columns)
+    assert len(profile) == 7
+    assert abs(float(profile.sum()) - 1.0) < 1e-9
