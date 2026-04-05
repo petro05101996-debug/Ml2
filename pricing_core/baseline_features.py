@@ -24,7 +24,7 @@ DEFAULT_BASELINE_NUMERIC = [
     "month_sin",
     "month_cos",
 ]
-DEFAULT_BASELINE_CATEGORICAL = ["product_id", "category", "region", "channel", "segment"]
+DEFAULT_BASELINE_CATEGORICAL = ["product_id", "category"]
 
 
 def _usable_categorical(df: pd.DataFrame, col: str) -> bool:
@@ -53,8 +53,7 @@ def build_baseline_feature_matrix(panel_daily: pd.DataFrame) -> pd.DataFrame:
     for lag in (1, 7, 14, 28):
         col = f"sales_lag{lag}"
         lagged = grp["sales"].shift(lag)
-        first = grp["sales"].transform("first").fillna(0.0)
-        out[col] = pd.to_numeric(lagged, errors="coerce").fillna(first).fillna(0.0)
+        out[col] = pd.to_numeric(lagged, errors="coerce").fillna(0.0)
 
     shifted = grp["sales"].shift(1)
     out["sales_ma7"] = shifted.groupby(out["product_id"]).rolling(7, min_periods=1).mean().reset_index(level=0, drop=True)
@@ -101,8 +100,7 @@ def build_baseline_one_step_features(
         row[c] = base_ctx.get(c, "unknown")
 
     for lag in (1, 7, 14, 28):
-        vals = sales.iloc[:- (lag - 1) if lag > 1 else None]
-        row[f"sales_lag{lag}"] = float(sales.iloc[-lag]) if len(sales) >= lag else float(sales.iloc[0] if len(sales) else 0.0)
+        row[f"sales_lag{lag}"] = float(sales.iloc[-lag]) if len(sales) >= lag else 0.0
 
     shifted = sales
     row["sales_ma7"] = float(shifted.tail(7).mean()) if len(shifted) else 0.0

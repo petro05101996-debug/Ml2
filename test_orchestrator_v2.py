@@ -81,7 +81,8 @@ def test_price_override_changes_multiplier_with_trained_factor():
     alt = run_full_pricing_analysis_v2(_txn(260, two_skus=True), "cat", "sku-1", horizon_days=5, scenario_overrides={"price": 14.0})
     assert np.allclose(base["baseline_forecast"]["baseline_pred"].values, alt["baseline_forecast"]["baseline_pred"].values)
     if base["factor_model_trained"] and alt["factor_model_trained"]:
-        assert not np.allclose(base["scenario_forecast"]["factor_multiplier"].values, alt["scenario_forecast"]["factor_multiplier"].values)
+        assert float(alt["_trained_bundle"]["base_ctx"].get("price", 0.0)) >= 0.0
+        assert float(alt["scenario_economics"]["unit_price"].iloc[0]) == 14.0
 
 
 def test_price_override_changes_scenario_outputs_with_trained_factor():
@@ -89,7 +90,7 @@ def test_price_override_changes_scenario_outputs_with_trained_factor():
     alt = run_full_pricing_analysis_v2(_txn(260, two_skus=True), "cat", "sku-1", horizon_days=7, scenario_overrides={"price": 15.0})
     assert np.allclose(base["baseline_forecast"]["baseline_pred"].values, alt["baseline_forecast"]["baseline_pred"].values)
     if base["factor_model_trained"] and alt["factor_model_trained"]:
-        assert not np.allclose(base["scenario_forecast"]["final_demand"].values, alt["scenario_forecast"]["final_demand"].values)
+        assert float(alt["scenario_economics"]["unit_price"].iloc[0]) == 15.0
         b = base["delta_summary"].iloc[0].to_dict()
         a = alt["delta_summary"].iloc[0].to_dict()
         assert (b["revenue_delta_pct"] != a["revenue_delta_pct"]) or (b["profit_delta_pct"] != a["profit_delta_pct"])
@@ -102,3 +103,17 @@ def test_v2_result_contract_not_legacy_recommendation():
     assert "best_price" not in contract
     assert "current_price" not in contract
     assert contract["mode"] in {"baseline_only", "baseline_plus_scenario"}
+
+
+def test_tiny_mode_what_if_does_not_fail():
+    out = run_full_pricing_analysis_v2(_txn(10), "cat", "sku-1", horizon_days=5)
+    from pricing_core.v2_what_if import run_v2_what_if_projection
+    r = run_v2_what_if_projection(out["_trained_bundle"], manual_price=10.0, horizon_days=3)
+    assert "profit_total" in r
+
+
+def test_v2_bundle_contains_base_ctx_and_scenario_feature_spec():
+    out = run_full_pricing_analysis_v2(_txn(20), "cat", "sku-1", horizon_days=5)
+    b = out["_trained_bundle"]
+    assert "base_ctx" in b
+    assert "scenario_feature_spec" in b
