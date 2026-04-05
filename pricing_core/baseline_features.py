@@ -24,7 +24,7 @@ DEFAULT_BASELINE_NUMERIC = [
     "month_sin",
     "month_cos",
 ]
-DEFAULT_BASELINE_CATEGORICAL = ["product_id", "category"]
+DEFAULT_BASELINE_CATEGORICAL = ["series_id", "product_id", "category", "region", "channel", "segment"]
 
 
 def _usable_categorical(df: pd.DataFrame, col: str) -> bool:
@@ -44,9 +44,11 @@ def _usable_categorical(df: pd.DataFrame, col: str) -> bool:
 def build_baseline_feature_matrix(panel_daily: pd.DataFrame) -> pd.DataFrame:
     out = panel_daily.copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    out = out.sort_values(["product_id", "date"]).reset_index(drop=True)
+    if "series_id" not in out.columns:
+        out["series_id"] = out.get("product_id", "unknown").astype(str)
+    out = out.sort_values(["series_id", "date"]).reset_index(drop=True)
 
-    grp = out.groupby("product_id", dropna=False, group_keys=False)
+    grp = out.groupby("series_id", dropna=False, group_keys=False)
     sales = pd.to_numeric(out.get("sales", 0.0), errors="coerce").fillna(0.0)
     out["sales"] = sales
 
@@ -56,10 +58,10 @@ def build_baseline_feature_matrix(panel_daily: pd.DataFrame) -> pd.DataFrame:
         out[col] = pd.to_numeric(lagged, errors="coerce").fillna(0.0)
 
     shifted = grp["sales"].shift(1)
-    out["sales_ma7"] = shifted.groupby(out["product_id"]).rolling(7, min_periods=1).mean().reset_index(level=0, drop=True)
-    out["sales_ma14"] = shifted.groupby(out["product_id"]).rolling(14, min_periods=1).mean().reset_index(level=0, drop=True)
-    out["sales_ma28"] = shifted.groupby(out["product_id"]).rolling(28, min_periods=1).mean().reset_index(level=0, drop=True)
-    out["sales_std28"] = shifted.groupby(out["product_id"]).rolling(28, min_periods=1).std().reset_index(level=0, drop=True).fillna(0.0)
+    out["sales_ma7"] = shifted.groupby(out["series_id"]).rolling(7, min_periods=1).mean().reset_index(level=0, drop=True)
+    out["sales_ma14"] = shifted.groupby(out["series_id"]).rolling(14, min_periods=1).mean().reset_index(level=0, drop=True)
+    out["sales_ma28"] = shifted.groupby(out["series_id"]).rolling(28, min_periods=1).mean().reset_index(level=0, drop=True)
+    out["sales_std28"] = shifted.groupby(out["series_id"]).rolling(28, min_periods=1).std().reset_index(level=0, drop=True).fillna(0.0)
 
     d = out["date"].dt
     out["dow"] = d.dayofweek.fillna(0).astype(int)

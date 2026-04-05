@@ -64,7 +64,12 @@ def run_v2_what_if_projection(
     sf["discount"] = float(overrides.get("discount", 0.0))
     sf["cost"] = float(overrides.get("cost", 0.0))
     sf["freight_value"] = float(overrides.get("freight_value", 0.0))
-    eco, _ = compute_daily_unit_economics(sf, quantity_col="actual_sales")
+    eco, _ = compute_daily_unit_economics(
+        sf,
+        quantity_col="actual_sales",
+        unit_price_input_type=str(trained_bundle.get("unit_price_input_type", "net")),
+        economics_mode=str(trained_bundle.get("economics_mode", "net_price")),
+    )
 
     conf_state = trained_bundle.get("confidence", {}) or {}
     conf_label = str(conf_state.get("overall_confidence", "low"))
@@ -80,4 +85,8 @@ def run_v2_what_if_projection(
         "confidence_score": conf_score,
         "uncertainty_score": float(max(0.0, 1.0 - conf_score)),
         "ood_flags": scenario_result.get("ood_flags", []),
+        "scenario_mode": scenario_result.get("scenario_mode", scenario_result.get("mode", "fallback_elasticity")),
+        "scenario_effect_source": scenario_result.get("scenario_effect_source", "fallback_elasticity"),
+        "economics_mode": str(trained_bundle.get("economics_mode", "net_price")),
+        "unit_price_input_type": str(trained_bundle.get("unit_price_input_type", "net")),
     }

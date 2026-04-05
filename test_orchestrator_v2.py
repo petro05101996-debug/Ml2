@@ -109,7 +109,7 @@ def test_v2_result_contract_not_legacy_recommendation():
     assert "headline_action" in contract
     assert "best_price" not in contract
     assert "current_price" not in contract
-    assert contract["mode"] in {"baseline_only", "baseline_plus_scenario"}
+    assert contract["mode"] in {"baseline_only", "baseline_plus_scenario", "fallback_elasticity"}
 
 
 def test_tiny_mode_what_if_does_not_fail():
@@ -117,6 +117,27 @@ def test_tiny_mode_what_if_does_not_fail():
     from pricing_core.v2_what_if import run_v2_what_if_projection
     r = run_v2_what_if_projection(out["_trained_bundle"], manual_price=10.0, horizon_days=3)
     assert "profit_total" in r
+
+
+def test_orchestrator_targets_single_series_id():
+    tx = _txn(180)
+    tx2 = tx.copy()
+    tx2["region"] = "EU"
+    tx2["quantity"] = tx2["quantity"] + 7
+    tx2["revenue"] = tx2["quantity"] * tx2["price"]
+    all_tx = pd.concat([tx, tx2], ignore_index=True)
+    target_series_id = "sku-1|EU|online|retail"
+    out = run_full_pricing_analysis_v2(all_tx, "cat", "sku-1", target_series_id=target_series_id, horizon_days=7)
+    assert out["target_series_id"] == target_series_id
+    assert out["_trained_bundle"]["target_history"]["series_id"].astype(str).nunique() == 1
+    assert out["_trained_bundle"]["target_history"]["series_id"].astype(str).iloc[0] == target_series_id
+
+
+def test_economics_mode_propagates_end_to_end():
+    out = run_full_pricing_analysis_v2(_txn(180), "cat", "sku-1", horizon_days=5, unit_price_input_type="list", economics_mode="list_less_discount")
+    assert out["economics_mode"] == "list_less_discount"
+    assert out["unit_price_input_type"] == "list"
+    assert out["_trained_bundle"]["economics_mode"] == "list_less_discount"
 
 
 def test_v2_bundle_contains_base_ctx_and_scenario_feature_spec():

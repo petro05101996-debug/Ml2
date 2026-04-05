@@ -116,7 +116,7 @@ def build_factor_ood_flags(target_history: pd.DataFrame, factor_future_df: pd.Da
         if ((s < lo) | (s > hi)).any():
             flags.append(f"ood_numeric:{c}")
 
-    default_cats = ["product_id", "category"]
+    default_cats = ["series_id", "product_id", "category", "region", "channel", "segment"]
     user_cats = [c for c in feature_spec.get("factor_categorical_features", []) if str(c).startswith("user_factor_cat__")]
     for c in default_cats + user_cats:
         if c not in hist.columns or c not in factor_future_df.columns:
@@ -147,7 +147,7 @@ def _estimate_window_ood_share(train_df: pd.DataFrame, test_df: pd.DataFrame) ->
             continue
         flags = flags | ((s < lo) | (s > hi)).fillna(False)
 
-    for col in ["product_id", "category"] + [c for c in test_df.columns if str(c).startswith("user_factor_cat__")]:
+    for col in ["series_id", "product_id", "category", "region", "channel", "segment"] + [c for c in test_df.columns if str(c).startswith("user_factor_cat__")]:
         if col not in train_df.columns or col not in test_df.columns:
             continue
         known = set(train_df[col].dropna().astype(str).unique())

@@ -139,3 +139,29 @@ def test_weekly_aggregation_and_profile_contract():
     assert {"week_start", "sales"}.issubset(weekly.columns)
     assert len(profile) == 7
     assert abs(float(profile.sum()) - 1.0) < 1e-9
+
+
+def test_baseline_lags_are_isolated_by_series_id():
+    d = pd.date_range("2025-01-01", periods=5, freq="D")
+    tx = pd.DataFrame(
+        {
+            "date": list(d) + list(d),
+            "product_id": ["sku-1"] * 10,
+            "category": ["cat"] * 10,
+            "region": ["US"] * 5 + ["EU"] * 5,
+            "channel": ["online"] * 10,
+            "segment": ["retail"] * 10,
+            "quantity": [10, 20, 30, 40, 50, 1, 1, 1, 1, 1],
+            "price": [10] * 10,
+            "cost": [6] * 10,
+            "revenue": [100, 200, 300, 400, 500, 10, 10, 10, 10, 10],
+            "discount_rate": [0.0] * 10,
+            "promotion": [0.0] * 10,
+            "stock": [100.0] * 10,
+        }
+    )
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(tx))
+    us = fm[(fm["region"] == "US")].sort_values("date").reset_index(drop=True)
+    eu = fm[(fm["region"] == "EU")].sort_values("date").reset_index(drop=True)
+    assert float(us.loc[1, "sales_lag1"]) == 10.0
+    assert float(eu.loc[1, "sales_lag1"]) == 1.0

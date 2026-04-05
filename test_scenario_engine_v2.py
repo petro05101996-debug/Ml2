@@ -84,7 +84,8 @@ def test_scenario_mode_is_exposed():
     tr, spec, fm = _trained_baseline()
     fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
     out = run_scenario_forecast(tr, None, fm, fut, spec, None)
-    assert out["mode"] == "baseline_only"
+    assert out["mode"] == "fallback_elasticity"
+    assert out["scenario_effect_source"] == "fallback_elasticity"
 
 
 def test_baseline_override_is_used_for_scenario_path():
@@ -120,3 +121,13 @@ def test_stock_cap_zero_is_binding_when_explicitly_set():
     sf = out["scenario_forecast"]
     assert float(sf["actual_sales"].sum()) == 0.0
     assert float(sf["lost_sales"].sum()) == float(sf["scenario_demand_raw"].sum())
+
+
+def test_fallback_elasticity_responds_to_price_change():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=5, freq="D")})
+    low = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"price": 8.0})
+    high = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"price": 20.0})
+    assert low["scenario_effect_source"] == "fallback_elasticity"
+    assert high["scenario_effect_source"] == "fallback_elasticity"
+    assert float(low["scenario_forecast"]["actual_sales"].sum()) != float(high["scenario_forecast"]["actual_sales"].sum())

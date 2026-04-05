@@ -28,13 +28,13 @@ from ui_overview import render_overview
 from ui_shell import apply_enterprise_styles, render_navigation
 from what_if import build_sensitivity_grid, run_scenario_set
 
-st.set_page_config(page_title="Студия ценовой аналитики", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Demand What-If Studio", layout="wide", page_icon="📊")
 for key, default in {"results": None, "what_if_result": None, "scenario_table": None, "sensitivity_df": None, "active_page": "Обзор"}.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
 HORIZON_OPTIONS = [7, 14, 30, 60, 90, 180, 360]
-LOAD_MODE_UNIVERSAL = "Универсальный CSV"
+LOAD_MODE_UNIVERSAL = "Универсальный файл транзакций"
 
 
 def resolve_objective_weights(mode: str):
@@ -112,7 +112,7 @@ def _format_report(r: Dict[str, Any], explanation: Dict[str, Any]) -> str:
 
 def _build_target_selection(universal_txn: Optional[pd.DataFrame]) -> Dict[str, Optional[str]]:
     if universal_txn is None or universal_txn.empty:
-        return {"target_category": None, "target_sku": None, "category_options": [], "sku_options": []}
+        return {"target_category": None, "target_sku": None, "target_series_id": None, "category_options": [], "sku_options": [], "series_options": []}
 
     category_series = universal_txn.get("category", pd.Series(dtype=str)).dropna().astype(str).str.strip()
     category_options = sorted([c for c in category_series.unique().tolist() if c])
@@ -126,15 +126,27 @@ def _build_target_selection(universal_txn: Optional[pd.DataFrame]) -> Dict[str, 
     if not sku_options:
         sku_options = sorted([sku for sku in universal_txn.get("product_id", pd.Series(dtype=str)).dropna().astype(str).str.strip().unique().tolist() if sku])
     target_sku = st.selectbox("SKU *", sku_options) if sku_options else None
-    return {"target_category": target_category or None, "target_sku": target_sku or None, "category_options": category_options, "sku_options": sku_options}
+    scoped_series = scoped[scoped["product_id"].astype(str) == str(target_sku)].copy() if target_sku is not None and "product_id" in scoped.columns else scoped.copy()
+    if "series_id" not in scoped_series.columns:
+        rid = scoped_series["region"].astype(str) if "region" in scoped_series.columns else pd.Series(["unknown"] * len(scoped_series), index=scoped_series.index)
+        ch = scoped_series["channel"].astype(str) if "channel" in scoped_series.columns else pd.Series(["unknown"] * len(scoped_series), index=scoped_series.index)
+        seg = scoped_series["segment"].astype(str) if "segment" in scoped_series.columns else pd.Series(["unknown"] * len(scoped_series), index=scoped_series.index)
+        pid = scoped_series["product_id"].astype(str) if "product_id" in scoped_series.columns else pd.Series(["unknown"] * len(scoped_series), index=scoped_series.index)
+        scoped_series["series_id"] = pid + "|" + rid + "|" + ch + "|" + seg
+    series_options = sorted(scoped_series["series_id"].astype(str).dropna().unique().tolist())
+    target_series_id = st.selectbox("Series scope *", series_options) if series_options else None
+    return {"target_category": target_category or None, "target_sku": target_sku or None, "target_series_id": target_series_id or None, "category_options": category_options, "sku_options": sku_options, "series_options": series_options}
 
 
 def render_setup_page() -> Dict[str, Any]:
     st.markdown("### Настройка")
-    universal_file = st.file_uploader("Файл транзакций (универсальный CSV) *", type=["csv"], key="universal_file")
+    universal_file = st.file_uploader("Файл транзакций (.csv/.xlsx) *", type=["csv", "xlsx"], key="universal_file")
     universal_txn = None
     if universal_file is not None:
-        preview = pd.read_csv(universal_file)
+        if str(universal_file.name).lower().endswith(".xlsx"):
+            preview = pd.read_excel(universal_file)
+        else:
+            preview = pd.read_csv(universal_file)
         auto_map = build_auto_mapping(list(preview.columns))
         mapping: Dict[str, Optional[str]] = {}
         for f in CANONICAL_FIELDS:
@@ -146,22 +158,30 @@ def render_setup_page() -> Dict[str, Any]:
         universal_txn, quality = normalize_transactions(preview, mapping)
         for w in quality.get("warnings", []):
             st.warning(w)
+    st.file_uploader(
+        "Upload document events (pdf/docx) — beta placeholder",
+        type=["pdf", "docx"],
+        key="document_events_file",
+        help="Документы пока не влияют на прогноз. В этой версии они только загружаются.",
+    )
 
     target_selection = _build_target_selection(universal_txn)
     if target_selection["target_category"] is None and target_selection["target_sku"] is None:
         target_category = st.text_input("Категория *", value="")
         target_sku = st.text_input("SKU *", value="")
+        target_series_id = st.text_input("Series scope *", value="")
     else:
         target_category = target_selection["target_category"]
         target_sku = target_selection["target_sku"]
+        target_series_id = target_selection.get("target_series_id")
     selected_objective_label = st.selectbox("Цель оптимизации", list(OBJECTIVE_LABEL_TO_MODE.keys()))
     st.caption(OBJECTIVE_HINTS[selected_objective_label])
     st.caption("Цель влияет на ранжирование и выбор рекомендуемого сценария, а не на сам механизм прогноза спроса.")
     objective_mode = OBJECTIVE_LABEL_TO_MODE[selected_objective_label]
     forecast_horizon_days = st.select_slider("Горизонт, дней", options=HORIZON_OPTIONS, value=30)
-    run_requested = st.button("Запустить ценовой анализ", type="primary", use_container_width=True)
+    run_requested = st.button("Запустить Demand What-If анализ", type="primary", use_container_width=True)
     _, objective_mode, objective_warning = resolve_objective_weights(objective_mode)
-    return {"load_mode": LOAD_MODE_UNIVERSAL, "universal_txn": universal_txn, "target_category": target_category or None, "target_sku": target_sku or None, "objective_mode": objective_mode, "objective_warning": objective_warning, "forecast_horizon_days": int(forecast_horizon_days), "show_risk": True, "run_requested": run_requested}
+    return {"load_mode": LOAD_MODE_UNIVERSAL, "universal_txn": universal_txn, "target_category": target_category or None, "target_sku": target_sku or None, "target_series_id": target_series_id or None, "objective_mode": objective_mode, "objective_warning": objective_warning, "forecast_horizon_days": int(forecast_horizon_days), "show_risk": True, "run_requested": run_requested, "unit_price_input_type": "net", "economics_mode": "net_price"}
 
 
 def render_scenario_lab(r: Dict[str, Any]) -> None:
