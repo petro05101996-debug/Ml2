@@ -181,6 +181,7 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
 
     numeric_covariates = ["price", "cost", "discount_rate", "freight_value", "stock", "promotion", "review_score", "reviews_count"] + [c for c in df.columns if c.startswith(USER_FACTOR_NUM_PREFIX)]
     cat_mode_cols = ["region", "channel", "segment"] + [c for c in df.columns if c.startswith(USER_FACTOR_CAT_PREFIX)]
+    series_keys = ["product_id", "category", "region", "channel", "segment"]
 
     for c in ["product_id", "category"] + cat_mode_cols:
         df[c] = get_text_series(df, c, "unknown")
@@ -188,11 +189,15 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
         df[c] = get_numeric_series(df, c, np.nan)
 
     grouped = []
-    for (dt, pid, cat), g in df.groupby([pd.Grouper(key="date", freq="D"), "product_id", "category"], dropna=False):
+    for keys, g in df.groupby([pd.Grouper(key="date", freq="D")] + series_keys, dropna=False):
+        dt, pid, cat, region, channel, segment = keys
         row: Dict[str, Any] = {
             "date": pd.Timestamp(dt),
             "product_id": str(pid),
             "category": str(cat),
+            "region": str(region),
+            "channel": str(channel),
+            "segment": str(segment),
             "sales": float(pd.to_numeric(g["quantity"], errors="coerce").fillna(0.0).sum()),
             "revenue": float(pd.to_numeric(g["revenue"], errors="coerce").fillna(0.0).sum()),
             "price": _weighted_mean_by_quantity(g["price"], g["quantity"]),
@@ -216,24 +221,43 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
 
     pieces = []
     num_fill_cols = ["price", "cost", "discount_rate", "freight_value", "stock", "promotion", "review_score", "reviews_count"] + [c for c in panel.columns if c.startswith(USER_FACTOR_NUM_PREFIX)]
-    for _, g in panel.groupby("product_id", dropna=False):
+    for _, g in panel.groupby(series_keys, dropna=False):
         g = g.sort_values("date").reset_index(drop=True)
         full = pd.DataFrame({"date": pd.date_range(g["date"].min(), g["date"].max(), freq="D")})
-        full["product_id"] = g["product_id"].iloc[0]
-        full["category"] = g["category"].mode().iloc[0] if not g["category"].mode().empty else "unknown"
-        m = full.merge(g, on=["date", "product_id", "category"], how="left")
+        for key in series_keys:
+            full[key] = g[key].iloc[0] if key in g.columns else "unknown"
+        m = full.merge(g, on=["date"] + series_keys, how="left")
+        m["has_observation_flag"] = get_numeric_series(m, "sales", np.nan).notna().astype(int)
 
         for c in ["sales", "revenue"]:
             m[c] = get_numeric_series(m, c, 0.0).fillna(0.0)
-        for c in num_fill_cols:
-            m[c] = get_numeric_series(m, c, np.nan).ffill()
+        for c in ["price", "cost", "freight_value"]:
+            if c in m.columns:
+                m[c] = get_numeric_series(m, c, np.nan).ffill(limit=7)
+        for c in ["discount_rate", "promotion"]:
+            if c in m.columns:
+                m[c] = get_numeric_series(m, c, 0.0).fillna(0.0).clip(lower=0.0)
+        if "stock" in m.columns:
+            m["stock"] = get_numeric_series(m, "stock", 0.0).fillna(0.0).clip(lower=0.0)
+        for c in [c for c in num_fill_cols if c.startswith(USER_FACTOR_NUM_PREFIX)]:
+            m[c] = get_numeric_series(m, c, np.nan)
         for c in cat_mode_cols:
             m[c] = get_text_series(m, c, "unknown").ffill().fillna("unknown")
+        m["stockout_flag"] = (get_numeric_series(m, "stock", 0.0).fillna(0.0) <= 0.0).astype(int)
         pieces.append(m)
 
     out = pd.concat(pieces, ignore_index=True)
     out["discount"] = get_numeric_series(out, "discount_rate", 0.0).fillna(0.0)
-    return out.sort_values(["product_id", "date"]).reset_index(drop=True)
+    out["series_id"] = (
+        out["product_id"].astype(str)
+        + "|"
+        + out["region"].astype(str)
+        + "|"
+        + out["channel"].astype(str)
+        + "|"
+        + out["segment"].astype(str)
+    )
+    return out.sort_values(["series_id", "date"]).reset_index(drop=True)
 
 
 def build_daily_from_transactions(txn: pd.DataFrame, sku_id: str) -> pd.DataFrame:

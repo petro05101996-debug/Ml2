@@ -28,6 +28,8 @@ def compute_daily_unit_economics(
     discount_col: str = "discount",
     freight_col: str = "freight_value",
     stock_cap: float = 0.0,
+    unit_price_input_type: str = "net",
+    economics_mode: str = "net_price",
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = daily.copy()
     out["unit_price"] = get_numeric_series(out, unit_price_col, 0.0).fillna(0.0).clip(lower=0.0)
@@ -38,7 +40,16 @@ def compute_daily_unit_economics(
     out["discount_rate"] = out["raw_discount_rate"].clip(lower=0.0, upper=0.95)
     out["freight_value"] = get_numeric_series(out, freight_col, 0.0).fillna(0.0).clip(lower=0.0)
 
-    out["effective_unit_price"] = out["unit_price"]
+    normalized_price_type = str(unit_price_input_type).strip().lower()
+    normalized_mode = str(economics_mode).strip().lower()
+    out["unit_price_input_type"] = normalized_price_type if normalized_price_type in {"net", "list"} else "net"
+    out["economics_mode"] = normalized_mode if normalized_mode in {"net_price", "list_less_discount"} else "net_price"
+    use_list_less_discount = (out["economics_mode"] == "list_less_discount") | (out["unit_price_input_type"] == "list")
+    out["effective_unit_price"] = np.where(
+        use_list_less_discount,
+        out["unit_price"] * (1.0 - out["discount_rate"].clip(lower=0.0, upper=0.95)),
+        out["unit_price"],
+    )
     out["total_revenue"] = out["effective_unit_price"] * out["actual_quantity"]
     out["unit_variable_cost"] = out["unit_cost"] + out["freight_value"]
     out["total_cost"] = out["unit_variable_cost"] * out["actual_quantity"]

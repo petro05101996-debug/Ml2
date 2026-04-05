@@ -84,7 +84,8 @@ def test_scenario_mode_is_exposed():
     tr, spec, fm = _trained_baseline()
     fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
     out = run_scenario_forecast(tr, None, fm, fut, spec, None)
-    assert out["mode"] == "baseline_only"
+    assert out["mode"] == "fallback_elasticity"
+    assert out["scenario_effect_source"] == "fallback_elasticity"
 
 
 def test_baseline_override_is_used_for_scenario_path():

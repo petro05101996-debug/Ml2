@@ -28,13 +28,13 @@ from ui_overview import render_overview
 from ui_shell import apply_enterprise_styles, render_navigation
 from what_if import build_sensitivity_grid, run_scenario_set
 
-st.set_page_config(page_title="Студия ценовой аналитики", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Demand What-If Studio", layout="wide", page_icon="📊")
 for key, default in {"results": None, "what_if_result": None, "scenario_table": None, "sensitivity_df": None, "active_page": "Обзор"}.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
 HORIZON_OPTIONS = [7, 14, 30, 60, 90, 180, 360]
-LOAD_MODE_UNIVERSAL = "Универсальный CSV"
+LOAD_MODE_UNIVERSAL = "Универсальный файл транзакций"
 
 
 def resolve_objective_weights(mode: str):
@@ -131,10 +131,13 @@ def _build_target_selection(universal_txn: Optional[pd.DataFrame]) -> Dict[str, 
 
 def render_setup_page() -> Dict[str, Any]:
     st.markdown("### Настройка")
-    universal_file = st.file_uploader("Файл транзакций (универсальный CSV) *", type=["csv"], key="universal_file")
+    universal_file = st.file_uploader("Файл транзакций (.csv/.xlsx) *", type=["csv", "xlsx"], key="universal_file")
     universal_txn = None
     if universal_file is not None:
-        preview = pd.read_csv(universal_file)
+        if str(universal_file.name).lower().endswith(".xlsx"):
+            preview = pd.read_excel(universal_file)
+        else:
+            preview = pd.read_csv(universal_file)
         auto_map = build_auto_mapping(list(preview.columns))
         mapping: Dict[str, Optional[str]] = {}
         for f in CANONICAL_FIELDS:
@@ -146,6 +149,12 @@ def render_setup_page() -> Dict[str, Any]:
         universal_txn, quality = normalize_transactions(preview, mapping)
         for w in quality.get("warnings", []):
             st.warning(w)
+    st.file_uploader(
+        "Upload document events (pdf/docx) — beta placeholder",
+        type=["pdf", "docx"],
+        key="document_events_file",
+        help="Документы пока не влияют напрямую на модель. Следующий шаг — извлечение фактов в таблицу событий.",
+    )
 
     target_selection = _build_target_selection(universal_txn)
     if target_selection["target_category"] is None and target_selection["target_sku"] is None:
@@ -159,7 +168,7 @@ def render_setup_page() -> Dict[str, Any]:
     st.caption("Цель влияет на ранжирование и выбор рекомендуемого сценария, а не на сам механизм прогноза спроса.")
     objective_mode = OBJECTIVE_LABEL_TO_MODE[selected_objective_label]
     forecast_horizon_days = st.select_slider("Горизонт, дней", options=HORIZON_OPTIONS, value=30)
-    run_requested = st.button("Запустить ценовой анализ", type="primary", use_container_width=True)
+    run_requested = st.button("Запустить Demand What-If анализ", type="primary", use_container_width=True)
     _, objective_mode, objective_warning = resolve_objective_weights(objective_mode)
     return {"load_mode": LOAD_MODE_UNIVERSAL, "universal_txn": universal_txn, "target_category": target_category or None, "target_sku": target_sku or None, "objective_mode": objective_mode, "objective_warning": objective_warning, "forecast_horizon_days": int(forecast_horizon_days), "show_risk": True, "run_requested": run_requested}
 

@@ -109,7 +109,7 @@ def test_v2_result_contract_not_legacy_recommendation():
     assert "headline_action" in contract
     assert "best_price" not in contract
     assert "current_price" not in contract
-    assert contract["mode"] in {"baseline_only", "baseline_plus_scenario"}
+    assert contract["mode"] in {"baseline_only", "baseline_plus_scenario", "fallback_elasticity"}
 
 
 def test_tiny_mode_what_if_does_not_fail():

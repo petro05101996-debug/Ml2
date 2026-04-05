@@ -24,7 +24,7 @@ DEFAULT_BASELINE_NUMERIC = [
     "month_sin",
     "month_cos",
 ]
-DEFAULT_BASELINE_CATEGORICAL = ["product_id", "category"]
+DEFAULT_BASELINE_CATEGORICAL = ["product_id", "category", "region", "channel", "segment"]
 
 
 def _usable_categorical(df: pd.DataFrame, col: str) -> bool:
