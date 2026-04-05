@@ -124,6 +124,129 @@ def recursive_baseline_forecast_dow_median8w(base_history: pd.DataFrame, future_
     return pd.DataFrame(rows)
 
 
+def week_start(series: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(series, errors="coerce")
+    return dt - pd.to_timedelta(dt.dt.dayofweek.fillna(0).astype(int), unit="D")
+
+
+def aggregate_daily_to_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["week_start", "sales"])
+    x = df.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x["sales"] = pd.to_numeric(x.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    x = x.dropna(subset=["date"])
+    if x.empty:
+        return pd.DataFrame(columns=["week_start", "sales"])
+    x["week_start"] = week_start(x["date"])
+    out = x.groupby("week_start", as_index=False)["sales"].sum().sort_values("week_start").reset_index(drop=True)
+    return out
+
+
+def build_weekday_profile(base_history: pd.DataFrame, lookback_weeks: int = 8, smoothing: float = 0.5) -> pd.Series:
+    if base_history.empty:
+        return pd.Series([1.0 / 7.0] * 7, index=range(7), dtype=float)
+    x = base_history.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x["sales"] = pd.to_numeric(x.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    x = x.dropna(subset=["date"]).sort_values("date")
+    if x.empty:
+        return pd.Series([1.0 / 7.0] * 7, index=range(7), dtype=float)
+    cutoff = pd.Timestamp(x["date"].max()) - pd.Timedelta(weeks=max(int(lookback_weeks), 1))
+    recent = x[x["date"] > cutoff].copy()
+    if recent.empty:
+        recent = x.copy()
+    by_dow = recent.groupby(recent["date"].dt.dayofweek)["sales"].sum().reindex(range(7), fill_value=0.0).astype(float)
+    prof = by_dow + float(smoothing)
+    denom = float(prof.sum())
+    if denom <= 1e-12:
+        return pd.Series([1.0 / 7.0] * 7, index=range(7), dtype=float)
+    return (prof / denom).astype(float)
+
+
+def disaggregate_weekly_to_daily(
+    weekly_forecast: pd.DataFrame,
+    future_dates_df: pd.DataFrame,
+    weekday_profile: pd.Series,
+) -> pd.DataFrame:
+    fut = future_dates_df.copy()
+    fut["date"] = pd.to_datetime(fut["date"], errors="coerce")
+    fut = fut.dropna(subset=["date"]).copy()
+    if fut.empty:
+        return pd.DataFrame(columns=["date", "baseline_pred"])
+
+    wf = weekly_forecast.copy()
+    wf["week_start"] = pd.to_datetime(wf["week_start"], errors="coerce")
+    wf["baseline_pred_weekly"] = pd.to_numeric(wf.get("baseline_pred_weekly", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    week_map = wf.dropna(subset=["week_start"]).set_index("week_start")["baseline_pred_weekly"].to_dict()
+
+    prof = pd.Series(weekday_profile, dtype=float).reindex(range(7), fill_value=(1.0 / 7.0))
+    if float(prof.sum()) <= 1e-12:
+        prof = pd.Series([1.0 / 7.0] * 7, index=range(7), dtype=float)
+    else:
+        prof = prof / float(prof.sum())
+
+    fut["week_start"] = week_start(fut["date"])
+    fut["dow"] = fut["date"].dt.dayofweek.astype(int)
+    fut["weekly_total"] = fut["week_start"].map(week_map).fillna(0.0)
+    fut["dow_share_raw"] = fut["dow"].map(prof).fillna(1.0 / 7.0)
+    fut["week_available_share"] = fut.groupby("week_start")["dow_share_raw"].transform("sum").replace(0.0, np.nan)
+    fut["dow_share"] = (fut["dow_share_raw"] / fut["week_available_share"]).fillna(0.0)
+    fut["baseline_pred"] = (fut["weekly_total"] * fut["dow_share"]).clip(lower=0.0)
+    return fut[["date", "baseline_pred"]].sort_values("date").reset_index(drop=True)
+
+
+def recursive_weekly_baseline_forecast_median4w(
+    weekly_history: pd.DataFrame,
+    future_week_starts: pd.DataFrame,
+) -> pd.DataFrame:
+    s = pd.to_numeric(weekly_history.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    base = float(s.tail(4).median()) if len(s) else 0.0
+    out = future_week_starts.copy()
+    out["week_start"] = pd.to_datetime(out["week_start"], errors="coerce")
+    out["baseline_pred_weekly"] = max(0.0, base)
+    return out[["week_start", "baseline_pred_weekly"]].sort_values("week_start").reset_index(drop=True)
+
+
+def recursive_weekly_baseline_forecast_recent4_avg(
+    weekly_history: pd.DataFrame,
+    future_week_starts: pd.DataFrame,
+) -> pd.DataFrame:
+    s = pd.to_numeric(weekly_history.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    base = float(s.tail(4).mean()) if len(s) else 0.0
+    out = future_week_starts.copy()
+    out["week_start"] = pd.to_datetime(out["week_start"], errors="coerce")
+    out["baseline_pred_weekly"] = max(0.0, base)
+    return out[["week_start", "baseline_pred_weekly"]].sort_values("week_start").reset_index(drop=True)
+
+
+def recursive_weekly_baseline_forecast_mean8w(
+    weekly_history: pd.DataFrame,
+    future_week_starts: pd.DataFrame,
+) -> pd.DataFrame:
+    s = pd.to_numeric(weekly_history.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    base = float(s.tail(8).mean()) if len(s) else 0.0
+    out = future_week_starts.copy()
+    out["week_start"] = pd.to_datetime(out["week_start"], errors="coerce")
+    out["baseline_pred_weekly"] = max(0.0, base)
+    return out[["week_start", "baseline_pred_weekly"]].sort_values("week_start").reset_index(drop=True)
+
+
+def forecast_weekly_baseline_by_strategy(
+    strategy: str,
+    weekly_history: pd.DataFrame,
+    future_week_starts: pd.DataFrame,
+) -> pd.DataFrame:
+    s = str(strategy or "weekly_median4w")
+    if s == "weekly_median4w":
+        return recursive_weekly_baseline_forecast_median4w(weekly_history, future_week_starts)
+    if s == "weekly_recent4_avg":
+        return recursive_weekly_baseline_forecast_recent4_avg(weekly_history, future_week_starts)
+    if s == "weekly_mean8w":
+        return recursive_weekly_baseline_forecast_mean8w(weekly_history, future_week_starts)
+    raise ValueError(f"Unknown weekly baseline strategy: {s}")
+
+
 def forecast_baseline_by_strategy(
     strategy: str,
     trained_baseline: Dict[str, Any] | None,
@@ -259,6 +382,162 @@ def select_best_baseline_strategy(
     }
 
 
+def run_weekly_baseline_rolling_backtest(
+    target_daily_history: pd.DataFrame,
+    n_windows: int = 3,
+    window_days: int = 28,
+    min_train_days: int = 120,
+) -> Dict[str, Any]:
+    target = target_daily_history.copy()
+    target["date"] = pd.to_datetime(target["date"], errors="coerce")
+    target["sales"] = pd.to_numeric(target.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    target = target.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    strategies = ["weekly_median4w", "weekly_recent4_avg", "weekly_mean8w"]
+    max_date = pd.Timestamp(target["date"].max()) if len(target) else pd.Timestamp("1970-01-01")
+    starts = sorted([max_date - pd.Timedelta(days=(window_days * (i + 1) - 1)) for i in range(int(n_windows))])
+
+    metrics_rows: List[Dict[str, Any]] = []
+    diag_by_strategy: Dict[str, List[pd.DataFrame]] = {s: [] for s in strategies}
+    oof_by_strategy: Dict[str, pd.DataFrame] = {}
+
+    for s in strategies:
+        oof = target[["date", "sales"]].copy()
+        oof["baseline_oof"] = np.nan
+        oof_by_strategy[s] = oof
+
+    for i, ws in enumerate(starts, start=1):
+        we = ws + pd.Timedelta(days=window_days)
+        train_t = target[target["date"] < ws].copy()
+        test_t = target[(target["date"] >= ws) & (target["date"] < we)].copy()
+        if train_t["date"].nunique() < int(min_train_days) or test_t.empty:
+            continue
+
+        weekly_hist = aggregate_daily_to_weekly(train_t)
+        weekday_prof = build_weekday_profile(train_t)
+        fut_weeks = pd.DataFrame({"week_start": sorted(week_start(test_t["date"]).dropna().unique())})
+
+        for s in strategies:
+            weekly_fc = forecast_weekly_baseline_by_strategy(s, weekly_hist, fut_weeks)
+            daily_fc = disaggregate_weekly_to_daily(weekly_fc, test_t[["date"]], weekday_prof)
+            merged = test_t[["date", "sales"]].merge(daily_fc, on="date", how="left")
+            merged["window_id"] = i
+            merged["window_start"] = ws
+            merged["window_end"] = we
+            merged["strategy"] = s
+            diag_by_strategy[s].append(merged)
+
+            metric = run_baseline_holdout(merged["sales"], merged["baseline_pred"])
+            metrics_rows.append({"strategy": s, "window_id": i, "window_start": ws, "window_end": we, **metric})
+
+            pred_map = dict(zip(pd.to_datetime(daily_fc["date"]), pd.to_numeric(daily_fc["baseline_pred"], errors="coerce")))
+            mask = oof_by_strategy[s]["date"].isin(test_t["date"]) & oof_by_strategy[s]["baseline_oof"].isna()
+            oof_by_strategy[s].loc[mask, "baseline_oof"] = pd.to_datetime(oof_by_strategy[s].loc[mask, "date"]).map(pred_map)
+
+    strategy_metrics = pd.DataFrame(metrics_rows)
+    if strategy_metrics.empty:
+        strategy_metrics = pd.DataFrame(columns=["strategy", "window_id", "window_start", "window_end", "forecast_wape", "mae", "rmse", "bias_pct", "sum_ratio"])
+    summary_rows: List[Dict[str, Any]] = []
+    for s in strategies:
+        m = strategy_metrics[strategy_metrics["strategy"] == s].copy()
+        summary_rows.append(
+            {
+                "strategy": s,
+                "n_valid_windows": int(len(m)),
+                "median_wape": float(m["forecast_wape"].median()) if len(m) else np.nan,
+                "median_bias_pct": float(m["bias_pct"].median()) if len(m) else np.nan,
+                "median_sum_ratio": float(m["sum_ratio"].median()) if len(m) else np.nan,
+                "max_wape": float(m["forecast_wape"].max()) if len(m) else np.nan,
+            }
+        )
+    strategy_summary = pd.DataFrame(summary_rows)
+    valid = strategy_summary[strategy_summary["n_valid_windows"] > 0].copy()
+    if valid.empty:
+        best_strategy = "weekly_median4w"
+    else:
+        valid["abs_median_bias_pct"] = valid["median_bias_pct"].abs()
+        valid = valid.sort_values(["median_wape", "abs_median_bias_pct"], ascending=[True, True])
+        best_strategy = str(valid.iloc[0]["strategy"])
+
+    best_metrics = strategy_metrics[strategy_metrics["strategy"] == best_strategy].copy()
+    best_diag = pd.concat(diag_by_strategy.get(best_strategy, []), ignore_index=True) if diag_by_strategy.get(best_strategy) else pd.DataFrame(columns=["date", "sales", "baseline_pred", "window_id", "window_start", "window_end", "strategy"])
+    best_summary_row = strategy_summary[strategy_summary["strategy"] == best_strategy]
+    rolling_summary = {
+        "strategy": best_strategy,
+        "n_valid_windows": int(best_summary_row["n_valid_windows"].iloc[0]) if len(best_summary_row) else 0,
+        "median_wape": float(best_summary_row["median_wape"].iloc[0]) if len(best_summary_row) else np.nan,
+        "median_bias_pct": float(best_summary_row["median_bias_pct"].iloc[0]) if len(best_summary_row) else np.nan,
+        "median_sum_ratio": float(best_summary_row["median_sum_ratio"].iloc[0]) if len(best_summary_row) else np.nan,
+        "max_wape": float(best_summary_row["max_wape"].iloc[0]) if len(best_summary_row) else np.nan,
+    }
+    return {
+        "best_strategy": best_strategy,
+        "strategy_metrics": strategy_metrics,
+        "strategy_summary": strategy_summary,
+        "rolling_metrics": best_metrics,
+        "rolling_diag": best_diag,
+        "rolling_summary": rolling_summary,
+        "strategy_oof_daily": oof_by_strategy,
+        "oof_daily": oof_by_strategy.get(best_strategy, pd.DataFrame(columns=["date", "sales", "baseline_oof"])),
+    }
+
+
+def select_best_baseline_plan(
+    panel_train: pd.DataFrame,
+    target_category: str,
+    target_sku: str,
+    n_windows: int = 3,
+    window_days: int = 28,
+    min_train_days: int = 120,
+) -> Dict[str, Any]:
+    daily_selection = select_best_baseline_strategy(
+        panel_train=panel_train,
+        target_category=target_category,
+        target_sku=target_sku,
+        n_windows=n_windows,
+        window_days=window_days,
+        min_train_days=min_train_days,
+    )
+    target = panel_train[(panel_train["category"].astype(str) == str(target_category)) & (panel_train["product_id"].astype(str) == str(target_sku))].copy().sort_values("date")
+    weekly_selection = run_weekly_baseline_rolling_backtest(
+        target_daily_history=target,
+        n_windows=n_windows,
+        window_days=window_days,
+        min_train_days=min_train_days,
+    )
+
+    daily_summary = daily_selection.get("strategy_summary", pd.DataFrame())
+    daily_best = str(daily_selection.get("best_strategy", "xgb_recursive"))
+    daily_row = daily_summary[daily_summary["strategy"] == daily_best] if not daily_summary.empty else pd.DataFrame()
+    daily_wape = float(daily_row["median_wape"].iloc[0]) if len(daily_row) else np.inf
+
+    weekly_summary = weekly_selection.get("strategy_summary", pd.DataFrame())
+    weekly_best = str(weekly_selection.get("best_strategy", "weekly_median4w"))
+    weekly_row = weekly_summary[weekly_summary["strategy"] == weekly_best] if not weekly_summary.empty else pd.DataFrame()
+    weekly_wape = float(weekly_row["median_wape"].iloc[0]) if len(weekly_row) else np.inf
+
+    weekly_beats_with_margin = np.isfinite(weekly_wape) and np.isfinite(daily_wape) and (weekly_wape + 2.0 < daily_wape)
+    granularity = "weekly" if weekly_beats_with_margin else "daily"
+    selected_strategy = weekly_best if granularity == "weekly" else daily_best
+    selected_median_wape = weekly_wape if granularity == "weekly" else daily_wape
+    reason = (
+        f"weekly selected: median_wape {weekly_wape:.2f} vs daily {daily_wape:.2f}"
+        if granularity == "weekly"
+        else f"daily selected: median_wape {daily_wape:.2f} vs weekly {weekly_wape:.2f}"
+    )
+
+    return {
+        "granularity": granularity,
+        "daily_selection": daily_selection,
+        "weekly_selection": weekly_selection,
+        "best_daily_strategy": daily_best,
+        "best_weekly_strategy": weekly_best,
+        "selected_strategy": selected_strategy,
+        "selected_median_wape": selected_median_wape,
+        "selection_margin_pp_wape": float(daily_wape - weekly_wape) if np.isfinite(daily_wape) and np.isfinite(weekly_wape) else np.nan,
+        "selector_reason": reason,
+    }
+
+
 def build_baseline_oof_predictions(
     panel_train: pd.DataFrame,
     target_category: str,
@@ -306,4 +585,42 @@ def build_baseline_oof_predictions(
         out.loc[mask, "baseline_oof"] = pd.to_datetime(out.loc[mask, "date"]).map(pred_map)
         start_idx += int(step_days)
 
+    return out.sort_values("date").reset_index(drop=True)
+
+
+def build_weekly_baseline_oof_predictions(
+    target_daily_history: pd.DataFrame,
+    strategy: str = "weekly_median4w",
+    min_train_days: int = 84,
+    step_days: int = 7,
+    horizon_days: int = 7,
+) -> pd.DataFrame:
+    target = target_daily_history.copy()
+    target["date"] = pd.to_datetime(target["date"], errors="coerce")
+    target["sales"] = pd.to_numeric(target.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    target = target.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    out = target[["date", "sales"]].copy()
+    out["baseline_oof"] = np.nan
+    if target.empty:
+        return out
+
+    n = len(target)
+    start_idx = int(max(min_train_days, 1))
+    while start_idx < n:
+        test_slice = target.iloc[start_idx:start_idx + int(horizon_days)].copy()
+        train_t = target.iloc[:start_idx].copy()
+        if test_slice.empty:
+            break
+        if train_t["date"].nunique() < int(min_train_days):
+            start_idx += int(step_days)
+            continue
+        weekly_hist = aggregate_daily_to_weekly(train_t)
+        weekday_prof = build_weekday_profile(train_t)
+        fut_weeks = pd.DataFrame({"week_start": sorted(week_start(test_slice["date"]).dropna().unique())})
+        weekly_fc = forecast_weekly_baseline_by_strategy(strategy, weekly_hist, fut_weeks)
+        daily_fc = disaggregate_weekly_to_daily(weekly_fc, test_slice[["date"]], weekday_prof)
+        pred_map = dict(zip(pd.to_datetime(daily_fc["date"]), pd.to_numeric(daily_fc["baseline_pred"], errors="coerce")))
+        mask = out["date"].isin(test_slice["date"]) & out["baseline_oof"].isna()
+        out.loc[mask, "baseline_oof"] = pd.to_datetime(out.loc[mask, "date"]).map(pred_map)
+        start_idx += int(step_days)
     return out.sort_values("date").reset_index(drop=True)
