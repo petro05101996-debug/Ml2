@@ -44,7 +44,7 @@ def test_v2_confidence_has_all_layers():
 def test_v2_excel_contains_required_sheets():
     out = run_full_pricing_analysis_v2(_txn(), "cat", "sku-1", horizon_days=7)
     xls = pd.ExcelFile(out["excel_buffer"])
-    required = {"history", "neutral_baseline_forecast", "as_is_forecast", "scenario_forecast", "neutral_baseline_economics", "as_is_economics", "scenario_economics", "delta_summary_current_vs_scenario", "delta_summary_neutral_vs_current", "baseline_rolling_metrics", "baseline_rolling_diag", "baseline_benchmark_suite", "baseline_quality_summary", "diagnostic_summary", "factor_backtest", "current_state_contributions", "scenario_delta_contributions", "confidence", "confidence_flat"}
+    required = {"history", "neutral_baseline_forecast", "as_is_forecast", "scenario_forecast", "neutral_baseline_economics", "as_is_economics", "scenario_economics", "delta_summary_current_vs_scenario", "delta_summary_neutral_vs_current", "baseline_rolling_metrics", "baseline_rolling_diag", "baseline_benchmark_suite", "baseline_quality_summary", "baseline_data_quality", "scenario_inputs_echo", "diagnostic_summary", "factor_backtest", "current_state_contributions", "scenario_delta_contributions", "confidence", "confidence_flat"}
     assert required.issubset(set(xls.sheet_names))
 
 
@@ -163,6 +163,18 @@ def test_v2_outputs_baseline_benchmark_and_quality_gate():
     }.issubset(out["baseline_quality_gate"].keys())
 
 
+def test_final_baseline_selection_is_consistent_across_outputs():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
+    plan = out["baseline_plan_selection"]
+    assert plan["final_selected_strategy"] == out["final_baseline_strategy"]
+    assert plan["final_selected_granularity"] == out["final_baseline_granularity"]
+    assert out["final_baseline_source"] == "benchmark_suite_selection"
+    xls = pd.ExcelFile(out["excel_buffer"])
+    summary = pd.read_excel(xls, sheet_name="baseline_quality_summary").iloc[0]
+    assert str(summary["baseline_strategy"]) == str(out["final_baseline_strategy"])
+    assert str(summary["baseline_granularity"]) == str(out["final_baseline_granularity"])
+
+
 def test_v2_rolling_export_contains_required_columns():
     out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
     xls = pd.ExcelFile(out["excel_buffer"])
@@ -250,6 +262,17 @@ def test_no_overrides_scenario_equals_as_is():
     a = out["as_is_forecast"]["actual_sales"].reset_index(drop=True)
     s = out["scenario_forecast"]["actual_sales"].reset_index(drop=True)
     assert a.equals(s)
+
+
+def test_scenario_inputs_echo_marks_no_change_when_no_overrides():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7)
+    echo = out["scenario_inputs_echo"]
+    if not echo.empty:
+        assert (echo["changed_flag"] == False).all()  # noqa: E712
+        row = out["delta_summary_current_vs_scenario"].iloc[0]
+        assert abs(float(row["demand_delta_pct"])) <= 1e-9
+        assert out["scenario_controls_changed"] is False
+        assert out["scenario_delta_zero_reason"] == "no_overrides"
 
 
 def test_delta_summary_current_vs_scenario_pct_is_based_on_as_is():

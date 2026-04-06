@@ -77,6 +77,77 @@ def _weighted_mean_by_quantity(values: pd.Series, quantity: pd.Series) -> float:
     return float(v2.mean())
 
 
+def _safe_cv(mean_value: float, std_value: float) -> float:
+    if not np.isfinite(mean_value) or abs(float(mean_value)) <= 1e-12:
+        return 0.0
+    return float(std_value / mean_value)
+
+
+def build_baseline_data_quality_summary(daily_panel: pd.DataFrame) -> pd.DataFrame:
+    if daily_panel is None or len(daily_panel) == 0:
+        return pd.DataFrame(
+            [
+                {
+                    "n_days_history": 0,
+                    "date_min": pd.NaT,
+                    "date_max": pd.NaT,
+                    "missing_date_share": 0.0,
+                    "zero_sales_share": 0.0,
+                    "sales_mean": 0.0,
+                    "sales_std": 0.0,
+                    "sales_cv": 0.0,
+                    "price_unique_count": 0,
+                    "price_cv": 0.0,
+                    "discount_nonzero_share": 0.0,
+                    "promo_share": 0.0,
+                    "stockout_share": 0.0,
+                    "sales_outlier_share": 0.0,
+                }
+            ]
+        )
+    x = daily_panel.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x = x.dropna(subset=["date"]).sort_values("date")
+    if x.empty:
+        return build_baseline_data_quality_summary(pd.DataFrame())
+    sales = pd.to_numeric(x.get("sales", 0.0), errors="coerce").fillna(0.0)
+    price = pd.to_numeric(x.get("price", np.nan), errors="coerce")
+    discount = pd.to_numeric(x.get("discount", x.get("discount_rate", 0.0)), errors="coerce").fillna(0.0)
+    promo = pd.to_numeric(x.get("promotion", 0.0), errors="coerce").fillna(0.0)
+    stockout = pd.to_numeric(x.get("stockout_flag", 0.0), errors="coerce").fillna(0.0)
+    sales_outlier = pd.to_numeric(x.get("sales_outlier_flag", 0.0), errors="coerce").fillna(0.0)
+    n_days = int(x["date"].nunique())
+    date_min = pd.Timestamp(x["date"].min())
+    date_max = pd.Timestamp(x["date"].max())
+    expected_days = int((date_max - date_min).days + 1) if pd.notna(date_min) and pd.notna(date_max) else n_days
+    missing_dates = max(expected_days - n_days, 0)
+    sales_mean = float(sales.mean()) if len(sales) else 0.0
+    sales_std = float(sales.std(ddof=0)) if len(sales) else 0.0
+    price_non_na = price.dropna()
+    price_mean = float(price_non_na.mean()) if len(price_non_na) else 0.0
+    price_std = float(price_non_na.std(ddof=0)) if len(price_non_na) else 0.0
+    return pd.DataFrame(
+        [
+            {
+                "n_days_history": n_days,
+                "date_min": date_min,
+                "date_max": date_max,
+                "missing_date_share": float(missing_dates / max(expected_days, 1)),
+                "zero_sales_share": float((sales <= 0).mean()) if len(sales) else 0.0,
+                "sales_mean": sales_mean,
+                "sales_std": sales_std,
+                "sales_cv": _safe_cv(sales_mean, sales_std),
+                "price_unique_count": int(price_non_na.nunique()),
+                "price_cv": _safe_cv(price_mean, price_std),
+                "discount_nonzero_share": float((discount > 0).mean()) if len(discount) else 0.0,
+                "promo_share": float((promo > 0).mean()) if len(promo) else 0.0,
+                "stockout_share": float((stockout > 0).mean()) if len(stockout) else 0.0,
+                "sales_outlier_share": float((sales_outlier > 0).mean()) if len(sales_outlier) else 0.0,
+            }
+        ]
+    )
+
+
 def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = apply_mapping(df, mapping)
     quality: Dict[str, Any] = {"warnings": [], "errors": [], "raw_stats": {}, "can_recommend": True, "data_quality": "ok"}
@@ -207,6 +278,8 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
     grouped = []
     for keys, g in df.groupby([pd.Grouper(key="date", freq="D"), "category"] + series_keys, dropna=False):
         dt, cat, pid, region, channel, segment = keys
+        sales_sum = float(pd.to_numeric(g["quantity"], errors="coerce").fillna(0.0).sum())
+        revenue_sum = float(pd.to_numeric(g["revenue"], errors="coerce").fillna(0.0).sum())
         row: Dict[str, Any] = {
             "date": pd.Timestamp(dt),
             "product_id": str(pid),
@@ -214,9 +287,13 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
             "region": str(region),
             "channel": str(channel),
             "segment": str(segment),
-            "sales": float(pd.to_numeric(g["quantity"], errors="coerce").fillna(0.0).sum()),
-            "revenue": float(pd.to_numeric(g["revenue"], errors="coerce").fillna(0.0).sum()),
-            "price": _weighted_mean_by_quantity(g["price"], g["quantity"]),
+            "sales": sales_sum,
+            "revenue": revenue_sum,
+            "price": (
+                float(revenue_sum / sales_sum)
+                if sales_sum > 0
+                else np.nan
+            ),
             "cost": _weighted_mean_by_quantity(g["cost"], g["quantity"]),
             "discount_rate": _weighted_mean_by_quantity(g["discount_rate"], g["quantity"]),
             "freight_value": _weighted_mean_by_quantity(g["freight_value"], g["quantity"]),
@@ -249,7 +326,7 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
             m[c] = get_numeric_series(m, c, 0.0).fillna(0.0)
         for c in ["price", "cost", "freight_value"]:
             if c in m.columns:
-                m[c] = get_numeric_series(m, c, np.nan).ffill(limit=7)
+                m[c] = get_numeric_series(m, c, np.nan)
         for c in ["discount_rate", "promotion"]:
             if c in m.columns:
                 m[c] = get_numeric_series(m, c, 0.0).fillna(0.0).clip(lower=0.0)
@@ -259,6 +336,17 @@ def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
             m[c] = get_numeric_series(m, c, np.nan)
         for c in cat_mode_cols:
             m[c] = get_text_series(m, c, "unknown").ffill().fillna("unknown")
+        m["missing_price_flag"] = get_numeric_series(m, "price", np.nan).isna().astype(int)
+        rev = get_numeric_series(m, "revenue", 0.0).fillna(0.0)
+        qty = get_numeric_series(m, "sales", 0.0).fillna(0.0)
+        unit_rev = rev / qty.replace(0.0, np.nan)
+        med_unit_rev = float(pd.to_numeric(unit_rev, errors="coerce").dropna().median()) if unit_rev.notna().any() else np.nan
+        m["return_spike_flag"] = ((rev < 0) | ((qty > 0) & np.isfinite(med_unit_rev) & (unit_rev < med_unit_rev * 0.2))).astype(int)
+        sales_series = qty.astype(float)
+        med_sales = float(sales_series.median()) if len(sales_series) else 0.0
+        mad = float((sales_series - med_sales).abs().median()) if len(sales_series) else 0.0
+        outlier_threshold = med_sales + 4.0 * max(mad, 1e-9)
+        m["sales_outlier_flag"] = (sales_series > outlier_threshold).astype(int)
         m["stockout_flag"] = (get_numeric_series(m, "stock", 0.0).fillna(0.0) <= 0.0).astype(int)
         pieces.append(m)
 
