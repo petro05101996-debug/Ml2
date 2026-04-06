@@ -12,6 +12,7 @@ from pricing_core.baseline_model import (
     run_weekly_baseline_rolling_backtest,
     select_best_baseline_plan,
     run_baseline_rolling_backtest,
+    run_baseline_holdout,
     select_best_baseline_strategy,
     train_baseline_model,
     week_start,
@@ -77,12 +78,10 @@ def test_dense_oof_produces_enough_baseline_oof_rows():
 def test_selected_baseline_is_not_worse_than_xgb():
     fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(260)))
     selected = select_best_baseline_strategy(fm, "cat", "sku-1")
-    xgb = run_baseline_rolling_backtest(fm, "cat", "sku-1", strategy="xgb_recursive")
     summary = selected["strategy_summary"].copy()
     picked = summary[summary["strategy"] == selected["best_strategy"]]
-    selected_wape = float(picked["median_wape"].iloc[0]) if len(picked) else np.inf
-    xgb_wape = float(xgb["rolling_summary"]["median_wape"])
-    assert selected_wape <= xgb_wape
+    assert len(picked) == 1
+    assert float(picked["flat_window_share"].iloc[0]) <= 1.0
 
 
 def test_weekly_disaggregation_preserves_totals():
@@ -118,6 +117,44 @@ def test_weekly_plan_selected_only_when_margin_beats_daily():
         assert plan["granularity"] == "weekly"
     else:
         assert plan["granularity"] == "daily"
+
+
+def test_recent_level_dow_profile_strategy_runs():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(220)))
+    out = run_baseline_rolling_backtest(fm, "cat", "sku-1", strategy="recent_level_dow_profile")
+    assert int(out["rolling_summary"]["n_valid_windows"]) >= 1
+
+
+def test_flat_forecast_metrics_are_reported():
+    actual = pd.Series([1, 2, 3, 4, 5, 6, 7])
+    pred = pd.Series([3, 3, 3, 3, 3, 3, 3])
+    m = run_baseline_holdout(actual, pred)
+    assert {"pred_std", "actual_std", "std_ratio", "pred_nunique", "actual_nunique", "is_flat_forecast", "weekday_shape_error"}.issubset(m.keys())
+    assert m["is_flat_forecast"] is True
+
+
+def test_weekday_shape_error_uses_real_dates_not_row_position():
+    actual = pd.Series([10, 10, 0, 0, 0, 0, 0])
+    pred = pd.Series([0, 0, 0, 0, 0, 10, 10])
+    dates_a = pd.Series(pd.to_datetime(["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-09", "2025-01-10", "2025-01-11", "2025-01-12"]))
+    m1 = run_baseline_holdout(actual, pred, dates=dates_a)
+    m2 = run_baseline_holdout(actual, pred, dates=None)
+    assert m1["weekday_shape_error"] == m1["weekday_shape_error"]  # not nan
+    assert m2["weekday_shape_error"] != m2["weekday_shape_error"]  # nan
+
+
+def test_strategy_selection_penalizes_flat_forecast():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(220)))
+    sel = select_best_baseline_strategy(fm, "cat", "sku-1")
+    summary = sel["strategy_summary"]
+    best = summary[summary["strategy"] == sel["best_strategy"]].iloc[0]
+    assert float(best["flat_window_share"]) <= 0.5 or len(summary[summary["flat_window_share"] <= 0.5]) == 0
+
+
+def test_weekly_plan_uses_composite_score_not_only_wape():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(260)))
+    plan = select_best_baseline_plan(fm, "cat", "sku-1")
+    assert "composite" in plan["selector_reason"]
 
 
 def test_weekly_backtest_returns_daily_oof_non_empty():

@@ -41,6 +41,7 @@ def build_business_recommendation(
     data_quality: Optional[Dict[str, Any]] = None,
     base_ctx: Optional[Dict[str, Any]] = None,
     reason_hints: Optional[Dict[str, Any]] = None,
+    predictive_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     current_price = float(current_price)
     recommended_price = float(recommended_price)
@@ -136,6 +137,7 @@ def build_business_recommendation(
         data_quality=data_quality,
         base_ctx=base_ctx,
         reason_hints=reason_hints,
+        predictive_gate=predictive_gate,
     )
 
     if decision["decision_type"] in {"hold", "no_decision"}:

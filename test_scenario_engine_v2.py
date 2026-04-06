@@ -1,5 +1,6 @@
 import pandas as pd
 
+from pricing_core.factor_features import build_factor_feature_matrix, derive_factor_feature_spec
 from pricing_core.scenario_engine import run_scenario_forecast
 from pricing_core.shock_engine import build_shock_profile
 
@@ -25,12 +26,13 @@ def _trained_baseline():
     return tr, spec, fm
 
 
-def test_no_override_returns_baseline_when_factor_multiplier_is_one_and_no_shocks():
+def test_no_override_returns_as_is_equal_to_scenario():
     tr, spec, fm = _trained_baseline()
     fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=5, freq="D")})
     out = run_scenario_forecast(tr, None, fm, fut, spec, None)
-    sf = out["scenario_forecast"]
-    assert (sf["actual_sales"] == sf["baseline_pred"]).all()
+    a = out["as_is_forecast"]["actual_sales"].reset_index(drop=True)
+    s = out["scenario_forecast"]["actual_sales"].reset_index(drop=True)
+    assert a.equals(s)
 
 
 def test_price_override_changes_factor_multiplier_not_baseline():
@@ -39,6 +41,17 @@ def test_price_override_changes_factor_multiplier_not_baseline():
     a = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"price": 999})
     b = run_scenario_forecast(tr, None, fm, fut, spec, None)
     assert (a["scenario_forecast"]["baseline_pred"].values == b["scenario_forecast"]["baseline_pred"].values).all()
+
+
+def test_neutral_baseline_differs_from_as_is_when_current_price_or_promo_non_neutral():
+    tr, spec, fm = _trained_baseline()
+    fm = fm.copy()
+    fm.loc[fm.index[-1], "promotion"] = 1.0
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=5, freq="D")})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None)
+    neutral = float(out["neutral_baseline_forecast"]["baseline_pred"].sum())
+    as_is = float(out["as_is_forecast"]["actual_sales"].sum())
+    assert neutral != as_is
 
 
 def test_shock_multiplier_applies_after_factor_multiplier():
@@ -54,6 +67,14 @@ def test_stock_total_horizon_caps_cumulatively():
     out = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"use_stock_cap": True, "stock_total_horizon": 5})
     sf = out["scenario_forecast"]
     assert float(sf["actual_sales"].sum()) <= 5.0
+
+
+def test_stock_cap_applies_to_as_is_and_scenario_paths_independently():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"price": 9.0, "use_stock_cap": True, "stock_total_horizon": 5})
+    assert float(out["as_is_forecast"]["actual_sales"].sum()) > 5.0
+    assert float(out["scenario_forecast"]["actual_sales"].sum()) <= 5.0
 
 
 def test_lost_sales_is_positive_when_stock_binding():
@@ -86,6 +107,31 @@ def test_scenario_mode_is_exposed():
     out = run_scenario_forecast(tr, None, fm, fut, spec, None)
     assert out["mode"] == "fallback_elasticity"
     assert out["scenario_effect_source"] == "fallback_elasticity"
+
+
+def test_scenario_outside_backtest_range_sets_flag():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    out = run_scenario_forecast(
+        tr,
+        None,
+        fm,
+        fut,
+        spec,
+        None,
+        scenario_overrides={"price": 1.0},
+        factor_backtest_summary={"factor_multiplier_p95": 1.01},
+    )
+    assert "scenario_outside_factor_backtest_range" in out["warnings"]
+
+
+def test_run_scenario_forecast_returns_three_forecast_layers():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None)
+    assert "neutral_baseline_forecast" in out
+    assert "as_is_forecast" in out
+    assert "scenario_forecast" in out
 
 
 def test_baseline_override_is_used_for_scenario_path():
@@ -131,3 +177,16 @@ def test_fallback_elasticity_responds_to_price_change():
     assert low["scenario_effect_source"] == "fallback_elasticity"
     assert high["scenario_effect_source"] == "fallback_elasticity"
     assert float(low["scenario_forecast"]["actual_sales"].sum()) != float(high["scenario_forecast"]["actual_sales"].sum())
+
+
+def test_future_and_train_factor_feature_schema_are_synced_for_dynamic_features():
+    tr, spec, fm = _trained_baseline()
+    ff_spec = derive_factor_feature_spec(fm)
+    train_mat = build_factor_feature_matrix(fm, ff_spec)
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, ff_spec)
+    future_cols = set(out["scenario_forecast"].columns)
+    required = {"demand_raw", "actual_sales", "lost_sales", "remaining_stock", "factor_multiplier"}
+    assert required.issubset(future_cols)
+    dynamic = {"recent_sales_level_7", "recent_sales_level_28", "sales_level_ratio_7_to_28", "weekday_profile_share", "days_since_last_promo", "price_rank_vs_last_8_weeks"}
+    assert dynamic.issubset(set(train_mat.columns))

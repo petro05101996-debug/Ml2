@@ -30,7 +30,8 @@ def test_v2_pipeline_runs_end_to_end():
 
 def test_v2_returns_baseline_and_scenario_outputs():
     out = run_full_pricing_analysis_v2(_txn(), "cat", "sku-1", horizon_days=7)
-    assert len(out["baseline_forecast"]) == 7
+    assert len(out["neutral_baseline_forecast"]) == 7
+    assert len(out["as_is_forecast"]) == 7
     assert len(out["scenario_forecast"]) == 7
 
 
@@ -43,14 +44,14 @@ def test_v2_confidence_has_all_layers():
 def test_v2_excel_contains_required_sheets():
     out = run_full_pricing_analysis_v2(_txn(), "cat", "sku-1", horizon_days=7)
     xls = pd.ExcelFile(out["excel_buffer"])
-    required = {"history", "baseline_forecast", "scenario_forecast", "baseline_economics", "scenario_economics", "delta_summary", "baseline_rolling_metrics", "baseline_rolling_diag", "factor_backtest", "factor_contributions", "confidence"}
+    required = {"history", "neutral_baseline_forecast", "as_is_forecast", "scenario_forecast", "neutral_baseline_economics", "as_is_economics", "scenario_economics", "delta_summary_current_vs_scenario", "delta_summary_neutral_vs_current", "baseline_rolling_metrics", "baseline_rolling_diag", "factor_backtest", "current_state_contributions", "scenario_delta_contributions", "confidence"}
     assert required.issubset(set(xls.sheet_names))
 
 
 def test_v2_uses_final_baseline_model_for_forecast():
     out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
     b = out["_trained_bundle"]
-    assert b.get("baseline_strategy") in {"xgb_recursive", "median7", "mean28", "dow_median8w", "weekly_median4w", "weekly_recent4_avg", "weekly_mean8w"}
+    assert b.get("baseline_strategy") in {"xgb_recursive", "median7", "mean28", "dow_median8w", "recent_level_dow_profile", "weekly_median4w", "weekly_recent4_avg", "weekly_mean8w"}
     if b.get("baseline_strategy") == "xgb_recursive" and b.get("baseline_granularity") != "weekly":
         assert b.get("trained_baseline_bt") is not None
         assert b.get("trained_baseline_final") is not None
@@ -65,7 +66,7 @@ def test_v2_uses_final_baseline_model_for_forecast():
 
 def test_tiny_history_fallback_consistent_between_baseline_and_scenario():
     out = run_full_pricing_analysis_v2(_txn(10), "cat", "sku-1", horizon_days=5)
-    b = out["baseline_forecast"]["baseline_pred"].reset_index(drop=True)
+    b = out["neutral_baseline_forecast"]["baseline_pred"].reset_index(drop=True)
     s = out["scenario_forecast"]["baseline_pred"].reset_index(drop=True)
     assert b.equals(s)
 
@@ -86,20 +87,20 @@ def test_factor_ood_flags_reduce_confidence():
 def test_price_override_changes_multiplier_with_trained_factor():
     base = run_full_pricing_analysis_v2(_txn(260, two_skus=True), "cat", "sku-1", horizon_days=5)
     alt = run_full_pricing_analysis_v2(_txn(260, two_skus=True), "cat", "sku-1", horizon_days=5, scenario_overrides={"price": 14.0})
-    assert np.allclose(base["baseline_forecast"]["baseline_pred"].values, alt["baseline_forecast"]["baseline_pred"].values)
+    assert np.allclose(base["neutral_baseline_forecast"]["baseline_pred"].values, alt["neutral_baseline_forecast"]["baseline_pred"].values)
     if base["factor_model_trained"] and alt["factor_model_trained"]:
-        assert float(alt["_trained_bundle"]["base_ctx"].get("price", 0.0)) >= 0.0
+        assert float(alt["_trained_bundle"]["current_ctx"].get("price", 0.0)) >= 0.0
         assert float(alt["scenario_economics"]["unit_price"].iloc[0]) == 14.0
 
 
 def test_price_override_changes_scenario_outputs_with_trained_factor():
     base = run_full_pricing_analysis_v2(_txn(260, two_skus=True), "cat", "sku-1", horizon_days=7)
     alt = run_full_pricing_analysis_v2(_txn(260, two_skus=True), "cat", "sku-1", horizon_days=7, scenario_overrides={"price": 15.0})
-    assert np.allclose(base["baseline_forecast"]["baseline_pred"].values, alt["baseline_forecast"]["baseline_pred"].values)
+    assert np.allclose(base["neutral_baseline_forecast"]["baseline_pred"].values, alt["neutral_baseline_forecast"]["baseline_pred"].values)
     if base["factor_model_trained"] and alt["factor_model_trained"]:
         assert float(alt["scenario_economics"]["unit_price"].iloc[0]) == 15.0
-        b = base["delta_summary"].iloc[0].to_dict()
-        a = alt["delta_summary"].iloc[0].to_dict()
+        b = base["delta_summary_current_vs_scenario"].iloc[0].to_dict()
+        a = alt["delta_summary_current_vs_scenario"].iloc[0].to_dict()
         assert (b["revenue_delta_pct"] != a["revenue_delta_pct"]) or (b["profit_delta_pct"] != a["profit_delta_pct"])
 
 
@@ -143,7 +144,8 @@ def test_economics_mode_propagates_end_to_end():
 def test_v2_bundle_contains_base_ctx_and_scenario_feature_spec():
     out = run_full_pricing_analysis_v2(_txn(20), "cat", "sku-1", horizon_days=5)
     b = out["_trained_bundle"]
-    assert "base_ctx" in b
+    assert "neutral_ctx" in b
+    assert "current_ctx" in b
     assert "scenario_feature_spec" in b
 
 
@@ -152,7 +154,7 @@ def test_cost_and_freight_do_not_change_demand_v2():
     bundle = out["_trained_bundle"]
     base = run_v2_what_if_projection(bundle, manual_price=10.0, horizon_days=7, cost_multiplier=1.0, freight_multiplier=1.0)
     stressed = run_v2_what_if_projection(bundle, manual_price=10.0, horizon_days=7, cost_multiplier=1.3, freight_multiplier=1.3)
-    assert base["demand_total"] == stressed["demand_total"]
+    assert base["scenario_demand_total"] == stressed["scenario_demand_total"]
     assert base["actual_sales_total"] == stressed["actual_sales_total"]
     assert base["lost_sales_total"] == stressed["lost_sales_total"]
     assert base["profit_total"] != stressed["profit_total"]
@@ -163,7 +165,7 @@ def test_stock_cap_none_means_unlimited():
     bundle = out["_trained_bundle"]
     w = run_v2_what_if_projection(bundle, manual_price=10.0, horizon_days=7, stock_cap=None)
     assert w["lost_sales_total"] == 0.0
-    assert w["actual_sales_total"] == w["demand_total"]
+    assert w["actual_sales_total"] == w["scenario_demand_total"]
 
 
 def test_stock_cap_zero_means_zero_inventory():
@@ -187,7 +189,7 @@ def test_sample_transactions_end_to_end_v2_runs():
 
 def test_weekly_baseline_plan_returns_daily_forecast_contract():
     out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=9)
-    bf = out["baseline_forecast"]
+    bf = out["neutral_baseline_forecast"]
     assert {"date", "baseline_pred"}.issubset(bf.columns)
     assert len(bf) == 9
 
@@ -208,3 +210,27 @@ def test_end_to_end_v2_runs_with_weekly_baseline_selection():
     assert "baseline_forecast" in out
     assert "scenario_forecast" in out
     assert out.get("baseline_granularity") in {"daily", "weekly"}
+
+
+def test_contract_contains_three_forecast_layers_and_contributions():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7)
+    assert "neutral_baseline_forecast" in out
+    assert "as_is_forecast" in out
+    assert "scenario_forecast" in out
+    assert "current_state_contributions" in out
+    assert "scenario_delta_contributions" in out
+    assert "delta_summary_current_vs_scenario" in out
+
+
+def test_no_overrides_scenario_equals_as_is():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7)
+    a = out["as_is_forecast"]["actual_sales"].reset_index(drop=True)
+    s = out["scenario_forecast"]["actual_sales"].reset_index(drop=True)
+    assert a.equals(s)
+
+
+def test_delta_summary_current_vs_scenario_pct_is_based_on_as_is():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7, scenario_overrides={"price": 15.0})
+    row = out["delta_summary_current_vs_scenario"].iloc[0]
+    expected = float(row["demand_delta_abs"]) / max(float(row["as_is_total_demand"]), 1e-9)
+    assert abs(float(row["demand_delta_pct"]) - expected) < 1e-9

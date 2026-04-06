@@ -8,18 +8,26 @@ def build_baseline_confidence_state(rolling_summary: Dict[str, Any]) -> Dict[str
     w = rolling_summary.get("median_wape")
     b = rolling_summary.get("median_bias_pct")
     sr = rolling_summary.get("median_sum_ratio")
+    flat = float(rolling_summary.get("flat_window_share", 1.0) or 1.0)
+    std_ratio = float(rolling_summary.get("median_std_ratio", 0.0) or 0.0)
+    strategy = str(rolling_summary.get("strategy", ""))
     issues: List[str] = []
-    if n >= 2 and w is not None and w <= 25 and abs(b) <= 0.05 and 0.95 <= sr <= 1.05:
+    if n >= 3 and w is not None and w <= 20 and abs(b) <= 0.05 and 0.95 <= sr <= 1.05 and flat <= 0.25 and std_ratio >= 0.60:
         lvl = "high"
-    elif n >= 1 and w is not None and w <= 35 and abs(b) <= 0.10:
+    elif n >= 2 and w is not None and w <= 28 and abs(b) <= 0.08 and 0.90 <= sr <= 1.10 and flat <= 0.50:
         lvl = "medium"
     else:
         lvl = "low"
         issues.append("baseline_backtest_weak")
+    if strategy in {"median7", "mean28"} and lvl == "high":
+        lvl = "medium"
+        issues.append("baseline_strategy_simple_cap")
+    if flat > 0.5:
+        issues.append("baseline_flat_forecast")
     return {"level": lvl, "metrics": rolling_summary, "issues": issues}
 
 
-def build_factor_confidence_state(factor_backtest_summary, ood_flags) -> Dict[str, Any]:
+def build_factor_confidence_state(factor_backtest_summary, ood_flags, baseline_level: str = "low", scenario_outside_factor_backtest_range: bool = False) -> Dict[str, Any]:
     issues = []
     if not factor_backtest_summary.get("trained", False):
         issues = ["factor_model_unavailable"]
@@ -63,6 +71,14 @@ def build_factor_confidence_state(factor_backtest_summary, ood_flags) -> Dict[st
         issues.append("factor_ood_detected")
         if lvl == "high":
             lvl = "medium"
+    if scenario_outside_factor_backtest_range:
+        issues.append("scenario_outside_factor_backtest_range")
+        if lvl == "high":
+            lvl = "medium"
+    if baseline_level == "low":
+        lvl = "low"
+    elif baseline_level == "medium" and lvl == "high":
+        lvl = "medium"
     return {"level": lvl, "metrics": factor_backtest_summary, "issues": issues}
 
 
@@ -77,11 +93,29 @@ def build_shock_confidence_state(shocks) -> Dict[str, Any]:
     return {"level": lvl, "metrics": {"n_shocks": len(shocks)}, "issues": []}
 
 
-def combine_confidence_states(baseline_state, factor_state, shock_state, intervals_available: bool = False) -> Dict[str, Any]:
+def combine_confidence_states(
+    baseline_state,
+    factor_state,
+    shock_state,
+    intervals_available: bool = False,
+    *,
+    factor_role: str | None = None,
+    scenario_outside_factor_backtest_range: bool = False,
+    scenario_equals_current_but_delta_nonzero: bool = False,
+    explainability_available: bool = True,
+) -> Dict[str, Any]:
     order = {"low": 0, "medium": 1, "high": 2}
     inv = {0: "low", 1: "medium", 2: "high"}
     overall = inv[min(order.get(baseline_state["level"], 0), order.get(factor_state["level"], 0), order.get(shock_state["level"], 0))]
     issues = baseline_state.get("issues", []) + factor_state.get("issues", []) + shock_state.get("issues", [])
+    if factor_role == "advisory_only":
+        issues.append("factor_advisory_only")
+    if scenario_outside_factor_backtest_range:
+        issues.append("scenario_outside_factor_backtest_range")
+    if scenario_equals_current_but_delta_nonzero:
+        issues.append("scenario_equals_current_but_delta_nonzero")
+    if not explainability_available:
+        issues.append("explainability_unavailable")
     return {
         "baseline_confidence": baseline_state,
         "factor_confidence": factor_state,

@@ -220,21 +220,64 @@ def run_factor_backtest(df: pd.DataFrame, trained_factor: Dict[str, Any], featur
     }
 
 
-def compute_factor_contributions(target_history: pd.DataFrame, future_dates_df: pd.DataFrame, base_ctx: Dict[str, Any], scenario_ctx: Dict[str, Any], trained_factor: Dict[str, Any], feature_spec: Dict[str, Any]) -> pd.DataFrame:
+def _compute_delta_contributions(
+    target_history: pd.DataFrame,
+    future_dates_df: pd.DataFrame,
+    from_ctx: Dict[str, Any],
+    to_ctx: Dict[str, Any],
+    trained_factor: Dict[str, Any],
+    feature_spec: Dict[str, Any],
+) -> pd.DataFrame:
     if trained_factor is None:
-        return pd.DataFrame(columns=["factor_name", "multiplier_delta", "contribution_pct", "confidence", "note"])
+        return pd.DataFrame(columns=["factor_name", "from_value", "to_value", "multiplier_delta", "contribution_pct", "confidence", "note"])
     from pricing_core.scenario_engine import build_future_factor_frame
 
-    base_frame = build_future_factor_frame(target_history, future_dates_df, base_ctx, feature_spec)
+    base_frame = build_future_factor_frame(target_history, future_dates_df, from_ctx, feature_spec)
     base_mult = float(predict_factor_effect(base_frame, trained_factor, feature_spec)["factor_multiplier"].mean())
     rows = []
     for f in feature_spec.get("controllable_features", []):
-        if base_ctx.get(f) == scenario_ctx.get(f):
+        if from_ctx.get(f) == to_ctx.get(f):
             continue
-        c = dict(base_ctx)
-        c[f] = scenario_ctx.get(f)
+        c = dict(from_ctx)
+        c[f] = to_ctx.get(f)
         frame = build_future_factor_frame(target_history, future_dates_df, c, feature_spec)
         m = float(predict_factor_effect(frame, trained_factor, feature_spec)["factor_multiplier"].mean())
         pct = 0.0 if base_mult <= 1e-9 else (m / base_mult - 1.0)
-        rows.append({"factor_name": f, "multiplier_delta": pct, "contribution_pct": pct, "confidence": "advisory", "note": "deterministic_one_factor_delta_not_shap"})
-    return pd.DataFrame(rows, columns=["factor_name", "multiplier_delta", "contribution_pct", "confidence", "note"])
+        rows.append(
+            {
+                "factor_name": f,
+                "from_value": from_ctx.get(f),
+                "to_value": to_ctx.get(f),
+                "multiplier_delta": pct,
+                "contribution_pct": pct,
+                "confidence": "advisory",
+                "note": "deterministic_one_factor_delta_not_shap",
+            }
+        )
+    return pd.DataFrame(rows, columns=["factor_name", "from_value", "to_value", "multiplier_delta", "contribution_pct", "confidence", "note"])
+
+
+def compute_current_state_contributions(
+    target_history: pd.DataFrame,
+    future_dates_df: pd.DataFrame,
+    neutral_ctx: Dict[str, Any],
+    current_ctx: Dict[str, Any],
+    trained_factor: Dict[str, Any],
+    feature_spec: Dict[str, Any],
+) -> pd.DataFrame:
+    return _compute_delta_contributions(target_history, future_dates_df, neutral_ctx, current_ctx, trained_factor, feature_spec)
+
+
+def compute_scenario_delta_contributions(
+    target_history: pd.DataFrame,
+    future_dates_df: pd.DataFrame,
+    current_ctx: Dict[str, Any],
+    scenario_ctx: Dict[str, Any],
+    trained_factor: Dict[str, Any],
+    feature_spec: Dict[str, Any],
+) -> pd.DataFrame:
+    return _compute_delta_contributions(target_history, future_dates_df, current_ctx, scenario_ctx, trained_factor, feature_spec)
+
+
+def compute_factor_contributions(target_history: pd.DataFrame, future_dates_df: pd.DataFrame, base_ctx: Dict[str, Any], scenario_ctx: Dict[str, Any], trained_factor: Dict[str, Any], feature_spec: Dict[str, Any]) -> pd.DataFrame:
+    return _compute_delta_contributions(target_history, future_dates_df, base_ctx, scenario_ctx, trained_factor, feature_spec)

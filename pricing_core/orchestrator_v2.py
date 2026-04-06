@@ -23,10 +23,15 @@ from pricing_core.baseline_model import (
     train_baseline_model,
     week_start,
 )
-from pricing_core.factor_features import build_factor_feature_matrix, build_factor_target, derive_factor_feature_spec
-from pricing_core.factor_model import compute_factor_contributions, run_factor_rolling_backtest, train_factor_model
+from pricing_core.factor_features import build_factor_feature_matrix, build_factor_target_frame, derive_factor_feature_spec
+from pricing_core.factor_model import (
+    compute_current_state_contributions,
+    compute_scenario_delta_contributions,
+    run_factor_rolling_backtest,
+    train_factor_model,
+)
 from pricing_core.model_registry import build_model_bundle
-from pricing_core.scenario_engine import compute_scenario_delta, run_scenario_forecast
+from pricing_core.scenario_engine import run_scenario_forecast
 from pricing_core.uncertainty import (
     build_baseline_confidence_state,
     build_factor_confidence_state,
@@ -63,16 +68,26 @@ def _assess_factor_trainability(factor_train: pd.DataFrame, factor_feature_spec:
     ]
     price_unique_count = int(pd.to_numeric(factor_train.get("price", np.nan), errors="coerce").nunique(dropna=True))
     variative_count = int(len(variative))
-    trainable = n_rows >= 45 and variative_count >= 1 and (price_unique_count >= 3 or variative_count >= 2)
+    trainable_for_advisory = n_rows >= 60 and variative_count >= 1 and (price_unique_count >= 3 or variative_count >= 2)
+    trainable_for_production = n_rows >= 120 and variative_count >= 2 and price_unique_count >= 5
     reason_codes = []
-    if n_rows < 45:
-        reason_codes.append("rows_lt_45")
+    if n_rows < 60:
+        reason_codes.append("rows_lt_60")
     if variative_count < 1:
         reason_codes.append("no_variative_controllable")
     if price_unique_count < 3 and variative_count < 2:
         reason_codes.append("weak_price_and_control_variation")
+    if trainable_for_production:
+        factor_role = "production"
+    elif trainable_for_advisory:
+        factor_role = "advisory_only"
+    else:
+        factor_role = "unavailable"
     return {
-        "trainable": bool(trainable),
+        "trainable": bool(trainable_for_advisory),
+        "trainable_for_advisory": bool(trainable_for_advisory),
+        "trainable_for_production": bool(trainable_for_production),
+        "factor_role": factor_role,
         "n_rows": n_rows,
         "price_unique_count": price_unique_count,
         "variative_controllable_count": variative_count,
@@ -251,8 +266,9 @@ def run_full_pricing_analysis_v2(
     factor_feature_spec_target = derive_factor_feature_spec(factor_train_target)
     factor_train_target = build_factor_feature_matrix(factor_train_target, factor_feature_spec_target)
     factor_train_target = factor_train_target[factor_train_target["baseline_oof"].notna()].copy()
-    factor_train_target["factor_target"] = build_factor_target(factor_train_target)
-    factor_train_target = factor_train_target[pd.to_numeric(factor_train_target["factor_target"], errors="coerce").notna()].copy()
+    target_frame = build_factor_target_frame(factor_train_target)
+    factor_train_target = pd.concat([factor_train_target, target_frame], axis=1)
+    factor_train_target = factor_train_target[factor_train_target["factor_target_valid"].astype(bool)].copy()
     target_assess = _assess_factor_trainability(factor_train_target, factor_feature_spec_target)
 
     use_target_direct = (
@@ -279,8 +295,9 @@ def run_full_pricing_analysis_v2(
             factor_feature_spec = derive_factor_feature_spec(pooled_candidate)
             pooled_candidate = build_factor_feature_matrix(pooled_candidate, factor_feature_spec)
             pooled_candidate = pooled_candidate[pooled_candidate["baseline_oof"].notna()].copy()
-            pooled_candidate["factor_target"] = build_factor_target(pooled_candidate)
-            pooled_candidate = pooled_candidate[pd.to_numeric(pooled_candidate["factor_target"], errors="coerce").notna()].copy()
+            pooled_frame = build_factor_target_frame(pooled_candidate)
+            pooled_candidate = pd.concat([pooled_candidate, pooled_frame], axis=1)
+            pooled_candidate = pooled_candidate[pooled_candidate["factor_target_valid"].astype(bool)].copy()
             pooled_assess = _assess_factor_trainability(pooled_candidate, factor_feature_spec)
             if pooled_assess["trainable"]:
                 factor_train_scope = "pooled"
@@ -326,29 +343,45 @@ def run_full_pricing_analysis_v2(
         scenario_overrides=scenario_overrides,
         shocks=shocks,
         baseline_override_df=baseline_forecast[["date", "baseline_pred"]] if use_baseline_override else None,
+        factor_backtest_summary=factor_backtest,
     )
+    neutral_baseline_forecast = scenario_result["neutral_baseline_forecast"].copy()
+    as_is_forecast = scenario_result["as_is_forecast"].copy()
     scenario_forecast = scenario_result["scenario_forecast"].copy()
 
-    base_ctx = scenario_result["base_ctx"]
+    neutral_ctx = scenario_result["neutral_ctx"]
+    current_ctx = scenario_result["current_ctx"]
     scn_ctx = scenario_result["scenario_ctx"]
 
-    b_input = baseline_forecast.copy()
-    b_input["price"] = max(float(base_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])), 1e-6)
-    b_input["discount"] = float(base_ctx.get("discount", target_history.get("discount", pd.Series([0.0])).iloc[-1]))
-    b_input["cost"] = float(base_ctx.get("cost", target_history.get("cost", pd.Series([0.0])).iloc[-1]))
-    b_input["freight_value"] = float(base_ctx.get("freight_value", target_history.get("freight_value", pd.Series([0.0])).iloc[-1]))
-    baseline_economics, _ = compute_daily_unit_economics(
-        b_input,
+    n_input = neutral_baseline_forecast.copy()
+    n_input["price"] = max(float(neutral_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])), 1e-6)
+    n_input["discount"] = float(neutral_ctx.get("discount", target_history.get("discount", pd.Series([0.0])).iloc[-1]))
+    n_input["cost"] = float(neutral_ctx.get("cost", target_history.get("cost", pd.Series([0.0])).iloc[-1]))
+    n_input["freight_value"] = float(neutral_ctx.get("freight_value", target_history.get("freight_value", pd.Series([0.0])).iloc[-1]))
+    neutral_baseline_economics, _ = compute_daily_unit_economics(
+        n_input,
         quantity_col="baseline_pred",
         unit_price_input_type=unit_price_input_type,
         economics_mode=economics_mode,
     )
 
+    a_input = as_is_forecast.copy()
+    a_input["price"] = max(float(current_ctx.get("price", n_input["price"].iloc[0])), 1e-6)
+    a_input["discount"] = float(current_ctx.get("discount", n_input["discount"].iloc[0]))
+    a_input["cost"] = float(current_ctx.get("cost", n_input["cost"].iloc[0]))
+    a_input["freight_value"] = float(current_ctx.get("freight_value", n_input["freight_value"].iloc[0]))
+    as_is_economics, _ = compute_daily_unit_economics(
+        a_input,
+        quantity_col="actual_sales",
+        unit_price_input_type=unit_price_input_type,
+        economics_mode=economics_mode,
+    )
+
     s_input = scenario_forecast.copy()
-    s_input["price"] = max(float(scn_ctx.get("price", b_input["price"].iloc[0])), 1e-6)
-    s_input["discount"] = float(scn_ctx.get("discount", b_input["discount"].iloc[0]))
-    s_input["cost"] = float(scn_ctx.get("cost", b_input["cost"].iloc[0]))
-    s_input["freight_value"] = float(scn_ctx.get("freight_value", b_input["freight_value"].iloc[0]))
+    s_input["price"] = max(float(scn_ctx.get("price", a_input["price"].iloc[0])), 1e-6)
+    s_input["discount"] = float(scn_ctx.get("discount", a_input["discount"].iloc[0]))
+    s_input["cost"] = float(scn_ctx.get("cost", a_input["cost"].iloc[0]))
+    s_input["freight_value"] = float(scn_ctx.get("freight_value", a_input["freight_value"].iloc[0]))
     scenario_economics, _ = compute_daily_unit_economics(
         s_input,
         quantity_col="actual_sales",
@@ -356,40 +389,105 @@ def run_full_pricing_analysis_v2(
         economics_mode=economics_mode,
     )
 
-    demand_delta = compute_scenario_delta(baseline_forecast, scenario_forecast)
-    baseline_total_revenue = float(baseline_economics["total_revenue"].sum())
+    as_is_total_demand = float(pd.to_numeric(as_is_forecast["actual_sales"], errors="coerce").fillna(0.0).sum())
+    scenario_total_demand = float(pd.to_numeric(scenario_forecast["actual_sales"], errors="coerce").fillna(0.0).sum())
+    demand_delta_abs = scenario_total_demand - as_is_total_demand
+    demand_delta_pct = demand_delta_abs / max(as_is_total_demand, 1e-9)
+    baseline_total_revenue = float(as_is_economics["total_revenue"].sum())
     scenario_total_revenue = float(scenario_economics["total_revenue"].sum())
-    baseline_total_profit = float(baseline_economics["profit"].sum())
+    baseline_total_profit = float(as_is_economics["profit"].sum())
     scenario_total_profit = float(scenario_economics["profit"].sum())
-    delta_summary = demand_delta.copy()
-    delta_summary["baseline_total_revenue"] = baseline_total_revenue
-    delta_summary["scenario_total_revenue"] = scenario_total_revenue
-    delta_summary["revenue_delta_abs"] = scenario_total_revenue - baseline_total_revenue
-    delta_summary["revenue_delta_pct"] = 0.0 if abs(baseline_total_revenue) < 1e-9 else (scenario_total_revenue - baseline_total_revenue) / baseline_total_revenue
-    delta_summary["baseline_total_profit"] = baseline_total_profit
-    delta_summary["scenario_total_profit"] = scenario_total_profit
-    delta_summary["profit_delta_abs"] = scenario_total_profit - baseline_total_profit
-    delta_summary["profit_delta_pct"] = 0.0 if abs(baseline_total_profit) < 1e-9 else (scenario_total_profit - baseline_total_profit) / baseline_total_profit
+    delta_summary_current_vs_scenario = pd.DataFrame(
+        [
+            {
+                "as_is_total_demand": as_is_total_demand,
+                "scenario_total_demand": scenario_total_demand,
+                "demand_delta_abs": demand_delta_abs,
+                "demand_delta_pct": demand_delta_pct,
+                "as_is_total_revenue": baseline_total_revenue,
+                "scenario_total_revenue": scenario_total_revenue,
+                "revenue_delta_abs": scenario_total_revenue - baseline_total_revenue,
+                "revenue_delta_pct": 0.0 if abs(baseline_total_revenue) < 1e-9 else (scenario_total_revenue - baseline_total_revenue) / baseline_total_revenue,
+                "as_is_total_profit": baseline_total_profit,
+                "scenario_total_profit": scenario_total_profit,
+                "profit_delta_abs": scenario_total_profit - baseline_total_profit,
+                "profit_delta_pct": 0.0 if abs(baseline_total_profit) < 1e-9 else (scenario_total_profit - baseline_total_profit) / baseline_total_profit,
+            }
+        ]
+    )
+    neutral_total_demand = float(pd.to_numeric(neutral_baseline_forecast["baseline_pred"], errors="coerce").fillna(0.0).sum())
+    neutral_total_revenue = float(neutral_baseline_economics["total_revenue"].sum())
+    neutral_total_profit = float(neutral_baseline_economics["profit"].sum())
+    delta_summary_neutral_vs_current = pd.DataFrame(
+        [
+            {
+                "neutral_total_demand": neutral_total_demand,
+                "as_is_total_demand": as_is_total_demand,
+                "demand_delta_abs": as_is_total_demand - neutral_total_demand,
+                "demand_delta_pct": 0.0 if abs(neutral_total_demand) < 1e-9 else (as_is_total_demand - neutral_total_demand) / neutral_total_demand,
+                "neutral_total_revenue": neutral_total_revenue,
+                "as_is_total_revenue": baseline_total_revenue,
+                "revenue_delta_abs": baseline_total_revenue - neutral_total_revenue,
+                "revenue_delta_pct": 0.0 if abs(neutral_total_revenue) < 1e-9 else (baseline_total_revenue - neutral_total_revenue) / neutral_total_revenue,
+                "neutral_total_profit": neutral_total_profit,
+                "as_is_total_profit": baseline_total_profit,
+                "profit_delta_abs": baseline_total_profit - neutral_total_profit,
+                "profit_delta_pct": 0.0 if abs(neutral_total_profit) < 1e-9 else (baseline_total_profit - neutral_total_profit) / neutral_total_profit,
+            }
+        ]
+    )
 
-    factor_contributions = compute_factor_contributions(target_history, future_dates, base_ctx, scn_ctx, trained_factor, factor_feature_spec if factor_model_trained else {"controllable_features": []}) if factor_model_trained else pd.DataFrame(columns=["factor_name", "multiplier_delta", "contribution_pct", "confidence", "note"])
+    current_state_contributions = compute_current_state_contributions(target_history, future_dates, neutral_ctx, current_ctx, trained_factor, factor_feature_spec if factor_model_trained else {"controllable_features": []}) if factor_model_trained else pd.DataFrame(columns=["factor_name", "from_value", "to_value", "multiplier_delta", "contribution_pct", "confidence", "note"])
+    scenario_delta_contributions = compute_scenario_delta_contributions(target_history, future_dates, current_ctx, scn_ctx, trained_factor, factor_feature_spec if factor_model_trained else {"controllable_features": []}) if factor_model_trained else pd.DataFrame(columns=["factor_name", "from_value", "to_value", "multiplier_delta", "contribution_pct", "confidence", "note"])
 
     baseline_conf = build_baseline_confidence_state(baseline_rolling.get("rolling_summary", {}))
-    factor_conf = build_factor_confidence_state(factor_backtest, ood_flags=scenario_result.get("ood_flags", []))
+    factor_role = factor_train_stats.get("factor_role", "unavailable")
+    if factor_train_scope == "pooled":
+        factor_role = "advisory_only"
+    if baseline_conf.get("level") != "high" and factor_role == "production":
+        factor_role = "advisory_only"
+    factor_conf = build_factor_confidence_state(
+        factor_backtest,
+        ood_flags=scenario_result.get("ood_flags", []),
+        baseline_level=baseline_conf.get("level", "low"),
+        scenario_outside_factor_backtest_range=("scenario_outside_factor_backtest_range" in scenario_result.get("warnings", [])),
+    )
     shock_conf = build_shock_confidence_state(shocks)
-    confidence = combine_confidence_states(baseline_conf, factor_conf, shock_conf, intervals_available=False)
+    has_current_effect = any(neutral_ctx.get(c) != current_ctx.get(c) for c in (factor_feature_spec or {}).get("controllable_features", []))
+    has_override_effect = any(current_ctx.get(c) != scn_ctx.get(c) for c in (factor_feature_spec or {}).get("controllable_features", []))
+    explainability_available = True
+    if has_current_effect and current_state_contributions.empty:
+        explainability_available = False
+    if has_override_effect and scenario_delta_contributions.empty:
+        explainability_available = False
+
+    confidence = combine_confidence_states(
+        baseline_conf,
+        factor_conf,
+        shock_conf,
+        intervals_available=False,
+        factor_role=factor_role,
+        scenario_outside_factor_backtest_range=("scenario_outside_factor_backtest_range" in scenario_result.get("warnings", [])),
+        scenario_equals_current_but_delta_nonzero=("scenario_equals_current_but_delta_nonzero" in scenario_result.get("warnings", [])),
+        explainability_available=explainability_available,
+    )
 
     excel_buffer = BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
         target_history.to_excel(writer, sheet_name="history", index=False)
-        baseline_forecast.to_excel(writer, sheet_name="baseline_forecast", index=False)
+        neutral_baseline_forecast.to_excel(writer, sheet_name="neutral_baseline_forecast", index=False)
+        as_is_forecast.to_excel(writer, sheet_name="as_is_forecast", index=False)
         scenario_forecast.to_excel(writer, sheet_name="scenario_forecast", index=False)
-        baseline_economics.to_excel(writer, sheet_name="baseline_economics", index=False)
+        neutral_baseline_economics.to_excel(writer, sheet_name="neutral_baseline_economics", index=False)
+        as_is_economics.to_excel(writer, sheet_name="as_is_economics", index=False)
         scenario_economics.to_excel(writer, sheet_name="scenario_economics", index=False)
-        delta_summary.to_excel(writer, sheet_name="delta_summary", index=False)
+        delta_summary_current_vs_scenario.to_excel(writer, sheet_name="delta_summary_current_vs_scenario", index=False)
+        delta_summary_neutral_vs_current.to_excel(writer, sheet_name="delta_summary_neutral_vs_current", index=False)
         baseline_rolling.get("rolling_metrics", pd.DataFrame()).to_excel(writer, sheet_name="baseline_rolling_metrics", index=False)
         baseline_rolling.get("rolling_diag", pd.DataFrame()).to_excel(writer, sheet_name="baseline_rolling_diag", index=False)
         (pd.DataFrame([factor_backtest]) if isinstance(factor_backtest, dict) else pd.DataFrame(factor_backtest)).to_excel(writer, sheet_name="factor_backtest", index=False)
-        factor_contributions.to_excel(writer, sheet_name="factor_contributions", index=False)
+        current_state_contributions.to_excel(writer, sheet_name="current_state_contributions", index=False)
+        scenario_delta_contributions.to_excel(writer, sheet_name="scenario_delta_contributions", index=False)
         pd.DataFrame([confidence]).to_excel(writer, sheet_name="confidence", index=False)
     excel_buffer.seek(0)
 
@@ -435,29 +533,43 @@ def run_full_pricing_analysis_v2(
         intervals_available=intervals_available,
         pooled_series_used=pooled_series_used,
         pooled_rows_used=pooled_rows_used,
-        base_ctx=base_ctx,
+        neutral_ctx=neutral_ctx,
+        current_ctx=current_ctx,
+        base_ctx=current_ctx,
         scenario_mode=scenario_result.get("scenario_mode", mode),
         scenario_effect_source=scenario_result.get("scenario_effect_source", mode),
         target_series_id=str(target_series_id),
         series_scope={c: str(target_history[c].iloc[-1]) if c in target_history.columns else "unknown" for c in SERIES_SCOPE_COLS},
         unit_price_input_type=str(unit_price_input_type),
         economics_mode=str(economics_mode),
-        baseline_forecast=baseline_forecast[["date", "baseline_pred", "baseline_lower", "baseline_upper"]].copy(),
+        neutral_baseline_forecast=neutral_baseline_forecast.copy(),
+        as_is_forecast=as_is_forecast.copy(),
+        factor_role=factor_role,
+        decision_validity="advisory_only" if confidence.get("overall_confidence") != "high" else "production_candidate",
+        baseline_forecast=neutral_baseline_forecast.copy(),
         scenario_feature_spec=scenario_feature_spec,
         feature_spec=scenario_feature_spec,
-        current_price=float(base_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])),
+        current_price=float(current_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])),
         forecast_horizon_days=int(horizon_days),
         objective_mode=str(objective_mode),
     )
 
     return {
         "history": target_history,
-        "baseline_forecast": baseline_forecast[["date", "baseline_pred", "baseline_lower", "baseline_upper"]],
+        "neutral_baseline_forecast": neutral_baseline_forecast,
+        "as_is_forecast": as_is_forecast,
+        "baseline_forecast": neutral_baseline_forecast,
         "scenario_forecast": scenario_forecast,
-        "baseline_economics": baseline_economics,
+        "neutral_baseline_economics": neutral_baseline_economics,
+        "as_is_economics": as_is_economics,
+        "baseline_economics": neutral_baseline_economics,
         "scenario_economics": scenario_economics,
-        "delta_summary": delta_summary,
-        "factor_contributions": factor_contributions,
+        "delta_summary_current_vs_scenario": delta_summary_current_vs_scenario,
+        "delta_summary_neutral_vs_current": delta_summary_neutral_vs_current,
+        "delta_summary": delta_summary_current_vs_scenario,
+        "current_state_contributions": current_state_contributions,
+        "scenario_delta_contributions": scenario_delta_contributions,
+        "factor_contributions": scenario_delta_contributions,
         "confidence": confidence,
         "excel_buffer": excel_buffer,
         "analysis_engine": "v2_decomposed_baseline_factor_shock",
@@ -474,6 +586,7 @@ def run_full_pricing_analysis_v2(
         "mode": mode,
         "scenario_mode": scenario_result.get("scenario_mode", mode),
         "scenario_effect_source": scenario_result.get("scenario_effect_source", mode),
+        "factor_role": factor_role,
         "ood_flags": ood_flags,
         "intervals_available": intervals_available,
         "target_series_id": str(target_series_id),
