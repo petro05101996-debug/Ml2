@@ -1,6 +1,6 @@
 import pandas as pd
 
-from data_adapter import build_auto_mapping, build_daily_from_transactions, build_daily_panel_from_transactions, normalize_transactions
+from data_adapter import build_auto_mapping, build_baseline_data_quality_summary, build_daily_from_transactions, build_daily_panel_from_transactions, normalize_transactions
 
 
 def test_normalize_transactions_missing_optional_columns_does_not_crash():
@@ -82,7 +82,26 @@ def test_gap_fill_no_backward_fill_leakage():
     )
     panel = build_daily_panel_from_transactions(txn)
     gap_row = panel[panel["date"] == pd.Timestamp("2025-01-02")].iloc[0]
-    assert abs(float(gap_row["price"]) - 100.0) < 1e-9
+    assert pd.isna(gap_row["price"])
+    assert pd.isna(gap_row["cost"])
+    assert pd.isna(gap_row["freight_value"])
+
+
+def test_baseline_data_quality_summary_contains_required_fields():
+    txn = pd.DataFrame(
+        {
+            "date": ["2025-01-01", "2025-01-03"],
+            "product_id": ["sku-1", "sku-1"],
+            "category": ["cat", "cat"],
+            "quantity": [1.0, 0.0],
+            "price": [100.0, 110.0],
+            "revenue": [100.0, 0.0],
+            "stock": [10.0, 0.0],
+        }
+    )
+    panel = build_daily_panel_from_transactions(txn)
+    summary = build_baseline_data_quality_summary(panel)
+    assert {"missing_date_share", "zero_sales_share", "price_unique_count", "stockout_share"}.issubset(summary.columns)
 
 
 def test_daily_panel_preserves_scope_and_series_id():

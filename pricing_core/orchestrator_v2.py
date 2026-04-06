@@ -7,10 +7,11 @@ import numpy as np
 import pandas as pd
 
 from calc_engine import compute_daily_unit_economics
-from data_adapter import SERIES_SCOPE_COLS, build_daily_panel_from_transactions, build_series_id
+from data_adapter import SERIES_SCOPE_COLS, build_baseline_data_quality_summary, build_daily_panel_from_transactions, build_series_id
 from pricing_core.baseline_features import build_baseline_feature_matrix, derive_baseline_feature_spec
 from pricing_core.baseline_model import (
     build_baseline_oof_predictions,
+    build_baseline_quality_summary,
     build_weekday_profile,
     build_weekly_baseline_oof_predictions,
     disaggregate_weekly_to_daily,
@@ -20,6 +21,7 @@ from pricing_core.baseline_model import (
     recursive_baseline_forecast,
     run_baseline_benchmark_suite,
     run_baseline_rolling_backtest,
+    select_baseline_from_benchmark_suite,
     select_best_baseline_plan,
     train_baseline_model,
     week_start,
@@ -202,6 +204,7 @@ def run_full_pricing_analysis_v2(
         raise ValueError("Target history is empty")
     target_category = str(target_history["category"].astype(str).iloc[0]) if "category" in target_history.columns else str(target_category)
     target_sku = str(target_history["product_id"].astype(str).iloc[0]) if "product_id" in target_history.columns else str(target_sku)
+    baseline_data_quality = build_baseline_data_quality_summary(target_history)
 
     unique_dates = sorted(panel_features_baseline["date"].dropna().unique())
     holdout_n = max(1, int(np.ceil(len(unique_dates) * 0.2)))
@@ -226,6 +229,9 @@ def run_full_pricing_analysis_v2(
     baseline_quality_gate: Dict[str, Any] = {}
     best_daily_strategy = "xgb_recursive"
     best_weekly_strategy = "weekly_median4w"
+    baseline_selection_result: Dict[str, Any] = {}
+    plan_selected_strategy = "median7"
+    plan_selected_granularity = "daily"
 
     if tiny_mode:
         baseline_forecast = _tiny_baseline_fallback(target_history, future_dates)
@@ -244,6 +250,8 @@ def run_full_pricing_analysis_v2(
             "selected_strategy": best_baseline_strategy,
             "selector_reason": baseline_selector_reason,
         }
+        plan_selected_strategy = str(baseline_plan_selection.get("selected_strategy", best_baseline_strategy))
+        plan_selected_granularity = str(baseline_plan_selection.get("granularity", baseline_granularity))
         baseline_strategy_selection["best_strategy"] = best_baseline_strategy
         baseline_benchmark_suite = pd.DataFrame(
             [
@@ -260,8 +268,18 @@ def run_full_pricing_analysis_v2(
                 }
             ]
         )
+        baseline_selection_result = {
+            "best_available_strategy": best_baseline_strategy,
+            "best_available_granularity": baseline_granularity,
+            "baseline_meets_quality_gate": False,
+            "baseline_rejection_reason": "tiny_history",
+            "runner_up_strategy": "",
+            "runner_up_score": np.nan,
+        }
     else:
         baseline_plan_selection = select_best_baseline_plan(panel_train, target_category, target_sku, target_series_id=str(target_series_id))
+        plan_selected_strategy = str(baseline_plan_selection.get("selected_strategy", "xgb_recursive"))
+        plan_selected_granularity = str(baseline_plan_selection.get("granularity", "daily"))
         baseline_granularity = str(baseline_plan_selection.get("granularity", "daily"))
         best_baseline_strategy = str(baseline_plan_selection.get("selected_strategy", "xgb_recursive"))
         baseline_selector_reason = str(baseline_plan_selection.get("selector_reason", "daily selected"))
@@ -274,6 +292,24 @@ def run_full_pricing_analysis_v2(
             target_sku=target_sku,
             target_series_id=str(target_series_id),
         )
+        baseline_selection_result = select_baseline_from_benchmark_suite(baseline_benchmark_suite)
+        best_baseline_strategy = str(baseline_selection_result.get("best_available_strategy", best_baseline_strategy))
+        baseline_granularity = str(baseline_selection_result.get("best_available_granularity", baseline_granularity))
+        baseline_selector_reason = (
+            f"final selected via benchmark_suite ({best_baseline_strategy}/{baseline_granularity}); "
+            f"plan suggested ({plan_selected_strategy}/{plan_selected_granularity})"
+        )
+        if not baseline_benchmark_suite.empty:
+            baseline_benchmark_suite["winner_scope"] = "rejected"
+            best_mask = (
+                (baseline_benchmark_suite["strategy"].astype(str) == best_baseline_strategy)
+                & (baseline_benchmark_suite["granularity"].astype(str) == baseline_granularity)
+            )
+            baseline_benchmark_suite.loc[best_mask, "winner_scope"] = "best_available"
+            runner_up_name = str(baseline_selection_result.get("runner_up_strategy", "") or "")
+            if runner_up_name:
+                ru = (baseline_benchmark_suite["strategy"].astype(str) == runner_up_name) & (~best_mask)
+                baseline_benchmark_suite.loc[ru, "winner_scope"] = "runner_up"
 
         base_ctx = {
             c: (target_history[c].dropna().astype(str).iloc[-1] if c in ["series_id", "product_id", "category", "region", "channel", "segment"] and c in target_history else "unknown")
@@ -304,6 +340,12 @@ def run_full_pricing_analysis_v2(
         baseline_forecast["baseline_lower"] = np.nan
         baseline_forecast["baseline_upper"] = np.nan
 
+    baseline_plan_selection["plan_selected_strategy"] = plan_selected_strategy
+    baseline_plan_selection["plan_selected_granularity"] = plan_selected_granularity
+    baseline_plan_selection["final_selected_strategy"] = best_baseline_strategy
+    baseline_plan_selection["final_selected_granularity"] = baseline_granularity
+    baseline_plan_selection["final_selection_source"] = "benchmark_suite_selection"
+
     bench_match = pd.DataFrame()
     if not baseline_benchmark_suite.empty:
         bench_match = baseline_benchmark_suite[
@@ -321,6 +363,7 @@ def run_full_pricing_analysis_v2(
             "baseline_goal_abs_bias_le_7pct": bool(r.get("goal_abs_bias_le_7pct", False)),
             "baseline_goal_sum_ratio_in_range": bool(r.get("goal_sum_ratio_in_range", False)),
             "baseline_goal_std_ratio_ge_055": bool(r.get("goal_std_ratio_ge_055", False)),
+            "baseline_rejection_reason": "" if bool(r.get("acceptance_pass", False)) else str(baseline_selection_result.get("baseline_rejection_reason", "quality_gate_failed")),
         }
     else:
         baseline_quality_gate = {
@@ -330,6 +373,7 @@ def run_full_pricing_analysis_v2(
             "baseline_goal_abs_bias_le_7pct": False,
             "baseline_goal_sum_ratio_in_range": False,
             "baseline_goal_std_ratio_ge_055": False,
+            "baseline_rejection_reason": str(baseline_selection_result.get("baseline_rejection_reason", "no_benchmark_match")),
         }
 
     factor_train_target = target_train.merge(baseline_oof[["date", "baseline_oof"]], on="date", how="left")
@@ -514,6 +558,8 @@ def run_full_pricing_analysis_v2(
     factor_role = factor_train_stats.get("factor_role", "unavailable")
     if factor_train_scope == "pooled":
         factor_role = "advisory_only"
+    if not bool(baseline_quality_gate.get("baseline_meets_quality_gate", False)):
+        factor_role = "advisory_only"
     if baseline_conf.get("level") != "high" and factor_role == "production":
         factor_role = "advisory_only"
     factor_conf = build_factor_confidence_state(
@@ -558,20 +604,26 @@ def run_full_pricing_analysis_v2(
         ]
     )
 
-    baseline_quality_summary = pd.DataFrame(
-        [
-            {
-                "baseline_strategy": best_baseline_strategy,
-                "baseline_granularity": baseline_granularity,
-                "baseline_selector_reason": baseline_selector_reason,
-                **baseline_quality_gate,
-            }
-        ]
+    baseline_quality_summary = build_baseline_quality_summary(
+        baseline_benchmark_suite,
+        {
+            "best_available_strategy": best_baseline_strategy,
+            "best_available_granularity": baseline_granularity,
+            "baseline_meets_quality_gate": baseline_quality_gate.get("baseline_meets_quality_gate", False),
+            "runner_up_strategy": baseline_selection_result.get("runner_up_strategy", ""),
+            "runner_up_score": baseline_selection_result.get("runner_up_score", np.nan),
+        },
+        baseline_selector_reason,
     )
 
     runner_up_note = "n/a"
     if not baseline_benchmark_suite.empty:
-        top2 = baseline_benchmark_suite.sort_values(["composite_score", "median_wape"]).head(2).copy()
+        bench_rank = baseline_benchmark_suite.copy()
+        if "composite_score" not in bench_rank.columns:
+            bench_rank["composite_score"] = np.nan
+        if "median_wape" not in bench_rank.columns:
+            bench_rank["median_wape"] = np.nan
+        top2 = bench_rank.sort_values(["composite_score", "median_wape"]).head(2).copy()
         if len(top2) >= 2:
             r = top2.iloc[1]
             runner_up_note = f"{r.get('strategy')} ({r.get('granularity')}) score={float(r.get('composite_score', np.nan)):.2f}"
@@ -584,7 +636,59 @@ def run_full_pricing_analysis_v2(
             {"item": "confidence_issues", "value": "; ".join([str(x) for x in confidence.get("issues", [])])},
             {"item": "scenario_equals_as_is_demand", "value": str(abs(demand_delta_pct) <= 1e-9)},
             {"item": "scenario_demand_delta_pct", "value": f"{float(demand_delta_pct) * 100.0:.2f}%"},
+            {"item": "baseline_meets_quality_gate", "value": str(bool(baseline_quality_gate.get("baseline_meets_quality_gate", False)))},
+            {"item": "baseline_rejection_reason", "value": str(baseline_quality_gate.get("baseline_rejection_reason", ""))},
         ]
+    )
+    scenario_inputs_echo = pd.DataFrame(
+        [
+            {
+                "control_name": c,
+                "current_value": current_ctx.get(c),
+                "scenario_value": scn_ctx.get(c),
+                "changed_flag": current_ctx.get(c) != scn_ctx.get(c),
+                "supported_flag": True,
+            }
+            for c in (factor_feature_spec or {}).get("controllable_features", [])
+        ]
+    )
+    if scenario_overrides:
+        known_controls = set((factor_feature_spec or {}).get("controllable_features", []))
+        for k, v in scenario_overrides.items():
+            if k not in known_controls:
+                scenario_inputs_echo = pd.concat(
+                    [
+                        scenario_inputs_echo,
+                        pd.DataFrame([{"control_name": k, "current_value": current_ctx.get(k), "scenario_value": v, "changed_flag": False, "supported_flag": False}]),
+                    ],
+                    ignore_index=True,
+                )
+
+    scenario_changed_any = bool(scenario_inputs_echo["changed_flag"].any()) if not scenario_inputs_echo.empty else False
+    unsupported_override_count = int((scenario_inputs_echo["supported_flag"] == False).sum()) if not scenario_inputs_echo.empty else 0  # noqa: E712
+    scenario_delta_zero_reason = ""
+    if abs(float(demand_delta_pct)) <= 1e-9:
+        if not scenario_overrides:
+            scenario_delta_zero_reason = "no_overrides"
+        elif unsupported_override_count > 0 and not scenario_changed_any:
+            scenario_delta_zero_reason = "unsupported_overrides"
+        elif not scenario_changed_any:
+            scenario_delta_zero_reason = "scenario_equals_current_state"
+        else:
+            scenario_delta_zero_reason = "no_material_effect"
+
+    diagnostic_summary = pd.concat(
+        [
+            diagnostic_summary,
+            pd.DataFrame(
+                [
+                    {"item": "scenario_controls_changed", "value": str(scenario_changed_any)},
+                    {"item": "scenario_unsupported_overrides", "value": str(unsupported_override_count)},
+                    {"item": "scenario_delta_zero_reason", "value": scenario_delta_zero_reason},
+                ]
+            ),
+        ],
+        ignore_index=True,
     )
 
     rolling_metrics_export = baseline_rolling.get("rolling_metrics", pd.DataFrame()).copy()
@@ -631,6 +735,8 @@ def run_full_pricing_analysis_v2(
         current_state_contributions.to_excel(writer, sheet_name="current_state_contributions", index=False)
         scenario_delta_contributions.to_excel(writer, sheet_name="scenario_delta_contributions", index=False)
         baseline_quality_summary.to_excel(writer, sheet_name="baseline_quality_summary", index=False)
+        baseline_data_quality.to_excel(writer, sheet_name="baseline_data_quality", index=False)
+        scenario_inputs_echo.to_excel(writer, sheet_name="scenario_inputs_echo", index=False)
         diagnostic_summary.to_excel(writer, sheet_name="diagnostic_summary", index=False)
         baseline_benchmark_suite.to_excel(writer, sheet_name="baseline_benchmark_suite", index=False)
         pd.DataFrame([confidence]).to_excel(writer, sheet_name="confidence", index=False)
@@ -676,6 +782,13 @@ def run_full_pricing_analysis_v2(
         baseline_selector_reason=baseline_selector_reason,
         baseline_benchmark_suite=baseline_benchmark_suite,
         baseline_quality_gate=baseline_quality_gate,
+        baseline_runner_up_strategy=str(baseline_selection_result.get("runner_up_strategy", "")),
+        baseline_runner_up_score=float(baseline_selection_result.get("runner_up_score", np.nan)),
+        final_baseline_strategy=best_baseline_strategy,
+        final_baseline_granularity=baseline_granularity,
+        final_baseline_source="benchmark_suite_selection",
+        scenario_controls_changed=scenario_changed_any,
+        scenario_delta_zero_reason=scenario_delta_zero_reason,
         mode=mode,
         ood_flags=ood_flags,
         intervals_available=intervals_available,
@@ -693,7 +806,11 @@ def run_full_pricing_analysis_v2(
         neutral_baseline_forecast=neutral_baseline_forecast.copy(),
         as_is_forecast=as_is_forecast.copy(),
         factor_role=factor_role,
-        decision_validity="advisory_only" if confidence.get("overall_confidence") != "high" else "production_candidate",
+        decision_validity=(
+            "production_candidate"
+            if (confidence.get("overall_confidence") == "high" and bool(baseline_quality_gate.get("baseline_meets_quality_gate", False)))
+            else "advisory_only"
+        ),
         baseline_forecast=neutral_baseline_forecast.copy(),
         scenario_feature_spec=scenario_feature_spec,
         feature_spec=scenario_feature_spec,
@@ -733,6 +850,15 @@ def run_full_pricing_analysis_v2(
         "baseline_strategy_selection": baseline_strategy_selection,
         "baseline_benchmark_suite": baseline_benchmark_suite,
         "baseline_quality_gate": baseline_quality_gate,
+        "baseline_runner_up_strategy": str(baseline_selection_result.get("runner_up_strategy", "")),
+        "baseline_runner_up_score": float(baseline_selection_result.get("runner_up_score", np.nan)),
+        "final_baseline_strategy": best_baseline_strategy,
+        "final_baseline_granularity": baseline_granularity,
+        "final_baseline_source": "benchmark_suite_selection",
+        "baseline_data_quality": baseline_data_quality,
+        "scenario_inputs_echo": scenario_inputs_echo,
+        "scenario_controls_changed": scenario_changed_any,
+        "scenario_delta_zero_reason": scenario_delta_zero_reason,
         "mode": mode,
         "scenario_mode": scenario_result.get("scenario_mode", mode),
         "scenario_effect_source": scenario_result.get("scenario_effect_source", mode),

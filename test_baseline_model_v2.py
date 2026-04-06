@@ -16,6 +16,7 @@ from pricing_core.baseline_model import (
     run_baseline_holdout,
     select_best_baseline_strategy,
     run_baseline_benchmark_suite,
+    select_baseline_from_benchmark_suite,
     train_baseline_model,
     week_start,
 )
@@ -149,6 +150,52 @@ def test_baseline_benchmark_suite_has_goal_columns():
         "acceptance_pass",
     }.issubset(table.columns)
     assert {"daily", "weekly"}.issubset(set(table["granularity"].astype(str)))
+    assert {"candidate_tier", "winner_scope"}.issubset(table.columns)
+
+
+def test_baseline_quality_gate_false_if_production_winner_fails_goals():
+    suite = pd.DataFrame(
+        [
+            {
+                "strategy": "median7",
+                "granularity": "daily",
+                "composite_score": 1.0,
+                "candidate_tier": "benchmark_only",
+                "acceptance_pass": True,
+                "goal_wape_median_le_25": True,
+                "goal_wape_max_le_35": True,
+                "goal_abs_bias_le_7pct": True,
+                "goal_sum_ratio_in_range": True,
+                "goal_std_ratio_ge_055": True,
+            },
+            {
+                "strategy": "xgb_recursive",
+                "granularity": "daily",
+                "composite_score": 2.0,
+                "candidate_tier": "production_candidate",
+                "acceptance_pass": False,
+                "goal_wape_median_le_25": False,
+                "goal_wape_max_le_35": True,
+                "goal_abs_bias_le_7pct": True,
+                "goal_sum_ratio_in_range": True,
+                "goal_std_ratio_ge_055": True,
+            },
+        ]
+    )
+    selected = select_baseline_from_benchmark_suite(suite)
+    assert selected["best_available_strategy"] == "xgb_recursive"
+    assert selected["baseline_meets_quality_gate"] is False
+
+
+def test_production_candidate_has_priority_over_benchmark_only():
+    suite = pd.DataFrame(
+        [
+            {"strategy": "recent_level_dow_profile", "granularity": "daily", "composite_score": 1.0, "candidate_tier": "benchmark_only", "acceptance_pass": True},
+            {"strategy": "rolling_dow_regression", "granularity": "daily", "composite_score": 1.1, "candidate_tier": "production_candidate", "acceptance_pass": True},
+        ]
+    )
+    selected = select_baseline_from_benchmark_suite(suite)
+    assert selected["best_available_strategy"] == "rolling_dow_regression"
 
 
 def test_rolling_dow_regression_does_not_explode_on_long_horizon():
