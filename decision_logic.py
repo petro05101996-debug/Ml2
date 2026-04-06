@@ -66,10 +66,61 @@ def build_decision_layer(
     data_quality: Optional[Dict[str, Any]] = None,
     base_ctx: Optional[Dict[str, Any]] = None,
     reason_hints: Optional[Dict[str, Any]] = None,
+    predictive_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     data_quality = dict(data_quality or {})
     base_ctx = dict(base_ctx or {})
     reason_hints = dict(reason_hints or {})
+    predictive_gate = dict(predictive_gate or {})
+
+    hard_block = bool(
+        predictive_gate.get("baseline_confidence") not in {None, "high"}
+        or predictive_gate.get("factor_role") not in {None, "production"}
+        or bool(predictive_gate.get("scenario_outside_factor_backtest_range", False))
+        or bool(predictive_gate.get("scenario_equals_current_but_delta_nonzero", False))
+        or bool(predictive_gate.get("baseline_is_flat_forecast", False))
+        or bool(predictive_gate.get("explainability_unavailable", False))
+    )
+    if hard_block:
+        return {
+            "decision_type": "no_decision",
+            "implementation_mode": "do_not_change",
+            "decision_strength": "weak",
+            "seller_friendly_reason": "Прогнозный контур недостаточно надёжен для изменения цены",
+            "seller_friendly_summary": "Оставьте цену без изменений и мониторьте метрики.",
+            "seller_friendly_risk": "Риск: high. Уверенность: 0/100.",
+            "seller_friendly_next_step": "Сначала улучшите данные/операционные факторы, затем пересчитайте сценарий.",
+            "guardrails_triggered": ["predictive_pre_gate"],
+            "confidence_level": "low",
+            "primary_lever": "data_quality",
+            "recommended_price": float(current_price),
+            "price_delta_pct": 0.0,
+            "expected_profit_change": 0.0,
+            "expected_revenue_change": 0.0,
+            "expected_volume_change": 0.0,
+            "conservative_view": {"scenario": "conservative", "expected_profit_change": 0.0, "expected_revenue_change": 0.0, "expected_volume_change": 0.0, "assumption": "predictive_pre_gate_block"},
+            "test_plan": "Сначала улучшите данные/операционные факторы, затем пересчитайте сценарий.",
+            "what_to_monitor": ["profit", "revenue", "volume", "margin", "conversion_proxy"],
+            "monitor_metrics": ["profit", "revenue", "volume", "margin", "conversion_proxy"],
+            "success_condition": "Достигнут приемлемый уровень данных и прогнозной надёжности.",
+            "rollback_condition": "Не применять ценовые изменения до улучшения входных данных.",
+            "success_rule": "Достигнут приемлемый уровень данных и прогнозной надёжности.",
+            "rollback_rule": "Не применять ценовые изменения до улучшения входных данных.",
+            "review_after_days": 14,
+            "why_not_more": "Прогнозный контур заблокирован pre-gate.",
+            "why_not_less": "Прогнозный контур заблокирован pre-gate.",
+            "why_not_now": "Прогнозный контур заблокирован pre-gate.",
+            "assumptions": [],
+            "seller_notes": [],
+            "when_not_to_use": [],
+            "risk_level": "high",
+            "key_driver_positive": "Недоступно при pre-gate",
+            "key_driver_negative": "predictive_pre_gate",
+            "reason_why_this_scenario_wins": "Решение заблокировано до улучшения надежности",
+            "absolute_lift_threshold": DECISION_DEFAULTS["absolute_lift_threshold"],
+            "relative_lift_threshold": DECISION_DEFAULTS["relative_lift_threshold"],
+            "minimum_meaningful_lift_passed": False,
+        }
 
     current_price = float(current_price)
     recommended_price = float(recommended_price)

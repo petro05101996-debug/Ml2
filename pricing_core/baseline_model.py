@@ -124,6 +124,30 @@ def recursive_baseline_forecast_dow_median8w(base_history: pd.DataFrame, future_
     return pd.DataFrame(rows)
 
 
+def recursive_baseline_forecast_recent_level_dow_profile(base_history: pd.DataFrame, future_dates_df: pd.DataFrame) -> pd.DataFrame:
+    hist = base_history.copy()
+    hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
+    hist["sales"] = pd.to_numeric(hist.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    hist = hist.dropna(subset=["date"]).sort_values("date")
+    if hist.empty:
+        return pd.DataFrame({"date": pd.to_datetime(future_dates_df["date"]), "baseline_pred": 0.0})
+
+    recent_28 = hist.tail(28)["sales"]
+    recent_7 = hist.tail(7)["sales"]
+    eps = 1e-6
+    recent_level = float(recent_28.mean()) if len(recent_28) else float(hist["sales"].mean())
+    short_term_correction = float(recent_7.median() / max(float(recent_28.mean()) if len(recent_28) else recent_level, eps))
+    base_level = max(0.0, recent_level * short_term_correction)
+    dow_profile = build_weekday_profile(hist, lookback_weeks=8, smoothing=0.5)
+    dow_weights = (dow_profile * 7.0).reindex(range(7), fill_value=1.0)
+
+    rows: List[Dict[str, Any]] = []
+    for dt in pd.to_datetime(future_dates_df["date"], errors="coerce"):
+        dow = int(pd.Timestamp(dt).dayofweek)
+        rows.append({"date": pd.Timestamp(dt), "baseline_pred": max(0.0, base_level * float(dow_weights.get(dow, 1.0)))})
+    return pd.DataFrame(rows)
+
+
 def week_start(series: pd.Series) -> pd.Series:
     dt = pd.to_datetime(series, errors="coerce")
     return dt - pd.to_timedelta(dt.dt.dayofweek.fillna(0).astype(int), unit="D")
@@ -266,10 +290,12 @@ def forecast_baseline_by_strategy(
         return recursive_baseline_forecast_mean28(base_history, future_dates_df)
     if s == "dow_median8w":
         return recursive_baseline_forecast_dow_median8w(base_history, future_dates_df)
+    if s == "recent_level_dow_profile":
+        return recursive_baseline_forecast_recent_level_dow_profile(base_history, future_dates_df)
     raise ValueError(f"Unknown baseline strategy: {s}")
 
 
-def run_baseline_holdout(actual: pd.Series, pred: pd.Series) -> Dict[str, float]:
+def run_baseline_holdout(actual: pd.Series, pred: pd.Series, dates: pd.Series | None = None) -> Dict[str, float]:
     a = pd.to_numeric(actual, errors="coerce").fillna(0.0)
     p = pd.to_numeric(pred, errors="coerce").fillna(0.0)
     denom = float(np.abs(a).sum())
@@ -279,7 +305,59 @@ def run_baseline_holdout(actual: pd.Series, pred: pd.Series) -> Dict[str, float]
     asum, psum = float(a.sum()), float(p.sum())
     bias_pct = 0.0 if abs(asum) <= 1e-9 else float((psum - asum) / asum)
     sum_ratio = 0.0 if abs(asum) <= 1e-9 else float(psum / asum)
-    return {"forecast_wape": wape, "mae": mae, "rmse": rmse, "bias_pct": bias_pct, "sum_ratio": sum_ratio}
+    pred_std = float(p.std(ddof=0)) if len(p) else 0.0
+    actual_std = float(a.std(ddof=0)) if len(a) else 0.0
+    std_ratio = float(pred_std / max(actual_std, 1e-9))
+    pred_nunique = int(p.nunique(dropna=True))
+    actual_nunique = int(a.nunique(dropna=True))
+    is_flat_forecast = bool(pred_nunique <= 2 and std_ratio < 0.35 and actual_nunique >= 5)
+    weekday_shape_error = 0.0
+    if len(a) and dates is not None:
+        dts = pd.to_datetime(dates, errors="coerce")
+        dow = dts.dt.dayofweek
+        valid = dow.notna()
+        dow = dow[valid].astype(int)
+        a = a[valid]
+        p = p[valid]
+        a_share = pd.Series(a.values).groupby(dow).sum()
+        p_share = pd.Series(p.values).groupby(dow).sum()
+        a_share = a_share.reindex(range(7), fill_value=0.0)
+        p_share = p_share.reindex(range(7), fill_value=0.0)
+        if float(a_share.sum()) > 1e-9 and float(p_share.sum()) > 1e-9:
+            a_share = a_share / float(a_share.sum())
+            p_share = p_share / float(p_share.sum())
+            weekday_shape_error = float(np.abs(a_share - p_share).mean())
+    elif len(a):
+        weekday_shape_error = np.nan
+    return {
+        "forecast_wape": wape,
+        "mae": mae,
+        "rmse": rmse,
+        "bias_pct": bias_pct,
+        "sum_ratio": sum_ratio,
+        "pred_std": pred_std,
+        "actual_std": actual_std,
+        "std_ratio": std_ratio,
+        "pred_nunique": pred_nunique,
+        "actual_nunique": actual_nunique,
+        "is_flat_forecast": is_flat_forecast,
+        "weekday_shape_error": weekday_shape_error,
+    }
+
+
+def _safe_log(x: float) -> float:
+    return float(np.log(max(x, 1e-9)))
+
+
+def _composite_score(row: pd.Series) -> float:
+    return float(
+        row.get("median_wape", np.inf)
+        + 25.0 * abs(float(row.get("median_bias_pct", 0.0)))
+        + 15.0 * abs(_safe_log(float(row.get("median_sum_ratio", 1.0))))
+        + 12.0 * float(row.get("flat_window_share", 0.0))
+        + 10.0 * max(0.0, 0.60 - float(row.get("median_std_ratio", 0.0)))
+        + 8.0 * float(row.get("median_weekday_shape_error", 0.0))
+    )
 
 
 def run_baseline_rolling_backtest(
@@ -318,7 +396,7 @@ def run_baseline_rolling_backtest(
         merged["window_start"] = ws
         merged["window_end"] = we
         diag_rows.append(merged)
-        metric_rows.append({"window_id": i, "window_start": ws, "window_end": we, **run_baseline_holdout(merged["sales"], merged["baseline_pred"])})
+        metric_rows.append({"window_id": i, "window_start": ws, "window_end": we, **run_baseline_holdout(merged["sales"], merged["baseline_pred"], dates=merged["date"])})
     rolling_diag = pd.concat(diag_rows, ignore_index=True) if diag_rows else pd.DataFrame(columns=["date", "sales", "baseline_pred", "window_id", "window_start", "window_end"])
     rolling_metrics = pd.DataFrame(metric_rows)
     summary = {
@@ -328,6 +406,9 @@ def run_baseline_rolling_backtest(
         "median_bias_pct": float(rolling_metrics["bias_pct"].median()) if len(rolling_metrics) else np.nan,
         "median_sum_ratio": float(rolling_metrics["sum_ratio"].median()) if len(rolling_metrics) else np.nan,
         "max_wape": float(rolling_metrics["forecast_wape"].max()) if len(rolling_metrics) else np.nan,
+        "median_std_ratio": float(rolling_metrics["std_ratio"].median()) if len(rolling_metrics) else np.nan,
+        "flat_window_share": float(pd.to_numeric(rolling_metrics.get("is_flat_forecast", False), errors="coerce").fillna(0.0).mean()) if len(rolling_metrics) else np.nan,
+        "median_weekday_shape_error": float(rolling_metrics["weekday_shape_error"].median()) if len(rolling_metrics) else np.nan,
     }
     return {"rolling_diag": rolling_diag, "rolling_metrics": rolling_metrics, "rolling_summary": summary}
 
@@ -341,7 +422,7 @@ def select_best_baseline_strategy(
     window_days: int = 28,
     min_train_days: int = 120,
 ) -> Dict[str, Any]:
-    strategies = ["xgb_recursive", "median7", "mean28", "dow_median8w"]
+    strategies = ["xgb_recursive", "median7", "mean28", "dow_median8w", "recent_level_dow_profile"]
     metrics_rows: List[pd.DataFrame] = []
     summary_rows: List[Dict[str, Any]] = []
 
@@ -369,6 +450,9 @@ def select_best_baseline_strategy(
                 "median_bias_pct": float(rs.get("median_bias_pct", np.nan)),
                 "median_sum_ratio": float(rs.get("median_sum_ratio", np.nan)),
                 "max_wape": float(rs.get("max_wape", np.nan)),
+                "median_std_ratio": float(rs.get("median_std_ratio", np.nan)),
+                "flat_window_share": float(rs.get("flat_window_share", np.nan)),
+                "median_weekday_shape_error": float(rs.get("median_weekday_shape_error", np.nan)),
             }
         )
 
@@ -378,8 +462,29 @@ def select_best_baseline_strategy(
     if valid.empty:
         best_strategy = "xgb_recursive"
     else:
-        valid["abs_median_bias_pct"] = valid["median_bias_pct"].abs()
-        valid = valid.sort_values(["median_wape", "abs_median_bias_pct"], ascending=[True, True])
+        valid["score"] = valid.apply(_composite_score, axis=1)
+        non_flat = valid[valid["flat_window_share"].fillna(1.0) <= 0.5].copy()
+        if not non_flat.empty:
+            valid = non_flat
+        valid = valid.sort_values(["score", "median_wape"], ascending=[True, True])
+        if str(valid.iloc[0]["strategy"]) == "xgb_recursive":
+            simple = valid[valid["strategy"] != "xgb_recursive"].copy()
+            if not simple.empty:
+                runner = simple.sort_values(["score", "median_wape"]).iloc[0]
+                xgb = valid.iloc[0]
+                wape_gain = float(runner["median_wape"] - xgb["median_wape"])
+                if not (
+                    wape_gain >= 1.5
+                    and float(xgb["flat_window_share"]) <= 0.33
+                    and float(xgb["median_std_ratio"]) >= 0.55
+                    and abs(float(xgb["median_bias_pct"])) <= 0.08
+                ):
+                    best_strategy = str(runner["strategy"])
+                    return {
+                        "best_strategy": best_strategy,
+                        "strategy_metrics": strategy_metrics,
+                        "strategy_summary": strategy_summary,
+                    }
         best_strategy = str(valid.iloc[0]["strategy"])
     return {
         "best_strategy": best_strategy,
@@ -432,7 +537,7 @@ def run_weekly_baseline_rolling_backtest(
             merged["strategy"] = s
             diag_by_strategy[s].append(merged)
 
-            metric = run_baseline_holdout(merged["sales"], merged["baseline_pred"])
+            metric = run_baseline_holdout(merged["sales"], merged["baseline_pred"], dates=merged["date"])
             metrics_rows.append({"strategy": s, "window_id": i, "window_start": ws, "window_end": we, **metric})
 
             pred_map = dict(zip(pd.to_datetime(daily_fc["date"]), pd.to_numeric(daily_fc["baseline_pred"], errors="coerce")))
@@ -453,6 +558,9 @@ def run_weekly_baseline_rolling_backtest(
                 "median_bias_pct": float(m["bias_pct"].median()) if len(m) else np.nan,
                 "median_sum_ratio": float(m["sum_ratio"].median()) if len(m) else np.nan,
                 "max_wape": float(m["forecast_wape"].max()) if len(m) else np.nan,
+                "median_std_ratio": float(m["std_ratio"].median()) if len(m) else np.nan,
+                "flat_window_share": float(pd.to_numeric(m.get("is_flat_forecast", False), errors="coerce").fillna(0.0).mean()) if len(m) else np.nan,
+                "median_weekday_shape_error": float(m["weekday_shape_error"].median()) if len(m) else np.nan,
             }
         )
     strategy_summary = pd.DataFrame(summary_rows)
@@ -460,8 +568,8 @@ def run_weekly_baseline_rolling_backtest(
     if valid.empty:
         best_strategy = "weekly_median4w"
     else:
-        valid["abs_median_bias_pct"] = valid["median_bias_pct"].abs()
-        valid = valid.sort_values(["median_wape", "abs_median_bias_pct"], ascending=[True, True])
+        valid["score"] = valid.apply(_composite_score, axis=1)
+        valid = valid.sort_values(["score", "median_wape"], ascending=[True, True])
         best_strategy = str(valid.iloc[0]["strategy"])
 
     best_metrics = strategy_metrics[strategy_metrics["strategy"] == best_strategy].copy()
@@ -474,6 +582,9 @@ def run_weekly_baseline_rolling_backtest(
         "median_bias_pct": float(best_summary_row["median_bias_pct"].iloc[0]) if len(best_summary_row) else np.nan,
         "median_sum_ratio": float(best_summary_row["median_sum_ratio"].iloc[0]) if len(best_summary_row) else np.nan,
         "max_wape": float(best_summary_row["max_wape"].iloc[0]) if len(best_summary_row) else np.nan,
+        "median_std_ratio": float(best_summary_row["median_std_ratio"].iloc[0]) if len(best_summary_row) else np.nan,
+        "flat_window_share": float(best_summary_row["flat_window_share"].iloc[0]) if len(best_summary_row) else np.nan,
+        "median_weekday_shape_error": float(best_summary_row["median_weekday_shape_error"].iloc[0]) if len(best_summary_row) else np.nan,
     }
     return {
         "best_strategy": best_strategy,
@@ -520,20 +631,28 @@ def select_best_baseline_plan(
     daily_best = str(daily_selection.get("best_strategy", "xgb_recursive"))
     daily_row = daily_summary[daily_summary["strategy"] == daily_best] if not daily_summary.empty else pd.DataFrame()
     daily_wape = float(daily_row["median_wape"].iloc[0]) if len(daily_row) else np.inf
+    daily_score = float(daily_row.apply(_composite_score, axis=1).iloc[0]) if len(daily_row) else np.inf
 
     weekly_summary = weekly_selection.get("strategy_summary", pd.DataFrame())
     weekly_best = str(weekly_selection.get("best_strategy", "weekly_median4w"))
     weekly_row = weekly_summary[weekly_summary["strategy"] == weekly_best] if not weekly_summary.empty else pd.DataFrame()
     weekly_wape = float(weekly_row["median_wape"].iloc[0]) if len(weekly_row) else np.inf
-
-    weekly_beats_with_margin = np.isfinite(weekly_wape) and np.isfinite(daily_wape) and (weekly_wape + 2.0 < daily_wape)
+    weekly_score = float(weekly_row.apply(_composite_score, axis=1).iloc[0]) if len(weekly_row) else np.inf
+    weekly_bad = False
+    if len(weekly_row):
+        weekly_bad = bool(
+            float(weekly_row["flat_window_share"].iloc[0]) > 0.5
+            or float(weekly_row["median_std_ratio"].iloc[0]) < 0.4
+            or float(weekly_row["median_weekday_shape_error"].iloc[0]) > 0.2
+        )
+    weekly_beats_with_margin = np.isfinite(weekly_score) and np.isfinite(daily_score) and (weekly_score + 1e-9 < daily_score) and not weekly_bad
     granularity = "weekly" if weekly_beats_with_margin else "daily"
     selected_strategy = weekly_best if granularity == "weekly" else daily_best
     selected_median_wape = weekly_wape if granularity == "weekly" else daily_wape
     reason = (
-        f"weekly selected: median_wape {weekly_wape:.2f} vs daily {daily_wape:.2f}"
+        f"weekly selected: composite {weekly_score:.2f} vs daily {daily_score:.2f}"
         if granularity == "weekly"
-        else f"daily selected: median_wape {daily_wape:.2f} vs weekly {weekly_wape:.2f}"
+        else f"daily selected: composite {daily_score:.2f} vs weekly {weekly_score:.2f}"
     )
 
     return {
