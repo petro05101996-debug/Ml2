@@ -44,14 +44,14 @@ def test_v2_confidence_has_all_layers():
 def test_v2_excel_contains_required_sheets():
     out = run_full_pricing_analysis_v2(_txn(), "cat", "sku-1", horizon_days=7)
     xls = pd.ExcelFile(out["excel_buffer"])
-    required = {"history", "neutral_baseline_forecast", "as_is_forecast", "scenario_forecast", "neutral_baseline_economics", "as_is_economics", "scenario_economics", "delta_summary_current_vs_scenario", "delta_summary_neutral_vs_current", "baseline_rolling_metrics", "baseline_rolling_diag", "factor_backtest", "current_state_contributions", "scenario_delta_contributions", "confidence"}
+    required = {"history", "neutral_baseline_forecast", "as_is_forecast", "scenario_forecast", "neutral_baseline_economics", "as_is_economics", "scenario_economics", "delta_summary_current_vs_scenario", "delta_summary_neutral_vs_current", "baseline_rolling_metrics", "baseline_rolling_diag", "baseline_benchmark_suite", "baseline_quality_summary", "diagnostic_summary", "factor_backtest", "current_state_contributions", "scenario_delta_contributions", "confidence", "confidence_flat"}
     assert required.issubset(set(xls.sheet_names))
 
 
 def test_v2_uses_final_baseline_model_for_forecast():
     out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
     b = out["_trained_bundle"]
-    assert b.get("baseline_strategy") in {"xgb_recursive", "median7", "mean28", "dow_median8w", "recent_level_dow_profile", "weekly_median4w", "weekly_recent4_avg", "weekly_mean8w"}
+    assert b.get("baseline_strategy") in {"xgb_recursive", "median7", "mean28", "dow_median8w", "recent_level_dow_profile", "recent_level_dow_trend", "rolling_dow_regression", "ets_seasonal7", "weekly_median4w", "weekly_recent4_avg", "weekly_mean8w"}
     if b.get("baseline_strategy") == "xgb_recursive" and b.get("baseline_granularity") != "weekly":
         assert b.get("trained_baseline_bt") is not None
         assert b.get("trained_baseline_final") is not None
@@ -147,6 +147,29 @@ def test_v2_bundle_contains_base_ctx_and_scenario_feature_spec():
     assert "neutral_ctx" in b
     assert "current_ctx" in b
     assert "scenario_feature_spec" in b
+
+
+def test_v2_outputs_baseline_benchmark_and_quality_gate():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
+    assert not out["baseline_benchmark_suite"].empty
+    assert {"granularity", "acceptance_pass"}.issubset(out["baseline_benchmark_suite"].columns)
+    assert {
+        "baseline_meets_quality_gate",
+        "baseline_goal_wape_median_le_25",
+        "baseline_goal_wape_max_le_35",
+        "baseline_goal_abs_bias_le_7pct",
+        "baseline_goal_sum_ratio_in_range",
+        "baseline_goal_std_ratio_ge_055",
+    }.issubset(out["baseline_quality_gate"].keys())
+
+
+def test_v2_rolling_export_contains_required_columns():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
+    xls = pd.ExcelFile(out["excel_buffer"])
+    roll = pd.read_excel(xls, sheet_name="baseline_rolling_metrics")
+    diag = pd.read_excel(xls, sheet_name="baseline_rolling_diag")
+    assert {"window_id", "window_start", "window_end", "forecast_wape", "mae", "rmse", "bias_pct", "sum_ratio", "pred_std", "actual_std", "std_ratio", "pred_nunique", "actual_nunique", "is_flat_forecast", "weekday_shape_error"}.issubset(roll.columns)
+    assert {"date", "sales", "baseline_pred", "window_id", "window_start", "window_end"}.issubset(diag.columns)
 
 
 def test_cost_and_freight_do_not_change_demand_v2():
