@@ -18,6 +18,7 @@ from pricing_core.baseline_model import (
     forecast_baseline_by_strategy,
     aggregate_daily_to_weekly,
     recursive_baseline_forecast,
+    run_baseline_benchmark_suite,
     run_baseline_rolling_backtest,
     select_best_baseline_plan,
     train_baseline_model,
@@ -98,7 +99,25 @@ def _assess_factor_trainability(factor_train: pd.DataFrame, factor_feature_spec:
 def _build_empty_baseline_rolling() -> Dict[str, Any]:
     return {
         "rolling_diag": pd.DataFrame(),
-        "rolling_metrics": pd.DataFrame(),
+        "rolling_metrics": pd.DataFrame(
+            columns=[
+                "window_id",
+                "window_start",
+                "window_end",
+                "forecast_wape",
+                "mae",
+                "rmse",
+                "bias_pct",
+                "sum_ratio",
+                "pred_std",
+                "actual_std",
+                "std_ratio",
+                "pred_nunique",
+                "actual_nunique",
+                "is_flat_forecast",
+                "weekday_shape_error",
+            ]
+        ),
         "rolling_summary": {
             "n_valid_windows": 0,
             "median_wape": np.nan,
@@ -203,6 +222,8 @@ def run_full_pricing_analysis_v2(
     baseline_selector_reason = "daily selected: tiny_mode fallback"
     baseline_plan_selection = {"granularity": "daily", "selected_strategy": "median7"}
     baseline_strategy_selection = {"best_strategy": "xgb_recursive", "strategy_metrics": pd.DataFrame(), "strategy_summary": pd.DataFrame()}
+    baseline_benchmark_suite = pd.DataFrame()
+    baseline_quality_gate: Dict[str, Any] = {}
     best_daily_strategy = "xgb_recursive"
     best_weekly_strategy = "weekly_median4w"
 
@@ -224,6 +245,21 @@ def run_full_pricing_analysis_v2(
             "selector_reason": baseline_selector_reason,
         }
         baseline_strategy_selection["best_strategy"] = best_baseline_strategy
+        baseline_benchmark_suite = pd.DataFrame(
+            [
+                {
+                    "strategy": best_baseline_strategy,
+                    "granularity": "daily",
+                    "composite_score": np.nan,
+                    "goal_wape_median_le_25": False,
+                    "goal_wape_max_le_35": False,
+                    "goal_abs_bias_le_7pct": False,
+                    "goal_sum_ratio_in_range": False,
+                    "goal_std_ratio_ge_055": False,
+                    "acceptance_pass": False,
+                }
+            ]
+        )
     else:
         baseline_plan_selection = select_best_baseline_plan(panel_train, target_category, target_sku, target_series_id=str(target_series_id))
         baseline_granularity = str(baseline_plan_selection.get("granularity", "daily"))
@@ -232,6 +268,12 @@ def run_full_pricing_analysis_v2(
         baseline_strategy_selection = baseline_plan_selection.get("daily_selection", baseline_strategy_selection)
         best_daily_strategy = str(baseline_plan_selection.get("best_daily_strategy", baseline_strategy_selection.get("best_strategy", "xgb_recursive")))
         best_weekly_strategy = str(baseline_plan_selection.get("best_weekly_strategy", best_weekly_strategy))
+        baseline_benchmark_suite = run_baseline_benchmark_suite(
+            panel_train=panel_train,
+            target_category=target_category,
+            target_sku=target_sku,
+            target_series_id=str(target_series_id),
+        )
 
         base_ctx = {
             c: (target_history[c].dropna().astype(str).iloc[-1] if c in ["series_id", "product_id", "category", "region", "channel", "segment"] and c in target_history else "unknown")
@@ -261,6 +303,34 @@ def run_full_pricing_analysis_v2(
             baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, target_series_id=str(target_series_id), strategy=best_baseline_strategy)
         baseline_forecast["baseline_lower"] = np.nan
         baseline_forecast["baseline_upper"] = np.nan
+
+    bench_match = pd.DataFrame()
+    if not baseline_benchmark_suite.empty:
+        bench_match = baseline_benchmark_suite[
+            (baseline_benchmark_suite["strategy"].astype(str) == str(best_baseline_strategy))
+            & (baseline_benchmark_suite["granularity"].astype(str) == str(baseline_granularity))
+        ].copy()
+        if bench_match.empty:
+            bench_match = baseline_benchmark_suite[baseline_benchmark_suite["strategy"].astype(str) == str(best_baseline_strategy)].copy()
+    if not bench_match.empty:
+        r = bench_match.iloc[0]
+        baseline_quality_gate = {
+            "baseline_meets_quality_gate": bool(r.get("acceptance_pass", False)),
+            "baseline_goal_wape_median_le_25": bool(r.get("goal_wape_median_le_25", False)),
+            "baseline_goal_wape_max_le_35": bool(r.get("goal_wape_max_le_35", False)),
+            "baseline_goal_abs_bias_le_7pct": bool(r.get("goal_abs_bias_le_7pct", False)),
+            "baseline_goal_sum_ratio_in_range": bool(r.get("goal_sum_ratio_in_range", False)),
+            "baseline_goal_std_ratio_ge_055": bool(r.get("goal_std_ratio_ge_055", False)),
+        }
+    else:
+        baseline_quality_gate = {
+            "baseline_meets_quality_gate": False,
+            "baseline_goal_wape_median_le_25": False,
+            "baseline_goal_wape_max_le_35": False,
+            "baseline_goal_abs_bias_le_7pct": False,
+            "baseline_goal_sum_ratio_in_range": False,
+            "baseline_goal_std_ratio_ge_055": False,
+        }
 
     factor_train_target = target_train.merge(baseline_oof[["date", "baseline_oof"]], on="date", how="left")
     factor_feature_spec_target = derive_factor_feature_spec(factor_train_target)
@@ -471,6 +541,78 @@ def run_full_pricing_analysis_v2(
         scenario_equals_current_but_delta_nonzero=("scenario_equals_current_but_delta_nonzero" in scenario_result.get("warnings", [])),
         explainability_available=explainability_available,
     )
+    confidence.update(baseline_quality_gate)
+
+    confidence_flat = pd.DataFrame(
+        [
+            {
+                "overall_confidence": confidence.get("overall_confidence"),
+                "issues": "; ".join([str(x) for x in confidence.get("issues", [])]),
+                "intervals_available": bool(confidence.get("intervals_available", False)),
+                "baseline_confidence_level": confidence.get("baseline_confidence", {}).get("level"),
+                "factor_confidence_level": confidence.get("factor_confidence", {}).get("level"),
+                "shock_confidence_level": confidence.get("shock_confidence", {}).get("level"),
+                "factor_role": factor_role,
+                **baseline_quality_gate,
+            }
+        ]
+    )
+
+    baseline_quality_summary = pd.DataFrame(
+        [
+            {
+                "baseline_strategy": best_baseline_strategy,
+                "baseline_granularity": baseline_granularity,
+                "baseline_selector_reason": baseline_selector_reason,
+                **baseline_quality_gate,
+            }
+        ]
+    )
+
+    runner_up_note = "n/a"
+    if not baseline_benchmark_suite.empty:
+        top2 = baseline_benchmark_suite.sort_values(["composite_score", "median_wape"]).head(2).copy()
+        if len(top2) >= 2:
+            r = top2.iloc[1]
+            runner_up_note = f"{r.get('strategy')} ({r.get('granularity')}) score={float(r.get('composite_score', np.nan)):.2f}"
+    diagnostic_summary = pd.DataFrame(
+        [
+            {"item": "selected_baseline", "value": f"{best_baseline_strategy} ({baseline_granularity})"},
+            {"item": "selector_reason", "value": baseline_selector_reason},
+            {"item": "runner_up", "value": runner_up_note},
+            {"item": "overall_confidence", "value": str(confidence.get("overall_confidence", "low"))},
+            {"item": "confidence_issues", "value": "; ".join([str(x) for x in confidence.get("issues", [])])},
+            {"item": "scenario_equals_as_is_demand", "value": str(abs(demand_delta_pct) <= 1e-9)},
+            {"item": "scenario_demand_delta_pct", "value": f"{float(demand_delta_pct) * 100.0:.2f}%"},
+        ]
+    )
+
+    rolling_metrics_export = baseline_rolling.get("rolling_metrics", pd.DataFrame()).copy()
+    rolling_diag_export = baseline_rolling.get("rolling_diag", pd.DataFrame()).copy()
+    required_roll_cols = [
+        "window_id",
+        "window_start",
+        "window_end",
+        "forecast_wape",
+        "mae",
+        "rmse",
+        "bias_pct",
+        "sum_ratio",
+        "pred_std",
+        "actual_std",
+        "std_ratio",
+        "pred_nunique",
+        "actual_nunique",
+        "is_flat_forecast",
+        "weekday_shape_error",
+    ]
+    for c in required_roll_cols:
+        if c not in rolling_metrics_export.columns:
+            rolling_metrics_export[c] = np.nan
+    required_diag_cols = ["date", "sales", "baseline_pred", "window_id", "window_start", "window_end"]
+    for c in required_diag_cols:
+        if c not in rolling_diag_export.columns:
+            rolling_diag_export[c] = np.nan
 
     excel_buffer = BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
@@ -483,12 +625,16 @@ def run_full_pricing_analysis_v2(
         scenario_economics.to_excel(writer, sheet_name="scenario_economics", index=False)
         delta_summary_current_vs_scenario.to_excel(writer, sheet_name="delta_summary_current_vs_scenario", index=False)
         delta_summary_neutral_vs_current.to_excel(writer, sheet_name="delta_summary_neutral_vs_current", index=False)
-        baseline_rolling.get("rolling_metrics", pd.DataFrame()).to_excel(writer, sheet_name="baseline_rolling_metrics", index=False)
-        baseline_rolling.get("rolling_diag", pd.DataFrame()).to_excel(writer, sheet_name="baseline_rolling_diag", index=False)
+        rolling_metrics_export[required_roll_cols].to_excel(writer, sheet_name="baseline_rolling_metrics", index=False)
+        rolling_diag_export[required_diag_cols].to_excel(writer, sheet_name="baseline_rolling_diag", index=False)
         (pd.DataFrame([factor_backtest]) if isinstance(factor_backtest, dict) else pd.DataFrame(factor_backtest)).to_excel(writer, sheet_name="factor_backtest", index=False)
         current_state_contributions.to_excel(writer, sheet_name="current_state_contributions", index=False)
         scenario_delta_contributions.to_excel(writer, sheet_name="scenario_delta_contributions", index=False)
+        baseline_quality_summary.to_excel(writer, sheet_name="baseline_quality_summary", index=False)
+        diagnostic_summary.to_excel(writer, sheet_name="diagnostic_summary", index=False)
+        baseline_benchmark_suite.to_excel(writer, sheet_name="baseline_benchmark_suite", index=False)
         pd.DataFrame([confidence]).to_excel(writer, sheet_name="confidence", index=False)
+        confidence_flat.to_excel(writer, sheet_name="confidence_flat", index=False)
     excel_buffer.seek(0)
 
     mode = scenario_result.get("mode", "baseline_only")
@@ -528,6 +674,8 @@ def run_full_pricing_analysis_v2(
         best_daily_strategy=best_daily_strategy,
         best_weekly_strategy=best_weekly_strategy,
         baseline_selector_reason=baseline_selector_reason,
+        baseline_benchmark_suite=baseline_benchmark_suite,
+        baseline_quality_gate=baseline_quality_gate,
         mode=mode,
         ood_flags=ood_flags,
         intervals_available=intervals_available,
@@ -583,6 +731,8 @@ def run_full_pricing_analysis_v2(
         "best_weekly_strategy": best_weekly_strategy,
         "baseline_selector_reason": baseline_selector_reason,
         "baseline_strategy_selection": baseline_strategy_selection,
+        "baseline_benchmark_suite": baseline_benchmark_suite,
+        "baseline_quality_gate": baseline_quality_gate,
         "mode": mode,
         "scenario_mode": scenario_result.get("scenario_mode", mode),
         "scenario_effect_source": scenario_result.get("scenario_effect_source", mode),

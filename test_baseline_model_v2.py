@@ -4,6 +4,7 @@ import pandas as pd
 from data_adapter import build_daily_panel_from_transactions
 from pricing_core.baseline_features import build_baseline_feature_matrix, derive_baseline_feature_spec
 from pricing_core.baseline_model import (
+    _composite_score,
     aggregate_daily_to_weekly,
     build_baseline_oof_predictions,
     build_weekday_profile,
@@ -14,6 +15,7 @@ from pricing_core.baseline_model import (
     run_baseline_rolling_backtest,
     run_baseline_holdout,
     select_best_baseline_strategy,
+    run_baseline_benchmark_suite,
     train_baseline_model,
     week_start,
 )
@@ -111,9 +113,9 @@ def test_weekly_plan_selected_only_when_margin_beats_daily():
     plan = select_best_baseline_plan(fm, "cat", "sku-1")
     daily = plan["daily_selection"]["strategy_summary"]
     weekly = plan["weekly_selection"]["strategy_summary"]
-    daily_wape = float(daily[daily["strategy"] == plan["best_daily_strategy"]]["median_wape"].iloc[0])
-    weekly_wape = float(weekly[weekly["strategy"] == plan["best_weekly_strategy"]]["median_wape"].iloc[0])
-    if weekly_wape + 2.0 < daily_wape:
+    daily_score = float(daily[daily["strategy"] == plan["best_daily_strategy"]].apply(_composite_score, axis=1).iloc[0])
+    weekly_score = float(weekly[weekly["strategy"] == plan["best_weekly_strategy"]].apply(_composite_score, axis=1).iloc[0])
+    if weekly_score < daily_score:
         assert plan["granularity"] == "weekly"
     else:
         assert plan["granularity"] == "daily"
@@ -123,6 +125,46 @@ def test_recent_level_dow_profile_strategy_runs():
     fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(220)))
     out = run_baseline_rolling_backtest(fm, "cat", "sku-1", strategy="recent_level_dow_profile")
     assert int(out["rolling_summary"]["n_valid_windows"]) >= 1
+
+
+def test_new_baseline_strategies_run():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(240)))
+    for strategy in ["recent_level_dow_trend", "rolling_dow_regression", "ets_seasonal7"]:
+        out = run_baseline_rolling_backtest(fm, "cat", "sku-1", strategy=strategy)
+        assert int(out["rolling_summary"]["n_valid_windows"]) >= 1
+
+
+def test_baseline_benchmark_suite_has_goal_columns():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(240)))
+    table = run_baseline_benchmark_suite(fm, "cat", "sku-1")
+    assert not table.empty
+    assert {
+        "granularity",
+        "composite_score",
+        "goal_wape_median_le_25",
+        "goal_wape_max_le_35",
+        "goal_abs_bias_le_7pct",
+        "goal_sum_ratio_in_range",
+        "goal_std_ratio_ge_055",
+        "acceptance_pass",
+    }.issubset(table.columns)
+    assert {"daily", "weekly"}.issubset(set(table["granularity"].astype(str)))
+
+
+def test_rolling_dow_regression_does_not_explode_on_long_horizon():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(280)))
+    target = fm[(fm["category"] == "cat") & (fm["product_id"] == "sku-1")].copy().sort_values("date")
+    fut = pd.DataFrame({"date": pd.date_range(target["date"].max() + pd.Timedelta(days=1), periods=45, freq="D")})
+    out = run_baseline_rolling_backtest(fm, "cat", "sku-1", strategy="rolling_dow_regression")
+    assert int(out["rolling_summary"]["n_valid_windows"]) >= 1
+    from pricing_core.baseline_model import forecast_baseline_by_strategy
+    pred = forecast_baseline_by_strategy("rolling_dow_regression", None, target, fut, {}, {})
+    s = pd.to_numeric(pred["baseline_pred"], errors="coerce")
+    recent28 = float(pd.to_numeric(target["sales"], errors="coerce").tail(28).mean())
+    assert np.isfinite(s).all()
+    assert float(s.min()) >= 0.0
+    assert float(s.max()) <= recent28 * 1.8 + 1e-9
+    assert float(s.mean()) >= recent28 * 0.45
 
 
 def test_flat_forecast_metrics_are_reported():
@@ -155,6 +197,15 @@ def test_weekly_plan_uses_composite_score_not_only_wape():
     fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(260)))
     plan = select_best_baseline_plan(fm, "cat", "sku-1")
     assert "composite" in plan["selector_reason"]
+
+
+def test_weekly_plan_rejects_bad_weekly_shape():
+    fm = build_baseline_feature_matrix(build_daily_panel_from_transactions(_txn(260)))
+    plan = select_best_baseline_plan(fm, "cat", "sku-1")
+    weekly = plan["weekly_selection"]["strategy_summary"]
+    row = weekly[weekly["strategy"] == plan["best_weekly_strategy"]].iloc[0]
+    if float(row["flat_window_share"]) > 0.5 or float(row["median_std_ratio"]) < 0.4 or float(row["median_weekday_shape_error"]) > 0.2:
+        assert plan["granularity"] == "daily"
 
 
 def test_weekly_backtest_returns_daily_oof_non_empty():
