@@ -25,6 +25,10 @@ def train_factor_model(train_df: pd.DataFrame, feature_spec: Dict[str, Any], sma
     cat = feature_spec.get("factor_categorical_features", [])
     X = clean_feature_frame(train_df, feats, feature_spec.get("factor_numeric_features", []), cat)
     y = pd.to_numeric(train_df.get("factor_target", 0.0), errors="coerce").fillna(0.0)
+    if "factor_weight" in train_df.columns:
+        sample_weight = pd.to_numeric(train_df["factor_weight"], errors="coerce").fillna(1.0).clip(lower=0.05)
+    else:
+        sample_weight = pd.Series(1.0, index=train_df.index, dtype=float)
     p = _params(training_profile, small_mode)
     if HAS_XGBOOST:
         model = XGBRegressor(
@@ -44,12 +48,12 @@ def train_factor_model(train_df: pd.DataFrame, feature_spec: Dict[str, Any], sma
         for c in cat:
             if c in X.columns:
                 X[c] = X[c].astype("category")
-        model.fit(X[feats], y)
+        model.fit(X[feats], y, sample_weight=sample_weight)
         backend, is_fallback = "xgboost", False
     else:
         X_num = pd.get_dummies(X[feats], columns=[c for c in cat if c in X.columns], dummy_na=True)
         model = HistGradientBoostingRegressor(max_depth=p["max_depth"], max_iter=p["n_estimators"], learning_rate=0.03, random_state=42)
-        model.fit(X_num, y)
+        model.fit(X_num, y, sample_weight=sample_weight)
         backend, is_fallback = "hist_gradient_boosting", True
     return {"model": model, "feature_spec": feature_spec, "model_backend": backend, "training_profile": training_profile, "is_fallback": is_fallback}
 
@@ -72,7 +76,7 @@ def predict_factor_effect(X: pd.DataFrame, trained_factor: Dict[str, Any], featu
             if c in Xc.columns:
                 Xc[c] = Xc[c].astype("category")
         log_eff = m.predict(Xc[feats])
-    mult = np.clip(np.exp(np.asarray(log_eff, dtype=float)), 0.25, 4.0)
+    mult = np.clip(np.exp(np.asarray(log_eff, dtype=float)), 0.70, 1.35)
     return pd.DataFrame({"factor_log_effect": log_eff, "factor_multiplier": mult}, index=X.index)
 
 

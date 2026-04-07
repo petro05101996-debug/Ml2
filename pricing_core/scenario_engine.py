@@ -28,6 +28,19 @@ def _last_valid_cat(df: pd.DataFrame, c: str, default: str = "unknown") -> str:
     return str(s.iloc[-1]) if len(s) else default
 
 
+def _recent_mode_or_last(df: pd.DataFrame, c: str, lookback: int = 28, default: str = "unknown") -> str:
+    if c not in df.columns:
+        return default
+    s = df[c].dropna()
+    if s.empty:
+        return default
+    tail = s.tail(lookback)
+    mode = tail.mode(dropna=True)
+    if not mode.empty:
+        return str(mode.iloc[0])
+    return str(s.astype(str).iloc[-1])
+
+
 def build_current_state_context(target_history: pd.DataFrame, factor_feature_spec: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if target_history.empty:
@@ -52,8 +65,10 @@ def build_neutral_context(target_history: pd.DataFrame, factor_feature_spec: Dic
         return out
     price_hist = pd.to_numeric(target_history.get("price", np.nan), errors="coerce").dropna()
     out["price"] = float(price_hist.tail(28).median()) if len(price_hist.tail(28)) else (float(price_hist.median()) if len(price_hist) else 0.0)
-    out["discount"] = 0.0
-    out["promotion"] = 0.0
+    discount_hist = pd.to_numeric(target_history.get("discount", np.nan), errors="coerce").dropna()
+    promo_hist = pd.to_numeric(target_history.get("promotion", np.nan), errors="coerce").dropna()
+    out["discount"] = float(discount_hist.tail(28).median()) if len(discount_hist.tail(28)) else _last_valid_numeric(target_history, "discount", 0.0)
+    out["promotion"] = float(promo_hist.tail(28).median()) if len(promo_hist.tail(28)) else _last_valid_numeric(target_history, "promotion", 0.0)
 
     controllable = set((factor_feature_spec or {}).get("controllable_features", []))
     for c in [col for col in target_history.columns if col.startswith("user_factor_num__")]:
@@ -63,7 +78,7 @@ def build_neutral_context(target_history: pd.DataFrame, factor_feature_spec: Dic
         else:
             out[c] = _last_valid_numeric(target_history, c, 0.0)
     for c in [col for col in target_history.columns if col.startswith("user_factor_cat__")]:
-        out[c] = _last_valid_cat(target_history, c, "unknown")
+        out[c] = _recent_mode_or_last(target_history, c, lookback=28, default="unknown")
     return out
 
 

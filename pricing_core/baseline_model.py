@@ -146,10 +146,10 @@ def recursive_baseline_forecast_recent_level_dow_profile(base_history: pd.DataFr
 
     recent_28 = hist.tail(28)["sales"]
     recent_7 = hist.tail(7)["sales"]
-    eps = 1e-6
-    recent_level = float(recent_28.mean()) if len(recent_28) else float(hist["sales"].mean())
-    short_term_correction = float(recent_7.median() / max(float(recent_28.mean()) if len(recent_28) else recent_level, eps))
-    base_level = max(0.0, recent_level * short_term_correction)
+    recent_28_mean = float(recent_28.mean()) if len(recent_28) else float(hist["sales"].mean())
+    recent_7_median = float(recent_7.median()) if len(recent_7) else recent_28_mean
+    ratio = float(np.clip(recent_7_median / max(recent_28_mean, 1e-6), 0.90, 1.10))
+    base_level = max(0.0, recent_28_mean * ratio)
     dow_profile = build_weekday_profile(hist, lookback_weeks=8, smoothing=0.5)
     dow_weights = (dow_profile * 7.0).reindex(range(7), fill_value=1.0)
 

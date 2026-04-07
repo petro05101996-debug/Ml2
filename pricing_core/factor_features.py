@@ -134,23 +134,23 @@ def build_factor_target_frame(df: pd.DataFrame) -> pd.DataFrame:
     baseline_abs_error = (sales - baseline_oof).abs()
     baseline_rel_error = baseline_abs_error / (sales.abs() + 1.0)
     baseline_ratio = (baseline_oof + 1.0) / (sales + 1.0)
-    y = np.log((sales + 1.0) / (baseline_oof + 1.0)).clip(-1.2, 1.2)
+    y = np.log((sales + 1.0) / (baseline_oof + 1.0)).clip(-0.35, 0.35)
 
     valid = (
         baseline_oof.notna()
-        & (baseline_rel_error <= 0.60)
-        & (baseline_ratio >= 0.5)
-        & (baseline_ratio <= 1.8)
     )
     if "stockout_flag" in df.columns:
         mask = pd.to_numeric(df["stockout_flag"], errors="coerce").fillna(0.0) > 0.0
         valid = valid & (~mask)
+    err = baseline_rel_error.fillna(1.0)
+    factor_weight = np.where(err <= 0.35, 1.0, np.where(err <= 0.60, 0.6, 0.25))
     return pd.DataFrame(
         {
             "factor_target": pd.Series(y, index=df.index),
             "factor_target_valid": pd.Series(valid, index=df.index).astype(bool),
             "baseline_rel_error": pd.Series(baseline_rel_error, index=df.index),
             "baseline_ratio": pd.Series(baseline_ratio, index=df.index),
+            "factor_weight": pd.Series(factor_weight, index=df.index),
         },
         index=df.index,
     )
