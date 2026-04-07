@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from data_adapter import build_auto_mapping, normalize_transactions
+import pricing_core.orchestrator_v2 as orch
 from pricing_core.orchestrator_v2 import run_full_pricing_analysis_v2
 from pricing_core.v2_presenter import build_v2_result_contract
 from pricing_core.v2_what_if import run_v2_what_if_projection

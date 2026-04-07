@@ -631,6 +631,8 @@ def run_full_pricing_analysis_v2(
         [
             {"item": "selected_baseline", "value": f"{best_baseline_strategy} ({baseline_granularity})"},
             {"item": "selector_reason", "value": baseline_selector_reason},
+            {"item": "plan_selected_baseline", "value": f"{plan_selected_strategy} ({plan_selected_granularity})"},
+            {"item": "final_baseline_source", "value": "benchmark_suite_selection"},
             {"item": "runner_up", "value": runner_up_note},
             {"item": "overall_confidence", "value": str(confidence.get("overall_confidence", "low"))},
             {"item": "confidence_issues", "value": "; ".join([str(x) for x in confidence.get("issues", [])])},
