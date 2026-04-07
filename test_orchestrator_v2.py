@@ -45,7 +45,7 @@ def test_v2_confidence_has_all_layers():
 def test_v2_excel_contains_required_sheets():
     out = run_full_pricing_analysis_v2(_txn(), "cat", "sku-1", horizon_days=7)
     xls = pd.ExcelFile(out["excel_buffer"])
-    required = {"history", "neutral_baseline_forecast", "as_is_forecast", "scenario_forecast", "neutral_baseline_economics", "as_is_economics", "scenario_economics", "delta_summary_current_vs_scenario", "delta_summary_neutral_vs_current", "baseline_rolling_metrics", "baseline_rolling_diag", "baseline_benchmark_suite", "baseline_quality_summary", "baseline_data_quality", "scenario_inputs_echo", "diagnostic_summary", "factor_backtest", "current_state_contributions", "scenario_delta_contributions", "confidence", "confidence_flat"}
+    required = {"history", "neutral_baseline_forecast", "as_is_forecast", "scenario_forecast", "neutral_baseline_economics", "as_is_economics", "scenario_economics", "delta_summary_current_vs_scenario", "delta_summary_neutral_vs_current", "baseline_rolling_metrics", "baseline_rolling_diag", "baseline_benchmark_suite", "baseline_quality_summary", "baseline_data_quality", "scenario_inputs_echo", "diagnostic_summary", "factor_backtest", "isolated_current_factor_deltas", "isolated_scenario_factor_deltas", "confidence", "confidence_flat"}
     assert required.issubset(set(xls.sheet_names))
 
 
@@ -111,7 +111,7 @@ def test_v2_result_contract_not_legacy_recommendation():
     assert "headline_action" in contract
     assert "best_price" not in contract
     assert "current_price" not in contract
-    assert contract["mode"] in {"baseline_only", "baseline_plus_scenario", "fallback_elasticity"}
+    assert contract["mode"] in {"baseline_only", "baseline_plus_scenario", "fallback_elasticity", "as_is_only"}
 
 
 def test_tiny_mode_what_if_does_not_fail():
@@ -169,7 +169,7 @@ def test_final_baseline_selection_is_consistent_across_outputs():
     plan = out["baseline_plan_selection"]
     assert plan["final_selected_strategy"] == out["final_baseline_strategy"]
     assert plan["final_selected_granularity"] == out["final_baseline_granularity"]
-    assert out["final_baseline_source"] == "benchmark_suite_selection"
+    assert out["final_baseline_source"] == "plan_selection"
     xls = pd.ExcelFile(out["excel_buffer"])
     summary = pd.read_excel(xls, sheet_name="baseline_quality_summary").iloc[0]
     assert str(summary["baseline_strategy"]) == str(out["final_baseline_strategy"])

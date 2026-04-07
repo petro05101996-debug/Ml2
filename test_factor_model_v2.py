@@ -41,7 +41,7 @@ def test_factor_multiplier_is_clipped():
     ff["factor_target"] = build_factor_target(ff)
     trained = train_factor_model(ff, spec, small_mode=True)
     p = predict_factor_effect(ff, trained, spec)
-    assert (p["factor_multiplier"].between(0.25, 4.0)).all()
+    assert (p["factor_multiplier"].between(0.70, 1.35)).all()
 
 
 def test_factor_model_unavailable_on_insufficient_signal():

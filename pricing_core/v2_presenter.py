@@ -58,7 +58,7 @@ def build_v2_result_contract(result_v2: Dict[str, Any]) -> Dict[str, Any]:
         "baseline_strategy": result_v2.get("baseline_strategy", "xgb_recursive"),
         "final_baseline_strategy": result_v2.get("final_baseline_strategy", result_v2.get("baseline_strategy", "xgb_recursive")),
         "final_baseline_granularity": result_v2.get("final_baseline_granularity", result_v2.get("baseline_granularity", "daily")),
-        "final_baseline_source": result_v2.get("final_baseline_source", "benchmark_suite_selection"),
+        "final_baseline_source": result_v2.get("final_baseline_source", "plan_selection"),
         "baseline_selector_reason": result_v2.get("baseline_selector_reason", ""),
         "baseline_meets_quality_gate": bool(conf.get("baseline_meets_quality_gate", False)),
         "baseline_goal_wape_median_le_25": bool(conf.get("baseline_goal_wape_median_le_25", False)),
