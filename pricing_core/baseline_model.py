@@ -18,6 +18,10 @@ except Exception:  # pragma: no cover - optional fallback
     HAS_STATSMODELS_ETS = False
 
 
+BENCHMARK_ONLY_STRATEGIES = {"median7", "mean28", "dow_median8w", "recent_level_dow_profile", "recent_level_dow_trend"}
+PRODUCTION_CANDIDATE_STRATEGIES = {"xgb_recursive", "rolling_dow_regression", "ets_seasonal7", "weekly_median4w", "weekly_recent4_avg", "weekly_mean8w"}
+
+
 def _params(training_profile: str, small_mode: bool) -> Dict[str, Any]:
     if training_profile == "backtest":
         return {
@@ -719,7 +723,98 @@ def run_baseline_benchmark_suite(
         & summary["goal_sum_ratio_in_range"]
         & summary["goal_std_ratio_ge_055"]
     )
+    summary["candidate_tier"] = np.where(summary["strategy"].astype(str).isin(PRODUCTION_CANDIDATE_STRATEGIES), "production_candidate", "benchmark_only")
+    summary["winner_scope"] = "rejected"
     return summary.sort_values(["composite_score", "median_wape"], ascending=[True, True]).reset_index(drop=True)
+
+
+def select_baseline_from_benchmark_suite(summary: pd.DataFrame) -> Dict[str, Any]:
+    default = {
+        "best_available_strategy": "xgb_recursive",
+        "best_available_granularity": "daily",
+        "baseline_meets_quality_gate": False,
+        "baseline_rejection_reason": "benchmark_suite_empty",
+        "runner_up_strategy": "",
+        "runner_up_score": np.nan,
+    }
+    if summary is None or summary.empty:
+        return default
+    ranked = summary.copy()
+    if "composite_score" not in ranked.columns:
+        ranked["composite_score"] = np.nan
+    if "median_wape" not in ranked.columns:
+        ranked["median_wape"] = np.nan
+    ranked = ranked.sort_values(["composite_score", "median_wape"], ascending=[True, True]).reset_index(drop=True)
+    prod = ranked[ranked["candidate_tier"].astype(str) == "production_candidate"].copy()
+    if prod.empty:
+        best = ranked.iloc[0]
+        return {
+            "best_available_strategy": str(best.get("strategy", "xgb_recursive")),
+            "best_available_granularity": str(best.get("granularity", "daily")),
+            "baseline_meets_quality_gate": False,
+            "baseline_rejection_reason": "no_production_candidates",
+            "runner_up_strategy": "",
+            "runner_up_score": np.nan,
+        }
+    best = prod.iloc[0]
+    runner = prod.iloc[1] if len(prod) > 1 else None
+    meets = bool(best.get("acceptance_pass", False))
+    fail_reasons: List[str] = []
+    for goal in [
+        "goal_wape_median_le_25",
+        "goal_wape_max_le_35",
+        "goal_abs_bias_le_7pct",
+        "goal_sum_ratio_in_range",
+        "goal_std_ratio_ge_055",
+    ]:
+        if not bool(best.get(goal, False)):
+            fail_reasons.append(goal)
+    return {
+        "best_available_strategy": str(best.get("strategy", "xgb_recursive")),
+        "best_available_granularity": str(best.get("granularity", "daily")),
+        "baseline_meets_quality_gate": meets,
+        "baseline_rejection_reason": "" if meets else (";".join(fail_reasons) if fail_reasons else "quality_gate_failed"),
+        "runner_up_strategy": str(runner.get("strategy")) if runner is not None else "",
+        "runner_up_score": float(runner.get("composite_score")) if runner is not None else np.nan,
+    }
+
+
+def build_baseline_quality_summary(
+    benchmark_suite: pd.DataFrame,
+    selection_result: Dict[str, Any],
+    baseline_selector_reason: str,
+) -> pd.DataFrame:
+    row = {
+        "baseline_strategy": str(selection_result.get("best_available_strategy", "")),
+        "baseline_granularity": str(selection_result.get("best_available_granularity", "")),
+        "baseline_selector_reason": str(baseline_selector_reason),
+        "baseline_meets_quality_gate": bool(selection_result.get("baseline_meets_quality_gate", False)),
+        "baseline_goal_wape_median_le_25": False,
+        "baseline_goal_wape_max_le_35": False,
+        "baseline_goal_abs_bias_le_7pct": False,
+        "baseline_goal_sum_ratio_in_range": False,
+        "baseline_goal_std_ratio_ge_055": False,
+        "runner_up_strategy": str(selection_result.get("runner_up_strategy", "")),
+        "runner_up_score": float(selection_result.get("runner_up_score", np.nan)),
+    }
+    if benchmark_suite is not None and not benchmark_suite.empty:
+        match = benchmark_suite[
+            (benchmark_suite["strategy"].astype(str) == row["baseline_strategy"])
+            & (benchmark_suite["granularity"].astype(str) == row["baseline_granularity"])
+        ].copy()
+        if match.empty:
+            match = benchmark_suite[benchmark_suite["strategy"].astype(str) == row["baseline_strategy"]].copy()
+        if not match.empty:
+            m = match.iloc[0]
+            for k in [
+                "baseline_goal_wape_median_le_25",
+                "baseline_goal_wape_max_le_35",
+                "baseline_goal_abs_bias_le_7pct",
+                "baseline_goal_sum_ratio_in_range",
+                "baseline_goal_std_ratio_ge_055",
+            ]:
+                row[k] = bool(m.get(k.replace("baseline_", ""), False))
+    return pd.DataFrame([row])
 
 
 def run_weekly_baseline_rolling_backtest(

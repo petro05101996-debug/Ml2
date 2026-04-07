@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from data_adapter import build_auto_mapping, normalize_transactions
+import pricing_core.orchestrator_v2 as orch
 from pricing_core.orchestrator_v2 import run_full_pricing_analysis_v2
 from pricing_core.v2_presenter import build_v2_result_contract
 from pricing_core.v2_what_if import run_v2_what_if_projection
@@ -44,7 +45,7 @@ def test_v2_confidence_has_all_layers():
 def test_v2_excel_contains_required_sheets():
     out = run_full_pricing_analysis_v2(_txn(), "cat", "sku-1", horizon_days=7)
     xls = pd.ExcelFile(out["excel_buffer"])
-    required = {"history", "neutral_baseline_forecast", "as_is_forecast", "scenario_forecast", "neutral_baseline_economics", "as_is_economics", "scenario_economics", "delta_summary_current_vs_scenario", "delta_summary_neutral_vs_current", "baseline_rolling_metrics", "baseline_rolling_diag", "baseline_benchmark_suite", "baseline_quality_summary", "diagnostic_summary", "factor_backtest", "current_state_contributions", "scenario_delta_contributions", "confidence", "confidence_flat"}
+    required = {"history", "neutral_baseline_forecast", "as_is_forecast", "scenario_forecast", "neutral_baseline_economics", "as_is_economics", "scenario_economics", "delta_summary_current_vs_scenario", "delta_summary_neutral_vs_current", "baseline_rolling_metrics", "baseline_rolling_diag", "baseline_benchmark_suite", "baseline_quality_summary", "baseline_data_quality", "scenario_inputs_echo", "diagnostic_summary", "factor_backtest", "current_state_contributions", "scenario_delta_contributions", "confidence", "confidence_flat"}
     assert required.issubset(set(xls.sheet_names))
 
 
@@ -163,6 +164,95 @@ def test_v2_outputs_baseline_benchmark_and_quality_gate():
     }.issubset(out["baseline_quality_gate"].keys())
 
 
+def test_final_baseline_selection_is_consistent_across_outputs():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
+    plan = out["baseline_plan_selection"]
+    assert plan["final_selected_strategy"] == out["final_baseline_strategy"]
+    assert plan["final_selected_granularity"] == out["final_baseline_granularity"]
+    assert out["final_baseline_source"] == "benchmark_suite_selection"
+    xls = pd.ExcelFile(out["excel_buffer"])
+    summary = pd.read_excel(xls, sheet_name="baseline_quality_summary").iloc[0]
+    assert str(summary["baseline_strategy"]) == str(out["final_baseline_strategy"])
+    assert str(summary["baseline_granularity"]) == str(out["final_baseline_granularity"])
+
+
+def test_final_selection_prefers_production_candidate_over_benchmark_only_in_outputs(monkeypatch):
+    def _fake_plan(*args, **kwargs):
+        return {
+            "granularity": "daily",
+            "selected_strategy": "recent_level_dow_profile",
+            "selector_reason": "plan picked benchmark-only",
+            "daily_selection": {"best_strategy": "recent_level_dow_profile", "strategy_metrics": pd.DataFrame(), "strategy_summary": pd.DataFrame()},
+            "weekly_selection": {"best_strategy": "weekly_median4w", "strategy_metrics": pd.DataFrame(), "strategy_summary": pd.DataFrame()},
+            "best_daily_strategy": "recent_level_dow_profile",
+            "best_weekly_strategy": "weekly_median4w",
+        }
+
+    def _fake_suite(*args, **kwargs):
+        return pd.DataFrame(
+            [
+                {
+                    "strategy": "recent_level_dow_profile",
+                    "granularity": "daily",
+                    "median_wape": 12.0,
+                    "max_wape": 18.0,
+                    "median_bias_pct": 0.01,
+                    "median_sum_ratio": 1.0,
+                    "median_std_ratio": 0.9,
+                    "flat_window_share": 0.1,
+                    "median_weekday_shape_error": 0.1,
+                    "composite_score": 1.0,
+                    "backend_available": True,
+                    "fallback_used": False,
+                    "guardrail_reject": False,
+                    "goal_wape_median_le_25": True,
+                    "goal_wape_max_le_35": True,
+                    "goal_abs_bias_le_7pct": True,
+                    "goal_sum_ratio_in_range": True,
+                    "goal_std_ratio_ge_055": True,
+                    "acceptance_pass": True,
+                    "candidate_tier": "benchmark_only",
+                    "winner_scope": "rejected",
+                },
+                {
+                    "strategy": "rolling_dow_regression",
+                    "granularity": "daily",
+                    "median_wape": 13.0,
+                    "max_wape": 19.0,
+                    "median_bias_pct": 0.01,
+                    "median_sum_ratio": 1.0,
+                    "median_std_ratio": 0.9,
+                    "flat_window_share": 0.1,
+                    "median_weekday_shape_error": 0.1,
+                    "composite_score": 1.2,
+                    "backend_available": True,
+                    "fallback_used": False,
+                    "guardrail_reject": False,
+                    "goal_wape_median_le_25": True,
+                    "goal_wape_max_le_35": True,
+                    "goal_abs_bias_le_7pct": True,
+                    "goal_sum_ratio_in_range": True,
+                    "goal_std_ratio_ge_055": True,
+                    "acceptance_pass": True,
+                    "candidate_tier": "production_candidate",
+                    "winner_scope": "best_available",
+                },
+            ]
+        )
+
+    monkeypatch.setattr(orch, "select_best_baseline_plan", _fake_plan)
+    monkeypatch.setattr(orch, "run_baseline_benchmark_suite", _fake_suite)
+
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
+    contract = build_v2_result_contract(out)
+    assert out["baseline_selection_result"]["best_available_strategy"] == "rolling_dow_regression"
+    assert out["final_baseline_strategy"] == "rolling_dow_regression"
+    assert contract["final_baseline_strategy"] == "rolling_dow_regression"
+    xls = pd.ExcelFile(out["excel_buffer"])
+    summary = pd.read_excel(xls, sheet_name="baseline_quality_summary").iloc[0]
+    assert str(summary["baseline_strategy"]) == "rolling_dow_regression"
+
+
 def test_v2_rolling_export_contains_required_columns():
     out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=5)
     xls = pd.ExcelFile(out["excel_buffer"])
@@ -250,6 +340,17 @@ def test_no_overrides_scenario_equals_as_is():
     a = out["as_is_forecast"]["actual_sales"].reset_index(drop=True)
     s = out["scenario_forecast"]["actual_sales"].reset_index(drop=True)
     assert a.equals(s)
+
+
+def test_scenario_inputs_echo_marks_no_change_when_no_overrides():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7)
+    echo = out["scenario_inputs_echo"]
+    if not echo.empty:
+        assert (echo["changed_flag"] == False).all()  # noqa: E712
+        row = out["delta_summary_current_vs_scenario"].iloc[0]
+        assert abs(float(row["demand_delta_pct"])) <= 1e-9
+        assert out["scenario_controls_changed"] is False
+        assert out["scenario_delta_zero_reason"] == "no_overrides"
 
 
 def test_delta_summary_current_vs_scenario_pct_is_based_on_as_is():

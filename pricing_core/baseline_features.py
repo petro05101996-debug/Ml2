@@ -18,11 +18,23 @@ DEFAULT_BASELINE_NUMERIC = [
     "dow",
     "week_of_year",
     "month",
+    "week_of_month",
+    "is_month_start",
+    "is_month_end",
     "is_weekend",
     "sin_doy",
     "cos_doy",
     "month_sin",
     "month_cos",
+    "lag7",
+    "lag14",
+    "lag28",
+    "rolling_mean_7",
+    "rolling_mean_14",
+    "rolling_mean_28",
+    "rolling_std_28",
+    "sales_level_ratio_7_to_28",
+    "weekday_profile_share",
 ]
 DEFAULT_BASELINE_CATEGORICAL = ["series_id", "product_id", "category", "region", "channel", "segment"]
 
@@ -62,17 +74,47 @@ def build_baseline_feature_matrix(panel_daily: pd.DataFrame) -> pd.DataFrame:
     out["sales_ma14"] = shifted.groupby(out["series_id"]).rolling(14, min_periods=1).mean().reset_index(level=0, drop=True)
     out["sales_ma28"] = shifted.groupby(out["series_id"]).rolling(28, min_periods=1).mean().reset_index(level=0, drop=True)
     out["sales_std28"] = shifted.groupby(out["series_id"]).rolling(28, min_periods=1).std().reset_index(level=0, drop=True).fillna(0.0)
+    out["lag7"] = out["sales_lag7"]
+    out["lag14"] = out["sales_lag14"]
+    out["lag28"] = out["sales_lag28"]
+    out["rolling_mean_7"] = out["sales_ma7"]
+    out["rolling_mean_14"] = out["sales_ma14"]
+    out["rolling_mean_28"] = out["sales_ma28"]
+    out["rolling_std_28"] = out["sales_std28"]
+    out["sales_level_ratio_7_to_28"] = (
+        pd.to_numeric(out["rolling_mean_7"], errors="coerce").fillna(0.0)
+        / pd.to_numeric(out["rolling_mean_28"], errors="coerce").fillna(0.0).clip(lower=1e-6)
+    )
 
     d = out["date"].dt
     out["dow"] = d.dayofweek.fillna(0).astype(int)
     out["week_of_year"] = d.isocalendar().week.astype("int64").fillna(1)
+    out["week_of_month"] = ((d.day.fillna(1).astype(int) - 1) // 7 + 1).astype(int)
     out["month"] = d.month.fillna(1).astype(int)
+    day = d.day.fillna(1).astype(int)
+    dim = d.days_in_month.fillna(31).astype(int)
+    out["is_month_start"] = (day <= 3).astype(int)
+    out["is_month_end"] = ((dim - day) < 3).astype(int)
     out["is_weekend"] = (out["dow"] >= 5).astype(int)
     doy = d.dayofyear.fillna(1)
     out["sin_doy"] = np.sin(2 * np.pi * doy / 365.25)
     out["cos_doy"] = np.cos(2 * np.pi * doy / 365.25)
     out["month_sin"] = np.sin(2 * np.pi * out["month"] / 12.0)
     out["month_cos"] = np.cos(2 * np.pi * out["month"] / 12.0)
+    out["weekday_profile_share"] = 1.0 / 7.0
+    for sid, idx in out.groupby("series_id", dropna=False).groups.items():
+        g = out.loc[idx].copy().sort_values("date")
+        shares = []
+        for i in range(len(g)):
+            hist = g.iloc[max(0, i - 56):i]
+            if hist.empty:
+                shares.append(1.0 / 7.0)
+                continue
+            total_hist = float(pd.to_numeric(hist["sales"], errors="coerce").fillna(0.0).sum())
+            dow_hist = hist[hist["dow"] == int(g.iloc[i]["dow"])]
+            dow_total = float(pd.to_numeric(dow_hist["sales"], errors="coerce").fillna(0.0).sum())
+            shares.append(float(dow_total / max(total_hist, 1e-6)))
+        out.loc[g.index, "weekday_profile_share"] = pd.Series(shares, index=g.index).fillna(1.0 / 7.0).clip(lower=0.0)
     return out
 
 
@@ -109,15 +151,36 @@ def build_baseline_one_step_features(
     row["sales_ma14"] = float(shifted.tail(14).mean()) if len(shifted) else 0.0
     row["sales_ma28"] = float(shifted.tail(28).mean()) if len(shifted) else 0.0
     row["sales_std28"] = float(shifted.tail(28).std(ddof=0)) if len(shifted) else 0.0
+    row["lag7"] = row["sales_lag7"]
+    row["lag14"] = row["sales_lag14"]
+    row["lag28"] = row["sales_lag28"]
+    row["rolling_mean_7"] = row["sales_ma7"]
+    row["rolling_mean_14"] = row["sales_ma14"]
+    row["rolling_mean_28"] = row["sales_ma28"]
+    row["rolling_std_28"] = row["sales_std28"]
+    row["sales_level_ratio_7_to_28"] = float(row["rolling_mean_7"]) / max(float(row["rolling_mean_28"]), 1e-6)
 
     dt = pd.Timestamp(current_date)
     row["dow"] = int(dt.dayofweek)
     row["week_of_year"] = int(dt.isocalendar().week)
+    row["week_of_month"] = int((dt.day - 1) // 7 + 1)
     row["month"] = int(dt.month)
+    row["is_month_start"] = int(dt.day <= 3)
+    row["is_month_end"] = int((dt.days_in_month - dt.day) < 3)
     row["is_weekend"] = int(dt.dayofweek >= 5)
     row["sin_doy"] = float(np.sin(2 * np.pi * dt.dayofyear / 365.25))
     row["cos_doy"] = float(np.cos(2 * np.pi * dt.dayofyear / 365.25))
     row["month_sin"] = float(np.sin(2 * np.pi * dt.month / 12.0))
     row["month_cos"] = float(np.cos(2 * np.pi * dt.month / 12.0))
+    last_56 = sales.tail(56).copy()
+    if len(last_56):
+        recent = history_df.copy().tail(56)
+        recent["date"] = pd.to_datetime(recent["date"], errors="coerce")
+        recent["sales"] = pd.to_numeric(recent.get("sales", 0.0), errors="coerce").fillna(0.0)
+        total_recent = float(recent["sales"].sum())
+        dow_recent = float(recent.loc[recent["date"].dt.dayofweek == int(dt.dayofweek), "sales"].sum())
+        row["weekday_profile_share"] = float(dow_recent / max(total_recent, 1e-6))
+    else:
+        row["weekday_profile_share"] = 1.0 / 7.0
 
     return pd.DataFrame([row])
