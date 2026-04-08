@@ -29,7 +29,14 @@ from ui_shell import apply_enterprise_styles, render_navigation
 from what_if import build_sensitivity_grid, run_scenario_set
 
 st.set_page_config(page_title="Demand What-If Studio", layout="wide", page_icon="📊")
-for key, default in {"results": None, "what_if_result": None, "scenario_table": None, "sensitivity_df": None, "active_page": "Обзор"}.items():
+for key, default in {
+    "results": None,
+    "what_if_result": None,
+    "scenario_table": None,
+    "sensitivity_df": None,
+    "_go_to_results": False,
+    "top_nav": "Обзор",
+}.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -288,7 +295,7 @@ def render_results_page(r: Dict[str, Any]) -> None:
             st.warning("Ограничения качества данных: " + "; ".join([str(x) for x in dq.get("issues", [])]))
     holdout_metrics = r.get("holdout_metrics")
     if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and isinstance(holdout_metrics, pd.DataFrame) and not holdout_metrics.empty:
-        st.dataframe(holdout_metrics, use_container_width=True)
+        st.dataframe(holdout_metrics, width="stretch")
         diag_row = holdout_metrics.iloc[0].to_dict()
         st.markdown("#### Диагностика модели")
         st.write(
@@ -310,7 +317,7 @@ def render_results_page(r: Dict[str, Any]) -> None:
     if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.button("Запустить: текущий vs рекомендованный vs консервативный", use_container_width=True):
         st.session_state.scenario_table = run_scenario_set(r["_trained_bundle"], build_default_scenario_inputs(float(r["current_price"]), int(r.get("forecast_horizon_days", 30)), r["_trained_bundle"]["base_ctx"])[:3], run_v2_what_if_projection)
     if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.session_state.get("scenario_table") is not None:
-        st.dataframe(st.session_state.scenario_table, use_container_width=True)
+        st.dataframe(st.session_state.scenario_table, width="stretch")
     with st.expander("Расширенная аналитика", expanded=False):
         st.write(explanation.get("summary", ""))
         if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.button("Запустить карту чувствительности", use_container_width=True):
@@ -357,11 +364,14 @@ def maybe_run_analysis(ctx: Dict[str, Any]) -> None:
                 st.write(f"Модель обучена. Рекомендованная цена: {float(reco_price):,.2f}")
         status.update(label="Анализ завершён", state="complete", expanded=False)
 
-    st.session_state.active_page = "Результаты"
+    st.session_state._go_to_results = True
     st.rerun()
 
 
 apply_enterprise_styles()
+if st.session_state.get("_go_to_results", False):
+    st.session_state.top_nav = "Результаты"
+    st.session_state._go_to_results = False
 active_page = render_navigation()
 if active_page == "Обзор":
     render_overview()
