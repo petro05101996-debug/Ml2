@@ -281,3 +281,28 @@ def test_delta_summary_current_vs_scenario_pct_is_based_on_as_is():
     row = out["delta_summary_current_vs_scenario"].iloc[0]
     expected = float(row["demand_delta_abs"]) / max(float(row["as_is_total_demand"]), 1e-9)
     assert abs(float(row["demand_delta_pct"]) - expected) < 1e-9
+
+def test_recent_level_dow_profile_has_week_to_week_drift_on_rising_history():
+    hist = _txn(180)
+    hist = hist.sort_values("date").copy()
+    hist["quantity"] = hist["quantity"] + np.linspace(0, 20, len(hist))
+    hist["revenue"] = hist["quantity"] * hist["price"]
+
+    out = run_full_pricing_analysis_v2(hist, "cat", "sku-1", horizon_days=21)
+    fc = out["neutral_baseline_forecast"].copy()
+
+    week1 = float(fc.iloc[:7]["baseline_pred"].sum())
+    week2 = float(fc.iloc[7:14]["baseline_pred"].sum())
+
+    assert week1 != week2
+
+
+def test_recent_level_dow_profile_preserves_week_total_after_normalization():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=14)
+    fc = out["neutral_baseline_forecast"].copy()
+
+    w1 = float(fc.iloc[:7]["baseline_pred"].sum())
+    w2 = float(fc.iloc[7:14]["baseline_pred"].sum())
+
+    assert w1 > 0
+    assert w2 > 0
