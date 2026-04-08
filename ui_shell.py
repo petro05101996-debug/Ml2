@@ -31,11 +31,15 @@ def apply_enterprise_styles() -> None:
 
 def render_navigation() -> str:
     st.markdown('<div class="top-nav-wrap">', unsafe_allow_html=True)
-    current = st.session_state.get("active_page", "Обзор")
-    if st.session_state.get("top_nav") != current:
-        st.session_state["top_nav"] = current
-    selected = st.segmented_control("", options=PAGES, default=current, key="top_nav")
+    current = st.session_state.get("top_nav", "Обзор")
+    if current not in PAGES:
+        current = "Обзор"
+        st.session_state.top_nav = current
+    selected = st.segmented_control(
+        "Навигация",
+        options=PAGES,
+        key="top_nav",
+        label_visibility="collapsed",
+    )
     st.markdown("</div>", unsafe_allow_html=True)
-    if selected:
-        st.session_state.active_page = selected
-    return st.session_state.get("active_page", "Обзор")
+    return selected or st.session_state.get("top_nav", "Обзор")
