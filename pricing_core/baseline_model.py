@@ -393,9 +393,18 @@ def recursive_weekly_baseline_forecast_median4w(
 ) -> pd.DataFrame:
     s = pd.to_numeric(weekly_history.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
     base = float(s.tail(4).median()) if len(s) else 0.0
+    weekly_step = 0.0
+    if len(s) >= 8:
+        prev = float(s.tail(8).head(4).mean())
+        last = float(s.tail(4).mean())
+        if prev > 1e-9:
+            weekly_step = float(np.clip((last / prev) - 1.0, -0.03, 0.03))
     out = future_week_starts.copy()
     out["week_start"] = pd.to_datetime(out["week_start"], errors="coerce")
-    out["baseline_pred_weekly"] = max(0.0, base)
+    out = out.sort_values("week_start").reset_index(drop=True)
+    out["week_idx"] = np.arange(len(out), dtype=float)
+    out["baseline_pred_weekly"] = (base * (1.0 + weekly_step * out["week_idx"])).clip(lower=0.0)
+    out = out.drop(columns=["week_idx"])
     return out[["week_start", "baseline_pred_weekly"]].sort_values("week_start").reset_index(drop=True)
 
 

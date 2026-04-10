@@ -259,6 +259,70 @@ def run_data_quality_checks(df: pd.DataFrame, raw_stats: Optional[Dict[str, Any]
     return issues
 
 
+def build_weekly_panel_from_daily(daily_panel: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    if daily_panel is None or len(daily_panel) == 0:
+        return {"weekly_panel": pd.DataFrame(), "daily_week_map": pd.DataFrame(columns=["date", "series_id", "week_start"])}
+
+    x = daily_panel.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x = x.dropna(subset=["date"]).copy()
+    if "series_id" not in x.columns:
+        x["series_id"] = build_series_id(x)
+    x["week_start"] = x["date"] - pd.to_timedelta(x["date"].dt.dayofweek.fillna(0).astype(int), unit="D")
+
+    static_cols = [c for c in ["series_id", "product_id", "category", "brand", "region", "channel", "segment"] if c in x.columns]
+    user_num_cols = [c for c in x.columns if str(c).startswith(USER_FACTOR_NUM_PREFIX)]
+    user_cat_cols = [c for c in x.columns if str(c).startswith(USER_FACTOR_CAT_PREFIX)]
+
+    if "discount" not in x.columns and "discount_rate" in x.columns:
+        x["discount"] = pd.to_numeric(x["discount_rate"], errors="coerce")
+    grouped = x.groupby(["series_id", "week_start"], dropna=False)
+    out = grouped.agg(
+        sales_week=("sales", "sum"),
+        avg_price_week=("price", "mean"),
+        median_price_week=("price", "median"),
+        promo_share_week=("promotion", lambda s: float((pd.to_numeric(s, errors="coerce").fillna(0.0) > 0).mean())),
+        avg_discount_week=("discount", "mean"),
+        avg_freight_week=("freight_value", "mean"),
+        avg_cost_week=("cost", "mean"),
+    ).reset_index()
+
+    for c in static_cols:
+        if c in {"series_id"}:
+            continue
+        mode_vals = grouped[c].apply(_mode_or_unknown).reset_index(name=c)
+        out = out.merge(mode_vals, on=["series_id", "week_start"], how="left")
+
+    for c in user_num_cols:
+        num_vals = grouped[c].mean().reset_index(name=f"{c}_week")
+        out = out.merge(num_vals, on=["series_id", "week_start"], how="left")
+    for c in user_cat_cols:
+        cat_vals = grouped[c].apply(_mode_or_unknown).reset_index(name=f"{c}_week")
+        out = out.merge(cat_vals, on=["series_id", "week_start"], how="left")
+
+    out = out.sort_values(["series_id", "week_start"]).reset_index(drop=True)
+
+    grp = out.groupby("series_id", dropna=False)
+    out["lag_1_week_sales"] = grp["sales_week"].shift(1)
+    out["lag_2_week_sales"] = grp["sales_week"].shift(2)
+    out["lag_3_week_sales"] = grp["sales_week"].shift(3)
+    out["lag_4_week_sales"] = grp["sales_week"].shift(4)
+    out["rolling_mean_4w"] = grp["sales_week"].shift(1).rolling(4, min_periods=1).mean().reset_index(level=0, drop=True)
+    out["rolling_mean_8w"] = grp["sales_week"].shift(1).rolling(8, min_periods=1).mean().reset_index(level=0, drop=True)
+    out["rolling_median_4w"] = grp["sales_week"].shift(1).rolling(4, min_periods=1).median().reset_index(level=0, drop=True)
+    out["rolling_std_4w"] = grp["sales_week"].shift(1).rolling(4, min_periods=1).std().reset_index(level=0, drop=True).fillna(0.0)
+
+    ws = pd.to_datetime(out["week_start"], errors="coerce")
+    out["week_of_year"] = ws.dt.isocalendar().week.astype(int)
+    out["month"] = ws.dt.month.astype(int)
+    out["quarter"] = ws.dt.quarter.astype(int)
+    out["year"] = ws.dt.year.astype(int)
+    out["trend_index"] = grp.cumcount().astype(int)
+
+    daily_week_map = x[["date", "series_id", "week_start"]].drop_duplicates().sort_values(["series_id", "date"]).reset_index(drop=True)
+    return {"weekly_panel": out, "daily_week_map": daily_week_map}
+
+
 def build_daily_panel_from_transactions(txn: pd.DataFrame) -> pd.DataFrame:
     df = txn.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")

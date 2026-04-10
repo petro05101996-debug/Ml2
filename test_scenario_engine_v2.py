@@ -106,7 +106,7 @@ def test_scenario_mode_is_exposed():
     fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
     out = run_scenario_forecast(tr, None, fm, fut, spec, None)
     assert out["mode"] == "fallback_elasticity"
-    assert out["scenario_effect_source"] == "fallback_elasticity"
+    assert out["scenario_effect_source"] == "bounded_rules"
 
 
 def test_scenario_outside_backtest_range_sets_flag():
@@ -174,9 +174,25 @@ def test_fallback_elasticity_responds_to_price_change():
     fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=5, freq="D")})
     low = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"price": 8.0})
     high = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"price": 20.0})
-    assert low["scenario_effect_source"] == "fallback_elasticity"
-    assert high["scenario_effect_source"] == "fallback_elasticity"
+    assert low["scenario_effect_source"] == "bounded_rules"
+    assert high["scenario_effect_source"] == "bounded_rules"
     assert float(low["scenario_forecast"]["actual_sales"].sum()) != float(high["scenario_forecast"]["actual_sales"].sum())
+
+
+def test_scenario_decomposition_columns_exist():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=3, freq="D")})
+    out = run_scenario_forecast(tr, None, fm, fut, spec, None)
+    required = {"baseline_component", "factor_effect", "shock_effect", "final_forecast"}
+    assert required.issubset(set(out["scenario_forecast"].columns))
+
+
+def test_baseline_is_invariant_under_factor_only_override():
+    tr, spec, fm = _trained_baseline()
+    fut = pd.DataFrame({"date": pd.date_range(fm["date"].max() + pd.Timedelta(days=1), periods=7, freq="D")})
+    base = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"price": 10.0})
+    bump = run_scenario_forecast(tr, None, fm, fut, spec, None, scenario_overrides={"price": 14.0})
+    assert base["scenario_forecast"]["baseline_pred"].tolist() == bump["scenario_forecast"]["baseline_pred"].tolist()
 
 
 def test_future_and_train_factor_feature_schema_are_synced_for_dynamic_features():

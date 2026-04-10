@@ -8,7 +8,13 @@ import numpy as np
 import pandas as pd
 
 from calc_engine import compute_daily_unit_economics
-from data_adapter import SERIES_SCOPE_COLS, build_baseline_data_quality_summary, build_daily_panel_from_transactions, build_series_id
+from data_adapter import (
+    SERIES_SCOPE_COLS,
+    build_baseline_data_quality_summary,
+    build_daily_panel_from_transactions,
+    build_series_id,
+    build_weekly_panel_from_daily,
+)
 from pricing_core.baseline_features import build_baseline_feature_matrix, derive_baseline_feature_spec
 from pricing_core.baseline_model import (
     build_baseline_oof_predictions,
@@ -30,11 +36,20 @@ from pricing_core.factor_features import build_factor_feature_matrix, build_fact
 from pricing_core.factor_model import (
     compute_current_state_contributions,
     compute_scenario_delta_contributions,
+    predict_weekly_factor_effect,
     run_factor_rolling_backtest,
+    train_weekly_factor_model,
     train_factor_model,
 )
 from pricing_core.model_registry import build_model_bundle
-from pricing_core.scenario_engine import run_scenario_forecast
+from pricing_core.quality import compute_scenario_confidence
+from pricing_core.scenario_engine import (
+    apply_user_overrides,
+    build_current_state_context,
+    build_neutral_context,
+    run_scenario_forecast,
+    run_weekly_scenario_forecast,
+)
 from pricing_core.uncertainty import (
     build_baseline_confidence_state,
     build_factor_confidence_state,
@@ -440,6 +455,23 @@ def run_full_pricing_analysis_v2(
     target_frame = build_factor_target_frame(factor_train_target)
     factor_train_target = pd.concat([factor_train_target, target_frame], axis=1)
     factor_train_target = factor_train_target[factor_train_target["factor_target_valid"].astype(bool)].copy()
+    weekly_train_panel = build_weekly_panel_from_daily(target_train)
+    weekly_factor_target = pd.DataFrame(columns=["week_start", "sales_week", "baseline_oof_week", "factor_target_week"])
+    if not weekly_train_panel.get("weekly_panel", pd.DataFrame()).empty:
+        wk_sales = weekly_train_panel["weekly_panel"][
+            ["week_start", "sales_week", "avg_price_week", "avg_discount_week", "promo_share_week", "avg_freight_week", "avg_cost_week"]
+        ].copy()
+        wk_oof = (
+            baseline_oof[["date", "baseline_oof"]]
+            .assign(week_start=week_start(baseline_oof["date"]))
+            .groupby("week_start", dropna=False)["baseline_oof"]
+            .sum()
+            .reset_index(name="baseline_oof_week")
+        )
+        weekly_factor_target = wk_sales.merge(wk_oof, on="week_start", how="left")
+        weekly_factor_target["factor_target_week"] = (
+            weekly_factor_target["sales_week"] / weekly_factor_target["baseline_oof_week"].clip(lower=1e-6)
+        ).clip(lower=0.4, upper=1.8)
     target_assess = _assess_factor_trainability(factor_train_target, factor_feature_spec_target)
 
     use_target_direct = (
@@ -504,25 +536,117 @@ def run_full_pricing_analysis_v2(
     )
 
     use_baseline_override = tiny_mode or (baseline_granularity == "weekly") or (best_baseline_strategy != "xgb_recursive")
-    scenario_result = run_scenario_forecast(
-        trained_baseline=trained_baseline_final,
-        trained_factor=trained_factor,
-        base_history=target_history,
-        future_dates_df=future_dates,
-        baseline_feature_spec=baseline_feature_spec_full,
-        factor_feature_spec=factor_feature_spec if factor_model_trained else None,
-        scenario_overrides=scenario_overrides,
-        shocks=shocks,
-        baseline_override_df=baseline_forecast[["date", "baseline_pred"]] if use_baseline_override else None,
-        factor_backtest_summary=factor_backtest,
+    pre_conf = compute_scenario_confidence(
+        baseline_quality_gate=baseline_quality_gate,
+        factor_backtest=factor_backtest,
+        factor_effect_source="ml_uplift" if trained_factor is not None else "bounded_rules",
+        ood_flags=[],
     )
-    neutral_baseline_forecast = scenario_result["neutral_baseline_forecast"].copy()
-    as_is_forecast = scenario_result["as_is_forecast"].copy()
-    scenario_forecast = scenario_result["scenario_forecast"].copy()
+    prelim_conf = str(pre_conf.get("overall_confidence", "medium"))
+    feature_spec_for_ctx = factor_feature_spec if factor_model_trained else {"controllable_features": ["price", "discount", "promotion"]}
+    neutral_ctx = build_neutral_context(target_history, feature_spec_for_ctx)
+    current_ctx = build_current_state_context(target_history, feature_spec_for_ctx)
+    scn_ctx = apply_user_overrides(current_ctx, scenario_overrides)
+    neutral_baseline_forecast = baseline_forecast.copy()
 
-    neutral_ctx = scenario_result["neutral_ctx"]
-    current_ctx = scenario_result["current_ctx"]
-    scn_ctx = scenario_result["scenario_ctx"]
+    weekly_factor_feature_cols = ["avg_price_week", "avg_discount_week", "promo_share_week", "avg_freight_week", "avg_cost_week"]
+    trained_weekly_factor = train_weekly_factor_model(weekly_factor_target, weekly_factor_feature_cols)
+
+    weekly_history_native = aggregate_daily_to_weekly(target_history)
+    weekly_future_starts = pd.DataFrame({"week_start": sorted(week_start(future_dates["date"]).dropna().unique())})
+    weekly_baseline_forecast_native = forecast_weekly_baseline_by_strategy(
+        best_weekly_strategy,
+        weekly_history_native,
+        weekly_future_starts,
+    )
+    weekly_path_ready = (not weekly_baseline_forecast_native.empty) and ("baseline_pred_weekly" in weekly_baseline_forecast_native.columns)
+    if weekly_path_ready:
+        ood_flags_weekly: List[str] = []
+        hist_price = pd.to_numeric(target_history.get("price", np.nan), errors="coerce").dropna()
+        if len(hist_price):
+            p_lo, p_hi = float(hist_price.quantile(0.01)), float(hist_price.quantile(0.99))
+            scn_price = float(pd.to_numeric(pd.Series([scn_ctx.get("price", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
+            if np.isfinite(scn_price) and (scn_price < p_lo or scn_price > p_hi):
+                ood_flags_weekly.append("ood_numeric:price")
+        for c in [col for col in target_history.columns if str(col).startswith("user_factor_cat__")]:
+            known = set(target_history[c].dropna().astype(str).unique())
+            incoming = str(scn_ctx.get(c, ""))
+            if incoming and known and incoming not in known:
+                ood_flags_weekly.append(f"ood_category:{c}")
+        weekly_scn = run_weekly_scenario_forecast(
+            weekly_baseline_forecast=weekly_baseline_forecast_native[["week_start", "baseline_pred_weekly"]],
+            trained_weekly_factor=trained_weekly_factor,
+            current_ctx=current_ctx,
+            scenario_ctx=scn_ctx,
+            shocks=shocks,
+            confidence_level=prelim_conf,
+        )
+        scenario_result = {
+            "warnings": [],
+            "mode": "weekly_native",
+            "scenario_mode": "weekly_native",
+            "scenario_effect_source": weekly_scn.get("factor_effect_source", "bounded_rules"),
+            "factor_effect_source": weekly_scn.get("factor_effect_source", "bounded_rules"),
+            "shock_applied": bool(weekly_scn.get("shock_applied", False)),
+            "ood_flags": sorted(set(list(weekly_scn.get("ood_flags", [])) + ood_flags_weekly)),
+            "neutral_ctx": neutral_ctx,
+            "current_ctx": current_ctx,
+            "scenario_ctx": scn_ctx,
+        }
+    else:
+        scenario_result = run_scenario_forecast(
+            trained_baseline=trained_baseline_final,
+            trained_factor=trained_factor,
+            base_history=target_history,
+            future_dates_df=future_dates,
+            baseline_feature_spec=baseline_feature_spec_full,
+            factor_feature_spec=factor_feature_spec if factor_model_trained else None,
+            scenario_overrides=scenario_overrides,
+            shocks=shocks,
+            baseline_override_df=baseline_forecast[["date", "baseline_pred"]] if use_baseline_override else None,
+            factor_backtest_summary=factor_backtest,
+            confidence_level=str(pre_conf.get("overall_confidence", "medium")),
+        )
+        weekly_scn = {
+            "weekly_neutral_baseline_forecast": aggregate_daily_to_weekly(scenario_result["neutral_baseline_forecast"].rename(columns={"baseline_pred": "sales"})).rename(columns={"sales": "baseline_pred_weekly"}),
+            "weekly_as_is_forecast": aggregate_daily_to_weekly(scenario_result["as_is_forecast"].rename(columns={"actual_sales": "sales"})).rename(columns={"sales": "final_as_is"}),
+            "weekly_scenario_forecast": aggregate_daily_to_weekly(scenario_result["scenario_forecast"].rename(columns={"actual_sales": "sales"})).rename(columns={"sales": "final_scenario"}),
+            "weekly_factor_effect_as_is": aggregate_daily_to_weekly(scenario_result["as_is_forecast"].rename(columns={"factor_multiplier": "sales"})).rename(columns={"sales": "factor_effect_as_is"}),
+            "weekly_factor_effect_scenario": aggregate_daily_to_weekly(scenario_result["scenario_forecast"].rename(columns={"factor_multiplier": "sales"})).rename(columns={"sales": "factor_effect_scenario"}),
+            "factor_effect_source": scenario_result.get("factor_effect_source", scenario_result.get("scenario_effect_source", "bounded_rules")),
+            "shock_applied": bool(scenario_result.get("shock_applied", False)),
+        }
+
+    weekday_profile = build_weekday_profile(target_history)
+    daily_presented_as_is = disaggregate_weekly_to_daily(
+        weekly_scn["weekly_as_is_forecast"][["week_start", "final_as_is"]].rename(columns={"final_as_is": "baseline_pred_weekly"}),
+        future_dates[["date"]],
+        weekday_profile,
+    ).rename(columns={"baseline_pred": "actual_sales"})
+    daily_presented_scenario = disaggregate_weekly_to_daily(
+        weekly_scn["weekly_scenario_forecast"][["week_start", "final_scenario"]].rename(columns={"final_scenario": "baseline_pred_weekly"}),
+        future_dates[["date"]],
+        weekday_profile,
+    ).rename(columns={"baseline_pred": "actual_sales"})
+
+    baseline_by_date = neutral_baseline_forecast[["date", "baseline_pred"]].copy()
+    as_is_forecast = daily_presented_as_is.merge(baseline_by_date, on="date", how="left")
+    as_is_forecast["factor_multiplier"] = float(pd.to_numeric(weekly_scn["weekly_factor_effect_as_is"].get("factor_effect_as_is", pd.Series([1.0])), errors="coerce").mean())
+    as_is_forecast["shock_multiplier"] = 1.0
+    as_is_forecast["demand_raw"] = as_is_forecast["actual_sales"]
+    as_is_forecast["final_demand"] = as_is_forecast["actual_sales"]
+    as_is_forecast["scenario_demand_raw"] = as_is_forecast["actual_sales"]
+    as_is_forecast["lost_sales"] = 0.0
+    as_is_forecast["remaining_stock"] = np.nan
+
+    scenario_forecast = daily_presented_scenario.merge(baseline_by_date, on="date", how="left")
+    scenario_forecast["factor_multiplier"] = float(pd.to_numeric(weekly_scn["weekly_factor_effect_scenario"].get("factor_effect_scenario", pd.Series([1.0])), errors="coerce").mean())
+    scenario_forecast["shock_multiplier"] = 1.0
+    scenario_forecast["demand_raw"] = scenario_forecast["actual_sales"]
+    scenario_forecast["final_demand"] = scenario_forecast["actual_sales"]
+    scenario_forecast["scenario_demand_raw"] = scenario_forecast["actual_sales"]
+    scenario_forecast["lost_sales"] = 0.0
+    scenario_forecast["remaining_stock"] = np.nan
 
     n_input = neutral_baseline_forecast.copy()
     n_input["price"] = max(float(neutral_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])), 1e-6)
@@ -877,6 +1001,10 @@ def run_full_pricing_analysis_v2(
         current_price=float(current_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])),
         forecast_horizon_days=int(horizon_days),
         objective_mode=str(objective_mode),
+        trained_weekly_factor=trained_weekly_factor,
+        weekly_factor_feature_cols=weekly_factor_feature_cols,
+        weekly_baseline_forecast_native=weekly_scn.get("weekly_neutral_baseline_forecast"),
+        weekday_profile=weekday_profile,
     )
 
     return {
@@ -924,9 +1052,27 @@ def run_full_pricing_analysis_v2(
         "mode": mode,
         "scenario_mode": scenario_result.get("scenario_mode", mode),
         "scenario_effect_source": scenario_result.get("scenario_effect_source", mode),
+        "factor_effect_source": weekly_scn.get("factor_effect_source", scenario_result.get("factor_effect_source", scenario_result.get("scenario_effect_source", mode))),
+        "shock_applied": bool(weekly_scn.get("shock_applied", scenario_result.get("shock_applied", False))),
         "factor_role": factor_role,
         "ood_flags": ood_flags,
         "intervals_available": intervals_available,
+        "weekly_history": aggregate_daily_to_weekly(target_history),
+        "weekly_future": aggregate_daily_to_weekly(as_is_forecast.rename(columns={"actual_sales": "sales"})),
+        "weekly_baseline_oof": aggregate_daily_to_weekly(
+            baseline_oof[["date", "baseline_oof"]].rename(columns={"baseline_oof": "sales"})
+        ),
+        "weekly_baseline_forecast": weekly_scn["weekly_neutral_baseline_forecast"].rename(columns={"baseline_pred_weekly": "sales"}),
+        "weekly_factor_oof": aggregate_daily_to_weekly(
+            factor_train_target[["date", "factor_target"]].rename(columns={"factor_target": "sales"})
+        ) if not factor_train_target.empty else pd.DataFrame(columns=["week_start", "sales"]),
+        "weekly_factor_target": weekly_factor_target.copy(),
+        "weekly_factor_effect_as_is": weekly_scn["weekly_factor_effect_as_is"].rename(columns={"factor_effect_as_is": "sales"}),
+        "weekly_factor_effect_scenario": weekly_scn["weekly_factor_effect_scenario"].rename(columns={"factor_effect_scenario": "sales"}),
+        "weekly_final_forecast_as_is": weekly_scn["weekly_as_is_forecast"][["week_start", "final_as_is"]].rename(columns={"final_as_is": "sales"}),
+        "weekly_final_forecast_scenario": weekly_scn["weekly_scenario_forecast"][["week_start", "final_scenario"]].rename(columns={"final_scenario": "sales"}),
+        "daily_presented_as_is": daily_presented_as_is.copy(),
+        "daily_presented_scenario": daily_presented_scenario.copy(),
         "target_series_id": str(target_series_id),
         "unit_price_input_type": str(unit_price_input_type),
         "economics_mode": str(economics_mode),

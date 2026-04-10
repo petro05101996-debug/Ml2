@@ -5,7 +5,8 @@ from typing import Any, Dict
 import pandas as pd
 
 from calc_engine import compute_daily_unit_economics
-from pricing_core.scenario_engine import run_scenario_forecast
+from pricing_core.baseline_model import disaggregate_weekly_to_daily
+from pricing_core.scenario_engine import run_weekly_scenario_forecast
 
 
 def _confidence_map(label: str) -> float:
@@ -46,26 +47,60 @@ def run_v2_what_if_projection(
         if str(k).startswith("user_factor_num__") or str(k).startswith("user_factor_cat__"):
             overrides[k] = v
 
-    baseline_override = trained_bundle.get("neutral_baseline_forecast", trained_bundle.get("baseline_forecast"))
-    scenario_result = run_scenario_forecast(
-        trained_baseline=trained_bundle.get("trained_baseline_final"),
-        trained_factor=trained_bundle.get("trained_factor"),
-        base_history=target_history,
-        future_dates_df=future_dates,
-        baseline_feature_spec=trained_bundle.get("baseline_feature_spec_full", trained_bundle.get("baseline_feature_spec_final", {})),
-        factor_feature_spec=trained_bundle.get("factor_feature_spec"),
-        scenario_overrides=overrides,
+    weekly_baseline = trained_bundle.get("weekly_baseline_forecast", pd.DataFrame()).copy()
+    if not weekly_baseline.empty and "sales" in weekly_baseline.columns:
+        weekly_baseline = weekly_baseline.rename(columns={"sales": "baseline_pred_weekly"})
+    if weekly_baseline.empty:
+        # fallback for legacy bundles
+        baseline_override = trained_bundle.get("neutral_baseline_forecast", trained_bundle.get("baseline_forecast", pd.DataFrame()))
+        if isinstance(baseline_override, pd.DataFrame) and not baseline_override.empty:
+            from pricing_core.baseline_model import aggregate_daily_to_weekly
+
+            weekly_baseline = aggregate_daily_to_weekly(baseline_override.rename(columns={"baseline_pred": "sales"})).rename(columns={"sales": "baseline_pred_weekly"})
+
+    weekly_result = run_weekly_scenario_forecast(
+        weekly_baseline_forecast=weekly_baseline[["week_start", "baseline_pred_weekly"]],
+        trained_weekly_factor=trained_bundle.get("trained_weekly_factor"),
+        current_ctx=current_ctx,
+        scenario_ctx=overrides,
         shocks=(scenario or {}).get("shocks"),
-        baseline_override_df=baseline_override[["date", "baseline_pred"]] if isinstance(baseline_override, pd.DataFrame) else None,
-        demand_multiplier=float(demand_multiplier),
+        confidence_level=str((trained_bundle.get("confidence", {}) or {}).get("overall_confidence", "medium")),
     )
-    as_is_forecast = scenario_result["as_is_forecast"].copy()
-    sf = scenario_result["scenario_forecast"].copy()
+    weekday_profile = trained_bundle.get("weekday_profile")
+    if weekday_profile is None:
+        weekday_profile = pd.Series([1.0 / 7.0] * 7, index=range(7), dtype=float)
+    as_is_forecast = disaggregate_weekly_to_daily(
+        weekly_result["weekly_as_is_forecast"][["week_start", "final_as_is"]].rename(columns={"final_as_is": "baseline_pred_weekly"}),
+        future_dates[["date"]],
+        weekday_profile,
+    ).rename(columns={"baseline_pred": "actual_sales"})
+    sf = disaggregate_weekly_to_daily(
+        weekly_result["weekly_scenario_forecast"][["week_start", "final_scenario"]].rename(columns={"final_scenario": "baseline_pred_weekly"}),
+        future_dates[["date"]],
+        weekday_profile,
+    ).rename(columns={"baseline_pred": "actual_sales"})
+    sf["scenario_demand_raw"] = pd.to_numeric(sf["actual_sales"], errors="coerce").fillna(0.0)
+    if stock_cap is not None:
+        remaining = max(0.0, float(stock_cap))
+        capped = []
+        lost = []
+        for v in pd.to_numeric(sf["scenario_demand_raw"], errors="coerce").fillna(0.0).clip(lower=0.0):
+            a = min(float(v), remaining)
+            capped.append(a)
+            lost.append(max(0.0, float(v) - a))
+            remaining -= a
+        sf["actual_sales"] = capped
+        sf["lost_sales"] = lost
+    else:
+        sf["lost_sales"] = 0.0
+
     sf["price"] = max(float(overrides.get("price", manual_price)), 1e-6)
     sf["discount"] = float(overrides.get("discount", 0.0))
     sf["cost"] = float(overrides.get("cost", 0.0))
     sf["freight_value"] = float(overrides.get("freight_value", 0.0))
     as_is_input = as_is_forecast.copy()
+    as_is_input["scenario_demand_raw"] = as_is_input["actual_sales"]
+    as_is_input["lost_sales"] = 0.0
     as_is_input["price"] = max(float(current_ctx.get("price", manual_price)), 1e-6)
     as_is_input["discount"] = float(current_ctx.get("discount", 0.0))
     as_is_input["cost"] = float(current_ctx.get("cost", 0.0))
@@ -112,10 +147,15 @@ def run_v2_what_if_projection(
         "confidence_label": conf_label,
         "confidence_score": conf_score,
         "uncertainty_score": float(max(0.0, 1.0 - conf_score)),
-        "ood_flags": scenario_result.get("ood_flags", []),
-        "scenario_mode": scenario_result.get("scenario_mode", scenario_result.get("mode", "fallback_elasticity")),
+        "ood_flags": weekly_result.get("ood_flags", []),
+        "scenario_mode": "weekly_native",
         "factor_role": str(trained_bundle.get("factor_role", "unavailable")),
-        "scenario_effect_source": scenario_result.get("scenario_effect_source", "fallback_elasticity"),
+        "scenario_effect_source": weekly_result.get("factor_effect_source", "bounded_rules"),
+        "factor_effect_source": weekly_result.get("factor_effect_source", "bounded_rules"),
+        "shock_applied": bool(weekly_result.get("shock_applied", False)),
+        "baseline_component_total": float(pd.to_numeric(weekly_result["weekly_scenario_forecast"].get("baseline_component", 0.0), errors="coerce").fillna(0.0).sum()) if "weekly_scenario_forecast" in weekly_result else 0.0,
+        "factor_effect_avg": float(pd.to_numeric(weekly_result["weekly_factor_effect_scenario"].get("factor_effect_scenario", 1.0), errors="coerce").fillna(1.0).mean()) if "weekly_factor_effect_scenario" in weekly_result else 1.0,
+        "shock_effect_avg": float(pd.to_numeric(weekly_result["weekly_scenario_forecast"].get("shock_effect", 1.0), errors="coerce").fillna(1.0).mean()) if "weekly_scenario_forecast" in weekly_result else 1.0,
         "economics_mode": str(trained_bundle.get("economics_mode", "net_price")),
         "unit_price_input_type": str(trained_bundle.get("unit_price_input_type", "net")),
     }
