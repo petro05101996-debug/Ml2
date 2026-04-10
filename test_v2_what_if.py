@@ -34,3 +34,4 @@ def test_what_if_confidence_propagation_and_factor_role():
     r = run_v2_what_if_projection(b, manual_price=10.0, horizon_days=7)
     assert r["confidence_label"] == out["confidence"]["overall_confidence"]
     assert "factor_role" in r
+    assert r["scenario_mode"] == "weekly_native"

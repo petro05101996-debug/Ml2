@@ -98,3 +98,33 @@ def generate_explanation(result_bundle: Dict[str, Any], data_quality: Optional[D
         "sales_change_pct": float(sales_change_pct),
         "mean_elasticity": None,
     }
+
+
+def compute_scenario_confidence(
+    baseline_quality_gate: Dict[str, Any],
+    factor_backtest: Dict[str, Any],
+    factor_effect_source: str,
+    ood_flags: List[str] | None = None,
+) -> Dict[str, Any]:
+    ood_count = len(ood_flags or [])
+    baseline_ok = bool(baseline_quality_gate.get("baseline_meets_quality_gate", False))
+    sign_stability = float(factor_backtest.get("price_sign_stability", 0.0) or 0.0)
+    trained = bool(factor_backtest.get("trained", False))
+    src = str(factor_effect_source or "bounded_rules")
+    reasons: List[str] = []
+    level = "medium"
+    if (not baseline_ok) or ood_count > 0:
+        level = "low"
+    elif trained and sign_stability >= 0.7 and src.startswith("ml_uplift"):
+        level = "high"
+    if not baseline_ok:
+        reasons.append("baseline_quality_gate_failed")
+    if ood_count > 0:
+        reasons.append("scenario_ood")
+    if src.startswith("bounded_rules"):
+        reasons.append("factor_fallback")
+    return {
+        "overall_confidence": level,
+        "confidence_score": {"low": 0.35, "medium": 0.6, "high": 0.8}[level],
+        "confidence_reasons": reasons,
+    }

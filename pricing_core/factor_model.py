@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
 
 from pricing_core.model_utils import HAS_XGBOOST, XGBRegressor, clean_feature_frame
 
@@ -281,6 +282,44 @@ def compute_scenario_delta_contributions(
     feature_spec: Dict[str, Any],
 ) -> pd.DataFrame:
     return _compute_delta_contributions(target_history, future_dates_df, current_ctx, scenario_ctx, trained_factor, feature_spec)
+
+
+def train_weekly_factor_model(weekly_train_df: pd.DataFrame, feature_cols: List[str]) -> Dict[str, Any] | None:
+    if weekly_train_df is None or len(weekly_train_df) < 12:
+        return None
+    x = weekly_train_df.copy()
+    for c in feature_cols:
+        if c not in x.columns:
+            x[c] = 0.0
+        x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
+    y = pd.to_numeric(x.get("factor_target_week", np.nan), errors="coerce").clip(lower=0.4, upper=1.8)
+    m = y.notna()
+    if int(m.sum()) < 12:
+        return None
+    variative = 0
+    for c in feature_cols:
+        if float(pd.to_numeric(x.loc[m, c], errors="coerce").nunique(dropna=True)) > 2:
+            variative += 1
+    if variative < 2:
+        return None
+    if float(pd.to_numeric(y.loc[m], errors="coerce").std()) < 0.03:
+        return None
+    model = Ridge(alpha=1.0, random_state=42)
+    model.fit(x.loc[m, feature_cols], np.log(y.loc[m]))
+    return {"model": model, "feature_cols": feature_cols, "model_backend": "ridge_weekly", "target": "factor_target_week"}
+
+
+def predict_weekly_factor_effect(weekly_df: pd.DataFrame, trained_weekly_factor: Dict[str, Any] | None, clip_low: float = 0.7, clip_high: float = 1.3) -> pd.Series:
+    if trained_weekly_factor is None:
+        return pd.Series(1.0, index=weekly_df.index, dtype=float)
+    feature_cols = list(trained_weekly_factor.get("feature_cols", []))
+    x = weekly_df.copy()
+    for c in feature_cols:
+        if c not in x.columns:
+            x[c] = 0.0
+        x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
+    pred_log = trained_weekly_factor["model"].predict(x[feature_cols])
+    return pd.Series(np.exp(pred_log), index=weekly_df.index).clip(lower=clip_low, upper=clip_high)
 
 
 def compute_factor_contributions(target_history: pd.DataFrame, future_dates_df: pd.DataFrame, base_ctx: Dict[str, Any], scenario_ctx: Dict[str, Any], trained_factor: Dict[str, Any], feature_spec: Dict[str, Any]) -> pd.DataFrame:

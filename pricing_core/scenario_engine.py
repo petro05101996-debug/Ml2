@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from pricing_core.baseline_model import recursive_baseline_forecast
-from pricing_core.factor_model import build_factor_ood_flags, predict_factor_effect
+from pricing_core.factor_model import build_factor_ood_flags, predict_factor_effect, predict_weekly_factor_effect
 from pricing_core.shock_engine import build_default_no_shock_profile, build_shock_profile
 
 SCENARIO_NUMERIC_KEYS = ["price", "discount", "promotion", "cost", "freight_value"]
@@ -214,12 +214,12 @@ def predict_context_multiplier(target_history: pd.DataFrame, future_dates_df: pd
     if trained_factor is not None:
         factor_pred_df = predict_factor_effect(factor_future_df, trained_factor, feature_spec)
         mode = "baseline_plus_scenario"
-        source = "ml_factor_model"
+        source = "ml_uplift"
         factor_multiplier_series = pd.to_numeric(factor_pred_df["factor_multiplier"], errors="coerce").fillna(1.0)
     else:
         factor_pred_df = pd.DataFrame({"factor_multiplier": _fallback_multiplier(target_history, ctx, len(factor_future_df))}, index=factor_future_df.index)
         mode = "fallback_elasticity"
-        source = "fallback_elasticity"
+        source = "bounded_rules"
         factor_multiplier_series = pd.to_numeric(factor_pred_df["factor_multiplier"], errors="coerce").fillna(1.0)
     return {
         "factor_future_df": factor_future_df,
@@ -229,6 +229,19 @@ def predict_context_multiplier(target_history: pd.DataFrame, future_dates_df: pd
         "mode": mode,
         "scenario_effect_source": source,
     }
+
+
+def _bounded_effect(series: pd.Series, confidence_level: str, ood_count: int) -> pd.Series:
+    bounds = {
+        "high": (0.65, 1.40),
+        "medium": (0.75, 1.25),
+        "low": (0.85, 1.15),
+    }
+    lo, hi = bounds.get(str(confidence_level).lower(), bounds["medium"])
+    if ood_count > 0:
+        lo = max(lo, 0.9)
+        hi = min(hi, 1.1)
+    return pd.to_numeric(series, errors="coerce").fillna(1.0).clip(lower=lo, upper=hi)
 
 
 def _contexts_equal_on_controls(a: Dict[str, Any], b: Dict[str, Any], controls: List[str]) -> bool:
@@ -255,6 +268,7 @@ def run_scenario_forecast(
     baseline_override_df: pd.DataFrame | None = None,
     demand_multiplier: float = 1.0,
     factor_backtest_summary: Dict[str, Any] | None = None,
+    confidence_level: str = "medium",
 ) -> Dict[str, Any]:
     base_ctx = {}
     for c in baseline_feature_spec.get("baseline_context_features", []):
@@ -284,8 +298,16 @@ def run_scenario_forecast(
 
     shock_df = build_shock_profile(shocks, future_dates_df) if shocks else build_default_no_shock_profile(future_dates_df)
     out = neutral_baseline_df.merge(shock_df, on="date", how="left")
-    out["current_multiplier"] = pd.to_numeric(current_mult["factor_multiplier_series"], errors="coerce").fillna(1.0)
-    out["scenario_multiplier"] = pd.to_numeric(scenario_mult["factor_multiplier_series"], errors="coerce").fillna(1.0)
+    out["current_multiplier"] = _bounded_effect(
+        current_mult["factor_multiplier_series"],
+        confidence_level=confidence_level,
+        ood_count=len(current_mult["ood_flags"]),
+    )
+    out["scenario_multiplier"] = _bounded_effect(
+        scenario_mult["factor_multiplier_series"],
+        confidence_level=confidence_level,
+        ood_count=len(scenario_mult["ood_flags"]),
+    )
     out["shock_multiplier"] = pd.to_numeric(out["shock_multiplier"], errors="coerce").fillna(1.0).clip(0.2, 5.0)
     out["neutral_baseline_pred"] = pd.to_numeric(out["baseline_pred"], errors="coerce").fillna(0.0)
     out["as_is_demand_raw"] = (out["neutral_baseline_pred"] * out["current_multiplier"] * out["shock_multiplier"] * float(demand_multiplier)).clip(lower=0.0)
@@ -326,17 +348,26 @@ def run_scenario_forecast(
     as_is_forecast = as_is_forecast.rename(columns={"current_multiplier": "factor_multiplier", "as_is_actual_sales": "actual_sales", "as_is_lost_sales": "lost_sales", "as_is_remaining_stock": "remaining_stock", "as_is_demand_raw": "demand_raw"})
     as_is_forecast["final_demand"] = as_is_forecast["actual_sales"]
     as_is_forecast["scenario_demand_raw"] = as_is_forecast["demand_raw"]  # backward compatibility
+    as_is_forecast["baseline_component"] = as_is_forecast["baseline_pred"]
+    as_is_forecast["factor_effect"] = as_is_forecast["factor_multiplier"]
+    as_is_forecast["shock_effect"] = as_is_forecast["shock_multiplier"]
+    as_is_forecast["final_forecast"] = as_is_forecast["actual_sales"]
 
     scenario_forecast = out[["date", "baseline_pred", "scenario_multiplier", "shock_multiplier", "scenario_demand_raw", "scenario_actual_sales", "scenario_lost_sales", "scenario_remaining_stock"]].copy()
     scenario_forecast = scenario_forecast.rename(columns={"scenario_multiplier": "factor_multiplier", "scenario_actual_sales": "actual_sales", "scenario_lost_sales": "lost_sales", "scenario_remaining_stock": "remaining_stock"})
     scenario_forecast["demand_raw"] = scenario_forecast["scenario_demand_raw"]
     scenario_forecast["final_demand"] = scenario_forecast["actual_sales"]
+    scenario_forecast["baseline_component"] = scenario_forecast["baseline_pred"]
+    scenario_forecast["factor_effect"] = scenario_forecast["factor_multiplier"]
+    scenario_forecast["shock_effect"] = scenario_forecast["shock_multiplier"]
+    scenario_forecast["final_forecast"] = scenario_forecast["actual_sales"]
     scenario_forecast["scenario_lower"] = np.nan
     scenario_forecast["scenario_upper"] = np.nan
 
     mode = current_mult["mode"]
     scenario_mode = scenario_mult["mode"]
-    source = scenario_mult["scenario_effect_source"]
+    factor_source = scenario_mult["scenario_effect_source"]
+    source = f"{factor_source}+shock" if shocks else factor_source
     if "scenario_outside_factor_backtest_range" in warnings:
         scenario_mode = "advisory_only"
 
@@ -355,6 +386,8 @@ def run_scenario_forecast(
         "mode": mode,
         "scenario_mode": scenario_mode,
         "scenario_effect_source": source,
+        "factor_effect_source": factor_source,
+        "shock_applied": bool(shocks),
         # backward-compatible keys
         "base_ctx": current_ctx,
         "ood_flags": sorted(set(current_mult["ood_flags"] + scenario_mult["ood_flags"])),
@@ -365,3 +398,65 @@ def compute_scenario_delta(baseline_df: pd.DataFrame, scenario_df: pd.DataFrame)
     b = float(pd.to_numeric(baseline_df.get("baseline_pred", 0.0), errors="coerce").fillna(0.0).sum())
     s = float(pd.to_numeric(scenario_df.get("actual_sales", scenario_df.get("final_demand", 0.0)), errors="coerce").fillna(0.0).sum())
     return pd.DataFrame([{"baseline_total_demand": b, "scenario_total_demand": s, "demand_delta_abs": s - b, "demand_delta_pct": 0.0 if abs(b) < 1e-9 else (s - b) / b}])
+
+
+def run_weekly_scenario_forecast(
+    weekly_baseline_forecast: pd.DataFrame,
+    trained_weekly_factor: Dict[str, Any] | None,
+    current_ctx: Dict[str, Any],
+    scenario_ctx: Dict[str, Any],
+    shocks: List[Dict[str, Any]] | None = None,
+    confidence_level: str = "medium",
+) -> Dict[str, Any]:
+    wk = weekly_baseline_forecast.copy()
+    wk["week_start"] = pd.to_datetime(wk["week_start"], errors="coerce")
+    wk = wk.sort_values("week_start").reset_index(drop=True)
+    if "baseline_pred_weekly" not in wk.columns and "baseline_pred" in wk.columns:
+        wk["baseline_pred_weekly"] = pd.to_numeric(wk["baseline_pred"], errors="coerce").fillna(0.0)
+
+    def _weekly_ctx_features(ctx: Dict[str, Any]) -> pd.DataFrame:
+        out = wk[["week_start"]].copy()
+        out["avg_price_week"] = float(pd.to_numeric(pd.Series([ctx.get("price", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        out["avg_discount_week"] = float(pd.to_numeric(pd.Series([ctx.get("discount", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        out["promo_share_week"] = 1.0 if float(pd.to_numeric(pd.Series([ctx.get("promotion", 0.0)]), errors="coerce").fillna(0.0).iloc[0]) > 0 else 0.0
+        out["avg_freight_week"] = float(pd.to_numeric(pd.Series([ctx.get("freight_value", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        out["avg_cost_week"] = float(pd.to_numeric(pd.Series([ctx.get("cost", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        return out
+
+    cur_feat = _weekly_ctx_features(current_ctx)
+    scn_feat = _weekly_ctx_features(scenario_ctx)
+    cur_mult = predict_weekly_factor_effect(cur_feat, trained_weekly_factor)
+    scn_mult = predict_weekly_factor_effect(scn_feat, trained_weekly_factor)
+    cur_mult = _bounded_effect(cur_mult, confidence_level, ood_count=0)
+    scn_mult = _bounded_effect(scn_mult, confidence_level, ood_count=0)
+
+    shock_weekly = pd.Series(1.0, index=wk.index, dtype=float)
+    if shocks:
+        for sh in shocks:
+            ws = pd.Timestamp(sh.get("start_date"))
+            we = pd.Timestamp(sh.get("end_date"))
+            intensity = float(pd.to_numeric(pd.Series([sh.get("intensity", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+            direction = str(sh.get("direction", "positive")).lower()
+            mult = 1.0 + abs(intensity) if direction == "positive" else max(0.0, 1.0 - abs(intensity))
+            mask = (wk["week_start"] >= ws) & (wk["week_start"] <= we)
+            shock_weekly.loc[mask] = shock_weekly.loc[mask] * mult
+    shock_weekly = shock_weekly.clip(lower=0.5, upper=1.5)
+
+    out = wk.copy()
+    out["baseline_component"] = pd.to_numeric(out["baseline_pred_weekly"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    out["factor_effect_as_is"] = cur_mult.values
+    out["factor_effect_scenario"] = scn_mult.values
+    out["shock_effect"] = shock_weekly.values
+    out["final_as_is"] = (out["baseline_component"] * out["factor_effect_as_is"] * out["shock_effect"]).clip(lower=0.0)
+    out["final_scenario"] = (out["baseline_component"] * out["factor_effect_scenario"] * out["shock_effect"]).clip(lower=0.0)
+    return {
+        "weekly_neutral_baseline_forecast": out[["week_start", "baseline_component"]].rename(columns={"baseline_component": "baseline_pred_weekly"}),
+        "weekly_as_is_forecast": out[["week_start", "baseline_component", "factor_effect_as_is", "shock_effect", "final_as_is"]],
+        "weekly_scenario_forecast": out[["week_start", "baseline_component", "factor_effect_scenario", "shock_effect", "final_scenario"]],
+        "weekly_factor_effect_as_is": out[["week_start", "factor_effect_as_is"]],
+        "weekly_factor_effect_scenario": out[["week_start", "factor_effect_scenario"]],
+        "factor_effect_source": "ml_uplift" if trained_weekly_factor is not None else "bounded_rules",
+        "shock_applied": bool(shocks),
+        "ood_flags": [],
+        "warnings": [],
+    }
