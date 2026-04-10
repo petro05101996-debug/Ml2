@@ -18,8 +18,8 @@ except Exception:  # pragma: no cover - optional fallback
     HAS_STATSMODELS_ETS = False
 
 
-BENCHMARK_ONLY_STRATEGIES = {"median7", "mean28", "dow_median8w", "recent_level_dow_profile", "recent_level_dow_trend"}
-PRODUCTION_CANDIDATE_STRATEGIES = {"xgb_recursive", "rolling_dow_regression", "ets_seasonal7", "weekly_median4w", "weekly_recent4_avg", "weekly_mean8w"}
+BENCHMARK_ONLY_STRATEGIES = {"median7", "mean28", "dow_median8w", "recent_level_dow_trend"}
+PRODUCTION_CANDIDATE_STRATEGIES = {"xgb_recursive", "rolling_dow_regression", "ets_seasonal7", "weekly_median4w", "weekly_recent4_avg", "weekly_mean8w", "recent_level_dow_profile"}
 
 
 def _params(training_profile: str, small_mode: bool) -> Dict[str, Any]:
@@ -136,28 +136,73 @@ def recursive_baseline_forecast_dow_median8w(base_history: pd.DataFrame, future_
     return pd.DataFrame(rows)
 
 
-def recursive_baseline_forecast_recent_level_dow_profile(base_history: pd.DataFrame, future_dates_df: pd.DataFrame) -> pd.DataFrame:
+def recursive_baseline_forecast_recent_level_dow_profile(
+    base_history: pd.DataFrame,
+    future_dates_df: pd.DataFrame,
+) -> pd.DataFrame:
     hist = base_history.copy()
     hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
     hist["sales"] = pd.to_numeric(hist.get("sales", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
     hist = hist.dropna(subset=["date"]).sort_values("date")
+
     if hist.empty:
         return pd.DataFrame({"date": pd.to_datetime(future_dates_df["date"]), "baseline_pred": 0.0})
 
+    recent_56 = hist.tail(56)["sales"]
     recent_28 = hist.tail(28)["sales"]
+    recent_14 = hist.tail(14)["sales"]
     recent_7 = hist.tail(7)["sales"]
-    recent_28_mean = float(recent_28.mean()) if len(recent_28) else float(hist["sales"].mean())
-    recent_7_median = float(recent_7.median()) if len(recent_7) else recent_28_mean
-    ratio = float(np.clip(recent_7_median / max(recent_28_mean, 1e-6), 0.90, 1.10))
-    base_level = max(0.0, recent_28_mean * ratio)
-    dow_profile = build_weekday_profile(hist, lookback_weeks=8, smoothing=0.5)
-    dow_weights = (dow_profile * 7.0).reindex(range(7), fill_value=1.0)
 
-    rows: List[Dict[str, Any]] = []
-    for dt in pd.to_datetime(future_dates_df["date"], errors="coerce"):
+    mean_56 = float(recent_56.mean()) if len(recent_56) else float(hist["sales"].mean())
+    mean_28 = float(recent_28.mean()) if len(recent_28) else mean_56
+    mean_14 = float(recent_14.mean()) if len(recent_14) else mean_28
+    mean_7 = float(recent_7.mean()) if len(recent_7) else mean_14
+
+    level_raw = 0.50 * mean_28 + 0.30 * mean_14 + 0.20 * mean_7
+    if np.isfinite(mean_56) and mean_56 > 1e-6:
+        level = float(np.clip(level_raw, 0.85 * mean_56, 1.15 * mean_56))
+    else:
+        level = max(0.0, level_raw)
+    level = max(0.0, level)
+
+    short_profile = build_weekday_profile(hist, lookback_weeks=4, smoothing=0.35)
+    long_profile = build_weekday_profile(hist, lookback_weeks=8, smoothing=0.50)
+    blended_profile = (0.65 * short_profile + 0.35 * long_profile).reindex(range(7), fill_value=(1.0 / 7.0))
+
+    dow_weights = blended_profile * 7.0
+    dow_weights = 1.15 * (dow_weights - 1.0) + 1.0
+    dow_weights = np.clip(dow_weights, 0.65, 1.45)
+    dow_weights = dow_weights / float(np.mean(dow_weights))
+
+    weekly_hist = aggregate_daily_to_weekly(hist).tail(8).copy()
+    week_growth_step = 0.0
+    if len(weekly_hist) >= 6:
+        prev4 = float(weekly_hist["sales"].head(max(1, len(weekly_hist) - 4)).tail(4).mean())
+        last4 = float(weekly_hist["sales"].tail(4).mean())
+        if np.isfinite(prev4) and prev4 > 1e-6:
+            trend_ratio = float(np.clip(last4 / prev4, 0.88, 1.12))
+            week_growth_step = float(np.clip((trend_ratio - 1.0) / 4.0, -0.025, 0.025))
+
+    future_dates = pd.to_datetime(future_dates_df["date"], errors="coerce")
+    rows = []
+    for idx, dt in enumerate(future_dates):
         dow = int(pd.Timestamp(dt).dayofweek)
-        rows.append({"date": pd.Timestamp(dt), "baseline_pred": max(0.0, base_level * float(dow_weights.get(dow, 1.0)))})
-    return pd.DataFrame(rows)
+        week_idx = idx // 7
+        trend_mult = float(np.clip(1.0 + week_growth_step * week_idx, 0.92, 1.08))
+        pred = level * trend_mult * float(dow_weights.get(dow, 1.0))
+        rows.append({"date": pd.Timestamp(dt), "baseline_pred": max(0.0, pred), "_week_idx": week_idx})
+
+    out = pd.DataFrame(rows)
+
+    for w in sorted(out["_week_idx"].dropna().unique()):
+        mask = out["_week_idx"] == w
+        trend_mult = float(np.clip(1.0 + week_growth_step * int(w), 0.92, 1.08))
+        target_total = 7.0 * level * trend_mult
+        current_total = float(out.loc[mask, "baseline_pred"].sum())
+        if current_total > 1e-9:
+            out.loc[mask, "baseline_pred"] *= target_total / current_total
+
+    return out.drop(columns=["_week_idx"])
 
 
 def recursive_baseline_forecast_recent_level_dow_trend(base_history: pd.DataFrame, future_dates_df: pd.DataFrame) -> pd.DataFrame:

@@ -299,19 +299,14 @@ def run_full_pricing_analysis_v2(
                 bench_rank["composite_score"] = np.nan
             if "median_wape" not in bench_rank.columns:
                 bench_rank["median_wape"] = np.nan
-            top2 = bench_rank.sort_values(["composite_score", "median_wape"]).head(2).copy()
-            runner_up_strategy = ""
-            runner_up_score = np.nan
-            if len(top2) >= 2:
-                runner_up_strategy = str(top2.iloc[1].get("strategy", ""))
-                runner_up_score = float(top2.iloc[1].get("composite_score", np.nan))
+            top1 = bench_rank.sort_values(["composite_score", "median_wape"]).head(1).copy()
             baseline_selection_result = {
-                "best_available_strategy": str(top2.iloc[0].get("strategy", best_baseline_strategy)),
-                "best_available_granularity": str(top2.iloc[0].get("granularity", baseline_granularity)),
-                "baseline_meets_quality_gate": bool(top2.iloc[0].get("acceptance_pass", False)),
-                "baseline_rejection_reason": "" if bool(top2.iloc[0].get("acceptance_pass", False)) else "quality_gate_failed",
-                "runner_up_strategy": runner_up_strategy,
-                "runner_up_score": runner_up_score,
+                "best_available_strategy": str(top1.iloc[0].get("strategy", best_baseline_strategy)),
+                "best_available_granularity": str(top1.iloc[0].get("granularity", baseline_granularity)),
+                "baseline_meets_quality_gate": bool(top1.iloc[0].get("acceptance_pass", False)),
+                "baseline_rejection_reason": "" if bool(top1.iloc[0].get("acceptance_pass", False)) else "quality_gate_failed",
+                "runner_up_strategy": "",
+                "runner_up_score": np.nan,
             }
         else:
             baseline_selection_result = {
@@ -336,6 +331,34 @@ def run_full_pricing_analysis_v2(
                 f"selected by plan ({best_baseline_strategy}/{baseline_granularity}); "
                 "benchmark suite diagnostics only"
             )
+        runner_up_strategy = ""
+        runner_up_score = np.nan
+
+        if not baseline_benchmark_suite.empty:
+            ranked = baseline_benchmark_suite.copy()
+            if "composite_score" not in ranked.columns:
+                ranked["composite_score"] = np.nan
+            if "median_wape" not in ranked.columns:
+                ranked["median_wape"] = np.nan
+
+            ranked = ranked[
+                ~(
+                    (ranked["strategy"].astype(str) == str(best_baseline_strategy))
+                    & (ranked["granularity"].astype(str) == str(baseline_granularity))
+                )
+            ].copy()
+
+            ranked = ranked.sort_values(["composite_score", "median_wape"], ascending=[True, True])
+
+            if not ranked.empty:
+                runner_up_strategy = str(ranked.iloc[0].get("strategy", ""))
+                runner_up_score = float(ranked.iloc[0].get("composite_score", np.nan))
+
+        baseline_selection_result["runner_up_strategy"] = runner_up_strategy
+        baseline_selection_result["runner_up_score"] = runner_up_score
+        baseline_selection_result["best_available_strategy"] = str(best_baseline_strategy)
+        baseline_selection_result["best_available_granularity"] = str(baseline_granularity)
+
         if not baseline_benchmark_suite.empty:
             baseline_benchmark_suite["winner_scope"] = "rejected"
             best_mask = (
@@ -651,16 +674,15 @@ def run_full_pricing_analysis_v2(
     )
 
     runner_up_note = "n/a"
-    if not baseline_benchmark_suite.empty:
-        bench_rank = baseline_benchmark_suite.copy()
-        if "composite_score" not in bench_rank.columns:
-            bench_rank["composite_score"] = np.nan
-        if "median_wape" not in bench_rank.columns:
-            bench_rank["median_wape"] = np.nan
-        top2 = bench_rank.sort_values(["composite_score", "median_wape"]).head(2).copy()
-        if len(top2) >= 2:
-            r = top2.iloc[1]
-            runner_up_note = f"{r.get('strategy')} ({r.get('granularity')}) score={float(r.get('composite_score', np.nan)):.2f}"
+    runner_up_strategy = str(baseline_selection_result.get("runner_up_strategy", ""))
+    if runner_up_strategy:
+        runner_up_granularity = ""
+        if not baseline_benchmark_suite.empty and "strategy" in baseline_benchmark_suite.columns:
+            ru = baseline_benchmark_suite[baseline_benchmark_suite["strategy"].astype(str) == runner_up_strategy].head(1)
+            if not ru.empty:
+                runner_up_granularity = str(ru.iloc[0].get("granularity", ""))
+        runner_up_score = float(baseline_selection_result.get("runner_up_score", np.nan))
+        runner_up_note = f"{runner_up_strategy} ({runner_up_granularity}) score={runner_up_score:.2f}"
     diagnostic_summary = pd.DataFrame(
         [
             {"item": "selected_baseline", "value": f"{best_baseline_strategy} ({baseline_granularity})"},
