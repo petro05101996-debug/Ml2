@@ -15,11 +15,11 @@ def render_overview() -> None:
     st.markdown('<div class="muted">Оцените влияние на спрос, выручку и прибыль до изменения цены на рынке.</div>', unsafe_allow_html=True)
     c1, c2 = st.columns([1, 1])
     with c1:
-        if st.button("Перейти к настройке", type="primary", use_container_width=True):
+        if st.button("Перейти к настройке", type="primary", width="stretch"):
             st.session_state.active_page = "Настройка"
             st.rerun()
     with c2:
-        if st.button("Как это работает", use_container_width=True):
+        if st.button("Как это работает", width="stretch"):
             st.session_state.active_page = "Модель и документация"
             st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)

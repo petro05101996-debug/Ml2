@@ -28,6 +28,14 @@ def test_what_if_stock_cap_applies_and_economics_consistent():
     assert w1["scenario_profit_total"] == w1["profit_total"]
 
 
+def test_what_if_as_is_side_respects_stock_lost_logic():
+    out = run_full_pricing_analysis_v2(_txn(), "cat", "sku-1", horizon_days=7)
+    b = out["_trained_bundle"]
+    w = run_v2_what_if_projection(b, manual_price=10.0, horizon_days=7, stock_cap=0.0)
+    assert w["lost_sales_total"] >= 0.0
+    assert w["as_is_demand_total"] >= 0.0
+
+
 def test_what_if_confidence_propagation_and_factor_role():
     out = run_full_pricing_analysis_v2(_txn(), "cat", "sku-1", horizon_days=7)
     b = out["_trained_bundle"]

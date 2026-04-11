@@ -1,7 +1,8 @@
 import pandas as pd
 
 from pricing_core.factor_features import build_factor_feature_matrix, derive_factor_feature_spec
-from pricing_core.scenario_engine import run_scenario_forecast
+from pricing_core.baseline_model import disaggregate_weekly_to_daily
+from pricing_core.scenario_engine import apply_total_stock_cap_weekly, run_scenario_forecast, run_weekly_scenario_forecast
 from pricing_core.shock_engine import build_shock_profile
 
 
@@ -206,3 +207,39 @@ def test_future_and_train_factor_feature_schema_are_synced_for_dynamic_features(
     assert required.issubset(future_cols)
     dynamic = {"recent_sales_level_7", "recent_sales_level_28", "sales_level_ratio_7_to_28", "weekday_profile_share", "days_since_last_promo", "price_rank_vs_last_8_weeks"}
     assert dynamic.issubset(set(train_mat.columns))
+
+
+def test_weekly_stock_cap_works():
+    capped = apply_total_stock_cap_weekly(pd.Series([10.0, 8.0, 5.0]), total_stock=12.0)
+    assert capped["actual_sales_weekly"].tolist() == [10.0, 2.0, 0.0]
+    assert capped["lost_sales_weekly"].tolist() == [0.0, 6.0, 5.0]
+    assert capped["remaining_stock_weekly"].tolist() == [2.0, 0.0, 0.0]
+
+
+def test_daily_disaggregation_preserves_actual_and_lost_totals():
+    weekly_baseline = pd.DataFrame(
+        {
+            "week_start": pd.to_datetime(["2026-01-05", "2026-01-12"]),
+            "baseline_pred_weekly": [100.0, 100.0],
+        }
+    )
+    out = run_weekly_scenario_forecast(
+        weekly_baseline_forecast=weekly_baseline,
+        trained_weekly_factor=None,
+        current_ctx={"price": 10.0, "discount": 0.0, "promotion": 0.0},
+        scenario_ctx={"price": 10.0, "discount": 0.0, "promotion": 0.0, "use_stock_cap": True, "stock_total_horizon": 80.0},
+    )
+    dates = pd.DataFrame({"date": pd.date_range("2026-01-05", periods=14, freq="D")})
+    weekday_profile = pd.Series([1 / 7.0] * 7, index=range(7), dtype=float)
+    d_actual = disaggregate_weekly_to_daily(
+        out["weekly_scenario_forecast"][["week_start", "actual_scenario"]].rename(columns={"actual_scenario": "baseline_pred_weekly"}),
+        dates,
+        weekday_profile,
+    )
+    d_lost = disaggregate_weekly_to_daily(
+        out["weekly_scenario_forecast"][["week_start", "lost_scenario"]].rename(columns={"lost_scenario": "baseline_pred_weekly"}),
+        dates,
+        weekday_profile,
+    )
+    assert abs(float(d_actual["baseline_pred"].sum()) - float(out["weekly_scenario_forecast"]["actual_scenario"].sum())) < 1e-6
+    assert abs(float(d_lost["baseline_pred"].sum()) - float(out["weekly_scenario_forecast"]["lost_scenario"].sum())) < 1e-6

@@ -258,6 +258,50 @@ def test_contract_contains_three_forecast_layers_and_contributions():
     assert "delta_summary_current_vs_scenario" in out
 
 
+def test_economics_use_daily_final_outputs():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7)
+    d_as_is = out["daily_final_as_is"]
+    d_scn = out["daily_final_scenario"]
+    assert float(out["as_is_economics"]["actual_quantity"].sum()) == float(d_as_is["actual_sales"].sum())
+    assert float(out["scenario_economics"]["actual_quantity"].sum()) == float(d_scn["actual_sales"].sum())
+
+
+def test_weekly_factor_model_fallback_on_weak_weekly_data():
+    out = run_full_pricing_analysis_v2(_txn(30), "cat", "sku-1", horizon_days=7)
+    assert out["_trained_bundle"].get("trained_weekly_factor") is None
+    assert out["factor_effect_source"] == "bounded_rules"
+
+
+def test_v2_what_if_consistent_with_orchestrator_weekly_logic():
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7, scenario_overrides={"price": 12.0})
+    bundle = out["_trained_bundle"]
+    w = run_v2_what_if_projection(
+        bundle,
+        manual_price=12.0,
+        horizon_days=7,
+        scenario={"factors": {"price": 12.0}},
+    )
+    orch_total = float(out["scenario_forecast"]["actual_sales"].sum())
+    assert abs(orch_total - float(w["scenario_demand_total"])) <= max(1.0, orch_total * 0.2)
+
+
+def test_daily_factor_and_shock_effects_keep_weekly_trace():
+    shocks = [
+        {
+            "shock_name": "tmp",
+            "start_date": "2025-08-09",
+            "end_date": "2025-08-15",
+            "direction": "negative",
+            "intensity": 0.2,
+            "shape": "flat",
+        }
+    ]
+    out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=14, scenario_overrides={"price": 12.0}, shocks=shocks)
+    d = out["daily_final_scenario"]
+    assert d["factor_effect"].nunique() >= 1
+    assert d["shock_effect"].nunique() > 1
+
+
 def test_no_overrides_scenario_equals_as_is():
     out = run_full_pricing_analysis_v2(_txn(220), "cat", "sku-1", horizon_days=7)
     a = out["as_is_forecast"]["actual_sales"].reset_index(drop=True)

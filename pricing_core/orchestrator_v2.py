@@ -38,6 +38,7 @@ from pricing_core.factor_model import (
     compute_scenario_delta_contributions,
     predict_weekly_factor_effect,
     run_factor_rolling_backtest,
+    run_weekly_factor_backtest,
     train_weekly_factor_model,
     train_factor_model,
 )
@@ -549,8 +550,12 @@ def run_full_pricing_analysis_v2(
     scn_ctx = apply_user_overrides(current_ctx, scenario_overrides)
     neutral_baseline_forecast = baseline_forecast.copy()
 
-    weekly_factor_feature_cols = ["avg_price_week", "avg_discount_week", "promo_share_week", "avg_freight_week", "avg_cost_week"]
+    user_weekly_num = [c for c in weekly_factor_target.columns if str(c).startswith("user_factor_num__")]
+    user_weekly_cat = [c for c in weekly_factor_target.columns if str(c).startswith("user_factor_cat__")]
+    weekly_factor_feature_cols = ["avg_price_week", "avg_discount_week", "promo_share_week", "avg_freight_week", "avg_cost_week"] + user_weekly_num + user_weekly_cat
     trained_weekly_factor = train_weekly_factor_model(weekly_factor_target, weekly_factor_feature_cols)
+    weekly_factor_backtest = run_weekly_factor_backtest(weekly_factor_target, weekly_factor_feature_cols)
+    factor_backtest["weekly_factor_backtest"] = weekly_factor_backtest
 
     weekly_history_native = aggregate_daily_to_weekly(target_history)
     weekly_future_starts = pd.DataFrame({"week_start": sorted(week_start(future_dates["date"]).dropna().unique())})
@@ -619,36 +624,58 @@ def run_full_pricing_analysis_v2(
 
     weekday_profile = build_weekday_profile(target_history)
     daily_presented_as_is = disaggregate_weekly_to_daily(
-        weekly_scn["weekly_as_is_forecast"][["week_start", "final_as_is"]].rename(columns={"final_as_is": "baseline_pred_weekly"}),
+        weekly_scn["weekly_as_is_forecast"][["week_start", "actual_as_is"]].rename(columns={"actual_as_is": "baseline_pred_weekly"}),
         future_dates[["date"]],
         weekday_profile,
     ).rename(columns={"baseline_pred": "actual_sales"})
+    daily_lost_as_is = disaggregate_weekly_to_daily(
+        weekly_scn["weekly_as_is_forecast"][["week_start", "lost_as_is"]].rename(columns={"lost_as_is": "baseline_pred_weekly"}),
+        future_dates[["date"]],
+        weekday_profile,
+    ).rename(columns={"baseline_pred": "lost_sales"})
     daily_presented_scenario = disaggregate_weekly_to_daily(
-        weekly_scn["weekly_scenario_forecast"][["week_start", "final_scenario"]].rename(columns={"final_scenario": "baseline_pred_weekly"}),
+        weekly_scn["weekly_scenario_forecast"][["week_start", "actual_scenario"]].rename(columns={"actual_scenario": "baseline_pred_weekly"}),
         future_dates[["date"]],
         weekday_profile,
     ).rename(columns={"baseline_pred": "actual_sales"})
+    daily_lost_scenario = disaggregate_weekly_to_daily(
+        weekly_scn["weekly_scenario_forecast"][["week_start", "lost_scenario"]].rename(columns={"lost_scenario": "baseline_pred_weekly"}),
+        future_dates[["date"]],
+        weekday_profile,
+    ).rename(columns={"baseline_pred": "lost_sales"})
+    future_week_map = future_dates[["date"]].copy()
+    future_week_map["week_start"] = week_start(future_week_map["date"])
+    as_is_week_effect = weekly_scn["weekly_as_is_forecast"][["week_start", "factor_effect_as_is", "shock_effect"]].copy()
+    as_is_week_effect = as_is_week_effect.rename(columns={"factor_effect_as_is": "factor_multiplier", "shock_effect": "shock_multiplier"})
+    scn_week_effect = weekly_scn["weekly_scenario_forecast"][["week_start", "factor_effect_scenario", "shock_effect"]].copy()
+    scn_week_effect = scn_week_effect.rename(columns={"factor_effect_scenario": "factor_multiplier", "shock_effect": "shock_multiplier"})
+    as_is_effect_daily = future_week_map.merge(as_is_week_effect, on="week_start", how="left")[["date", "factor_multiplier", "shock_multiplier"]]
+    scn_effect_daily = future_week_map.merge(scn_week_effect, on="week_start", how="left")[["date", "factor_multiplier", "shock_multiplier"]]
 
     baseline_by_date = neutral_baseline_forecast[["date", "baseline_pred"]].copy()
-    as_is_forecast = daily_presented_as_is.merge(baseline_by_date, on="date", how="left")
-    as_is_forecast["factor_multiplier"] = float(pd.to_numeric(weekly_scn["weekly_factor_effect_as_is"].get("factor_effect_as_is", pd.Series([1.0])), errors="coerce").mean())
-    as_is_forecast["shock_multiplier"] = 1.0
-    as_is_forecast["demand_raw"] = as_is_forecast["actual_sales"]
+    as_is_forecast = daily_presented_as_is.merge(baseline_by_date, on="date", how="left").merge(daily_lost_as_is, on="date", how="left")
+    as_is_forecast = as_is_forecast.merge(as_is_effect_daily, on="date", how="left")
+    as_is_forecast["factor_multiplier"] = pd.to_numeric(as_is_forecast["factor_multiplier"], errors="coerce").fillna(1.0)
+    as_is_forecast["shock_multiplier"] = pd.to_numeric(as_is_forecast["shock_multiplier"], errors="coerce").fillna(1.0)
+    as_is_forecast["demand_raw"] = as_is_forecast["actual_sales"] + as_is_forecast["lost_sales"].fillna(0.0)
     as_is_forecast["final_demand"] = as_is_forecast["actual_sales"]
-    as_is_forecast["scenario_demand_raw"] = as_is_forecast["actual_sales"]
-    as_is_forecast["lost_sales"] = 0.0
+    as_is_forecast["scenario_demand_raw"] = as_is_forecast["demand_raw"]
     as_is_forecast["remaining_stock"] = np.nan
 
-    scenario_forecast = daily_presented_scenario.merge(baseline_by_date, on="date", how="left")
-    scenario_forecast["factor_multiplier"] = float(pd.to_numeric(weekly_scn["weekly_factor_effect_scenario"].get("factor_effect_scenario", pd.Series([1.0])), errors="coerce").mean())
-    scenario_forecast["shock_multiplier"] = 1.0
-    scenario_forecast["demand_raw"] = scenario_forecast["actual_sales"]
+    scenario_forecast = daily_presented_scenario.merge(baseline_by_date, on="date", how="left").merge(daily_lost_scenario, on="date", how="left")
+    scenario_forecast = scenario_forecast.merge(scn_effect_daily, on="date", how="left")
+    scenario_forecast["factor_multiplier"] = pd.to_numeric(scenario_forecast["factor_multiplier"], errors="coerce").fillna(1.0)
+    scenario_forecast["shock_multiplier"] = pd.to_numeric(scenario_forecast["shock_multiplier"], errors="coerce").fillna(1.0)
+    scenario_forecast["demand_raw"] = scenario_forecast["actual_sales"] + scenario_forecast["lost_sales"].fillna(0.0)
     scenario_forecast["final_demand"] = scenario_forecast["actual_sales"]
-    scenario_forecast["scenario_demand_raw"] = scenario_forecast["actual_sales"]
-    scenario_forecast["lost_sales"] = 0.0
+    scenario_forecast["scenario_demand_raw"] = scenario_forecast["demand_raw"]
     scenario_forecast["remaining_stock"] = np.nan
 
-    n_input = neutral_baseline_forecast.copy()
+    n_input = disaggregate_weekly_to_daily(
+        weekly_scn["weekly_neutral_baseline_forecast"][["week_start", "baseline_pred_weekly"]],
+        future_dates[["date"]],
+        weekday_profile,
+    )
     n_input["price"] = max(float(neutral_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])), 1e-6)
     n_input["discount"] = float(neutral_ctx.get("discount", target_history.get("discount", pd.Series([0.0])).iloc[-1]))
     n_input["cost"] = float(neutral_ctx.get("cost", target_history.get("cost", pd.Series([0.0])).iloc[-1]))
@@ -660,25 +687,29 @@ def run_full_pricing_analysis_v2(
         economics_mode=economics_mode,
     )
 
-    a_input = as_is_forecast.copy()
-    a_input["price"] = max(float(current_ctx.get("price", n_input["price"].iloc[0])), 1e-6)
-    a_input["discount"] = float(current_ctx.get("discount", n_input["discount"].iloc[0]))
-    a_input["cost"] = float(current_ctx.get("cost", n_input["cost"].iloc[0]))
-    a_input["freight_value"] = float(current_ctx.get("freight_value", n_input["freight_value"].iloc[0]))
+    daily_final_as_is = as_is_forecast[["date", "actual_sales", "lost_sales", "baseline_pred"]].copy()
+    daily_final_as_is["factor_effect"] = as_is_forecast["factor_multiplier"]
+    daily_final_as_is["shock_effect"] = as_is_forecast["shock_multiplier"]
+    daily_final_as_is["price"] = max(float(current_ctx.get("price", n_input["price"].iloc[0])), 1e-6)
+    daily_final_as_is["discount"] = float(current_ctx.get("discount", n_input["discount"].iloc[0]))
+    daily_final_as_is["cost"] = float(current_ctx.get("cost", n_input["cost"].iloc[0]))
+    daily_final_as_is["freight_value"] = float(current_ctx.get("freight_value", n_input["freight_value"].iloc[0]))
     as_is_economics, _ = compute_daily_unit_economics(
-        a_input,
+        daily_final_as_is,
         quantity_col="actual_sales",
         unit_price_input_type=unit_price_input_type,
         economics_mode=economics_mode,
     )
 
-    s_input = scenario_forecast.copy()
-    s_input["price"] = max(float(scn_ctx.get("price", a_input["price"].iloc[0])), 1e-6)
-    s_input["discount"] = float(scn_ctx.get("discount", a_input["discount"].iloc[0]))
-    s_input["cost"] = float(scn_ctx.get("cost", a_input["cost"].iloc[0]))
-    s_input["freight_value"] = float(scn_ctx.get("freight_value", a_input["freight_value"].iloc[0]))
+    daily_final_scenario = scenario_forecast[["date", "actual_sales", "lost_sales", "baseline_pred"]].copy()
+    daily_final_scenario["factor_effect"] = scenario_forecast["factor_multiplier"]
+    daily_final_scenario["shock_effect"] = scenario_forecast["shock_multiplier"]
+    daily_final_scenario["price"] = max(float(scn_ctx.get("price", daily_final_as_is["price"].iloc[0])), 1e-6)
+    daily_final_scenario["discount"] = float(scn_ctx.get("discount", daily_final_as_is["discount"].iloc[0]))
+    daily_final_scenario["cost"] = float(scn_ctx.get("cost", daily_final_as_is["cost"].iloc[0]))
+    daily_final_scenario["freight_value"] = float(scn_ctx.get("freight_value", daily_final_as_is["freight_value"].iloc[0]))
     scenario_economics, _ = compute_daily_unit_economics(
-        s_input,
+        daily_final_scenario,
         quantity_col="actual_sales",
         unit_price_input_type=unit_price_input_type,
         economics_mode=economics_mode,
@@ -947,6 +978,7 @@ def run_full_pricing_analysis_v2(
         factor_feature_spec=factor_feature_spec,
         baseline_rolling_backtest=baseline_rolling,
         factor_backtest=factor_backtest,
+        weekly_factor_backtest=weekly_factor_backtest,
         baseline_oof=baseline_oof,
         target_history=target_history,
         panel_daily=panel_daily,
@@ -1005,6 +1037,8 @@ def run_full_pricing_analysis_v2(
         weekly_factor_feature_cols=weekly_factor_feature_cols,
         weekly_baseline_forecast_native=weekly_scn.get("weekly_neutral_baseline_forecast"),
         weekday_profile=weekday_profile,
+        daily_final_as_is=daily_final_as_is,
+        daily_final_scenario=daily_final_scenario,
     )
 
     return {
@@ -1073,6 +1107,8 @@ def run_full_pricing_analysis_v2(
         "weekly_final_forecast_scenario": weekly_scn["weekly_scenario_forecast"][["week_start", "final_scenario"]].rename(columns={"final_scenario": "sales"}),
         "daily_presented_as_is": daily_presented_as_is.copy(),
         "daily_presented_scenario": daily_presented_scenario.copy(),
+        "daily_final_as_is": daily_final_as_is.copy(),
+        "daily_final_scenario": daily_final_scenario.copy(),
         "target_series_id": str(target_series_id),
         "unit_price_input_type": str(unit_price_input_type),
         "economics_mode": str(economics_mode),

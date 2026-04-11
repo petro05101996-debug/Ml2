@@ -186,7 +186,7 @@ def render_setup_page() -> Dict[str, Any]:
     st.caption("Цель влияет на ранжирование и выбор рекомендуемого сценария, а не на сам механизм прогноза спроса.")
     objective_mode = OBJECTIVE_LABEL_TO_MODE[selected_objective_label]
     forecast_horizon_days = st.select_slider("Горизонт, дней", options=HORIZON_OPTIONS, value=30)
-    run_requested = st.button("Запустить Demand What-If анализ", type="primary", use_container_width=True)
+    run_requested = st.button("Запустить Demand What-If анализ", type="primary", width="stretch")
     _, objective_mode, objective_warning = resolve_objective_weights(objective_mode)
     return {"load_mode": LOAD_MODE_UNIVERSAL, "universal_txn": universal_txn, "target_category": target_category or None, "target_sku": target_sku or None, "target_series_id": target_series_id or None, "objective_mode": objective_mode, "objective_warning": objective_warning, "forecast_horizon_days": int(forecast_horizon_days), "show_risk": True, "run_requested": run_requested, "unit_price_input_type": "net", "economics_mode": "net_price"}
 
@@ -266,7 +266,7 @@ def render_results_page(r: Dict[str, Any]) -> None:
                 data=excel_payload,
                 file_name="pricing_report.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+                width="stretch",
             )
     report_text = _format_report(r, explanation)
     col_md.download_button(
@@ -274,7 +274,7 @@ def render_results_page(r: Dict[str, Any]) -> None:
         data=report_text.encode("utf-8"),
         file_name="pricing_report.md",
         mime="text/markdown",
-        use_container_width=True,
+        width="stretch",
     )
     dq = r.get("data_quality", {}) or {}
     if r.get("analysis_engine") == "v2_decomposed_baseline_factor_shock":
@@ -314,18 +314,18 @@ def render_results_page(r: Dict[str, Any]) -> None:
         )
         if not bool(diag_row.get("can_recommend_price", False)):
             st.warning("Ценовой сигнал недостаточен для надёжной рекомендации.")
-    if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.button("Запустить: текущий vs рекомендованный vs консервативный", use_container_width=True):
+    if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.button("Запустить: текущий vs рекомендованный vs консервативный", width="stretch"):
         st.session_state.scenario_table = run_scenario_set(r["_trained_bundle"], build_default_scenario_inputs(float(r["current_price"]), int(r.get("forecast_horizon_days", 30)), r["_trained_bundle"]["base_ctx"])[:3], run_v2_what_if_projection)
     if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.session_state.get("scenario_table") is not None:
         st.dataframe(st.session_state.scenario_table, width="stretch")
     with st.expander("Расширенная аналитика", expanded=False):
         st.write(explanation.get("summary", ""))
-        if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.button("Запустить карту чувствительности", use_container_width=True):
+        if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.button("Запустить карту чувствительности", width="stretch"):
             st.session_state.sensitivity_df = build_sensitivity_grid(r["_trained_bundle"], base_price=float(r["current_price"]), runner=run_v2_what_if_projection)
         if r.get("analysis_engine") != "v2_decomposed_baseline_factor_shock" and st.session_state.get("sensitivity_df") is not None:
             heat = px.density_heatmap(st.session_state.sensitivity_df, x="price", y="demand_multiplier", z="profit", template="plotly_dark")
             heat.update_layout(**_base_plotly_layout("Чувствительность: цена × спрос"))
-            st.plotly_chart(heat, use_container_width=True)
+            st.plotly_chart(heat, width="stretch")
 
 
 def maybe_run_analysis(ctx: Dict[str, Any]) -> None:

@@ -47,7 +47,7 @@ def run_v2_what_if_projection(
         if str(k).startswith("user_factor_num__") or str(k).startswith("user_factor_cat__"):
             overrides[k] = v
 
-    weekly_baseline = trained_bundle.get("weekly_baseline_forecast", pd.DataFrame()).copy()
+    weekly_baseline = trained_bundle.get("weekly_baseline_forecast_native", trained_bundle.get("weekly_baseline_forecast", pd.DataFrame())).copy()
     if not weekly_baseline.empty and "sales" in weekly_baseline.columns:
         weekly_baseline = weekly_baseline.rename(columns={"sales": "baseline_pred_weekly"})
     if weekly_baseline.empty:
@@ -70,49 +70,85 @@ def run_v2_what_if_projection(
     if weekday_profile is None:
         weekday_profile = pd.Series([1.0 / 7.0] * 7, index=range(7), dtype=float)
     as_is_forecast = disaggregate_weekly_to_daily(
-        weekly_result["weekly_as_is_forecast"][["week_start", "final_as_is"]].rename(columns={"final_as_is": "baseline_pred_weekly"}),
+        weekly_result["weekly_as_is_forecast"][["week_start", "actual_as_is"]].rename(columns={"actual_as_is": "baseline_pred_weekly"}),
         future_dates[["date"]],
         weekday_profile,
     ).rename(columns={"baseline_pred": "actual_sales"})
+    as_is_lost = disaggregate_weekly_to_daily(
+        weekly_result["weekly_as_is_forecast"][["week_start", "lost_as_is"]].rename(columns={"lost_as_is": "baseline_pred_weekly"}),
+        future_dates[["date"]],
+        weekday_profile,
+    ).rename(columns={"baseline_pred": "lost_sales"})
     sf = disaggregate_weekly_to_daily(
-        weekly_result["weekly_scenario_forecast"][["week_start", "final_scenario"]].rename(columns={"final_scenario": "baseline_pred_weekly"}),
+        weekly_result["weekly_scenario_forecast"][["week_start", "actual_scenario"]].rename(columns={"actual_scenario": "baseline_pred_weekly"}),
         future_dates[["date"]],
         weekday_profile,
     ).rename(columns={"baseline_pred": "actual_sales"})
-    sf["scenario_demand_raw"] = pd.to_numeric(sf["actual_sales"], errors="coerce").fillna(0.0)
-    if stock_cap is not None:
-        remaining = max(0.0, float(stock_cap))
-        capped = []
-        lost = []
-        for v in pd.to_numeric(sf["scenario_demand_raw"], errors="coerce").fillna(0.0).clip(lower=0.0):
-            a = min(float(v), remaining)
-            capped.append(a)
-            lost.append(max(0.0, float(v) - a))
-            remaining -= a
-        sf["actual_sales"] = capped
-        sf["lost_sales"] = lost
-    else:
-        sf["lost_sales"] = 0.0
+    sf_lost = disaggregate_weekly_to_daily(
+        weekly_result["weekly_scenario_forecast"][["week_start", "lost_scenario"]].rename(columns={"lost_scenario": "baseline_pred_weekly"}),
+        future_dates[["date"]],
+        weekday_profile,
+    ).rename(columns={"baseline_pred": "lost_sales"})
+    as_is_forecast = as_is_forecast.merge(as_is_lost, on="date", how="left")
+    sf = sf.merge(sf_lost, on="date", how="left")
+    sf["scenario_demand_raw"] = pd.to_numeric(sf["actual_sales"], errors="coerce").fillna(0.0) + pd.to_numeric(sf["lost_sales"], errors="coerce").fillna(0.0)
+    as_is_forecast["scenario_demand_raw"] = pd.to_numeric(as_is_forecast["actual_sales"], errors="coerce").fillna(0.0) + pd.to_numeric(as_is_forecast["lost_sales"], errors="coerce").fillna(0.0)
+    week_map = future_dates[["date"]].copy()
+    week_map["week_start"] = pd.to_datetime(week_map["date"], errors="coerce").dt.to_period("W-SUN").dt.start_time
+    as_is_mult = week_map.merge(
+        weekly_result["weekly_as_is_forecast"][["week_start", "factor_effect_as_is", "shock_effect"]],
+        on="week_start",
+        how="left",
+    )[["date", "factor_effect_as_is", "shock_effect"]]
+    scn_mult = week_map.merge(
+        weekly_result["weekly_scenario_forecast"][["week_start", "factor_effect_scenario", "shock_effect"]],
+        on="week_start",
+        how="left",
+    )[["date", "factor_effect_scenario", "shock_effect"]]
 
     sf["price"] = max(float(overrides.get("price", manual_price)), 1e-6)
     sf["discount"] = float(overrides.get("discount", 0.0))
     sf["cost"] = float(overrides.get("cost", 0.0))
     sf["freight_value"] = float(overrides.get("freight_value", 0.0))
     as_is_input = as_is_forecast.copy()
-    as_is_input["scenario_demand_raw"] = as_is_input["actual_sales"]
-    as_is_input["lost_sales"] = 0.0
+    as_is_input["scenario_demand_raw"] = as_is_input["scenario_demand_raw"]
+    as_is_input["lost_sales"] = pd.to_numeric(as_is_input["lost_sales"], errors="coerce").fillna(0.0)
     as_is_input["price"] = max(float(current_ctx.get("price", manual_price)), 1e-6)
     as_is_input["discount"] = float(current_ctx.get("discount", 0.0))
     as_is_input["cost"] = float(current_ctx.get("cost", 0.0))
     as_is_input["freight_value"] = float(current_ctx.get("freight_value", 0.0))
+    daily_final_as_is = as_is_input[["date", "actual_sales", "lost_sales"]].copy()
+    daily_final_as_is["baseline_pred"] = disaggregate_weekly_to_daily(
+        weekly_result["weekly_neutral_baseline_forecast"][["week_start", "baseline_pred_weekly"]],
+        future_dates[["date"]],
+        weekday_profile,
+    )["baseline_pred"].values
+    daily_final_as_is = daily_final_as_is.merge(as_is_mult, on="date", how="left")
+    daily_final_as_is["factor_effect"] = pd.to_numeric(daily_final_as_is["factor_effect_as_is"], errors="coerce").fillna(1.0)
+    daily_final_as_is["shock_effect"] = pd.to_numeric(daily_final_as_is["shock_effect"], errors="coerce").fillna(1.0)
+    daily_final_as_is = daily_final_as_is.drop(columns=["factor_effect_as_is"])
+    daily_final_as_is["price"] = as_is_input["price"]
+    daily_final_as_is["discount"] = as_is_input["discount"]
+    daily_final_as_is["cost"] = as_is_input["cost"]
+    daily_final_as_is["freight_value"] = as_is_input["freight_value"]
     as_is_eco, _ = compute_daily_unit_economics(
-        as_is_input,
+        daily_final_as_is,
         quantity_col="actual_sales",
         unit_price_input_type=str(trained_bundle.get("unit_price_input_type", "net")),
         economics_mode=str(trained_bundle.get("economics_mode", "net_price")),
     )
+    daily_final_scenario = sf[["date", "actual_sales", "lost_sales"]].copy()
+    daily_final_scenario["baseline_pred"] = daily_final_as_is["baseline_pred"].values
+    daily_final_scenario = daily_final_scenario.merge(scn_mult, on="date", how="left")
+    daily_final_scenario["factor_effect"] = pd.to_numeric(daily_final_scenario["factor_effect_scenario"], errors="coerce").fillna(1.0)
+    daily_final_scenario["shock_effect"] = pd.to_numeric(daily_final_scenario["shock_effect"], errors="coerce").fillna(1.0)
+    daily_final_scenario = daily_final_scenario.drop(columns=["factor_effect_scenario"])
+    daily_final_scenario["price"] = sf["price"]
+    daily_final_scenario["discount"] = sf["discount"]
+    daily_final_scenario["cost"] = sf["cost"]
+    daily_final_scenario["freight_value"] = sf["freight_value"]
     scenario_eco, _ = compute_daily_unit_economics(
-        sf,
+        daily_final_scenario,
         quantity_col="actual_sales",
         unit_price_input_type=str(trained_bundle.get("unit_price_input_type", "net")),
         economics_mode=str(trained_bundle.get("economics_mode", "net_price")),
