@@ -7,17 +7,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
+    DEBIAN_FRONTEND=noninteractive \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
-# tini корректно обрабатывает сигналы и предотвращает зависание процесса
+# tini оставляем: это не лишнее, а безопасный init для корректной остановки процесса
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install --prefer-binary --retries 5 -r requirements.txt
+RUN pip install --prefer-binary --retries 5 -r requirements.txt
 
 COPY . .
 
