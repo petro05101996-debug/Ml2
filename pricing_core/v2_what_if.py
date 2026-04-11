@@ -6,7 +6,9 @@ import pandas as pd
 
 from calc_engine import compute_daily_unit_economics
 from pricing_core.baseline_model import disaggregate_weekly_to_daily
-from pricing_core.scenario_engine import run_weekly_scenario_forecast
+from pricing_core.scenario_engine import apply_user_overrides, build_current_state_context
+from pricing_core.weekly_forecast_features import build_future_weekly_frame
+from pricing_core.weekly_forecast_model import recursive_weekly_forecast
 
 
 def _confidence_map(label: str) -> float:
@@ -24,12 +26,16 @@ def run_v2_what_if_projection(
     stock_cap: float | None = None,
     scenario: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    target_history = trained_bundle.get("target_history", pd.DataFrame())
-    future_dates = trained_bundle.get("future_dates", pd.DataFrame())
-    if horizon_days > 0 and len(future_dates):
-        future_dates = future_dates.head(int(horizon_days)).copy()
+    history = trained_bundle.get("target_history", pd.DataFrame())
+    future_dates = trained_bundle.get("future_dates", pd.DataFrame()).head(int(horizon_days)).copy()
+    model = trained_bundle.get("trained_weekly_forecast_model")
+    weekly_history = trained_bundle.get("weekly_history", pd.DataFrame())
+    weekday_profile = trained_bundle.get("weekday_profile")
+    if weekday_profile is None:
+        weekday_profile = pd.Series([1 / 7.0] * 7, index=range(7), dtype=float)
+
     factors = (scenario or {}).get("factors", {})
-    current_ctx = dict(trained_bundle.get("current_ctx", {})) or ({**target_history.tail(1).to_dict("records")[0]} if len(target_history) else {})
+    current_ctx = dict(trained_bundle.get("current_ctx", {})) or build_current_state_context(history, {})
     overrides = {
         "price": float(factors.get("price", manual_price)),
         "discount": float(factors.get("discount", current_ctx.get("discount", 0.0))) * float(discount_multiplier),
@@ -37,161 +43,81 @@ def run_v2_what_if_projection(
         "cost": float(current_ctx.get("cost", 0.0)) * float(cost_multiplier),
         "freight_value": float(current_ctx.get("freight_value", 0.0)) * float(freight_multiplier),
     }
-    if stock_cap is None:
-        overrides["use_stock_cap"] = False
-    else:
-        overrides["use_stock_cap"] = True
-        overrides["stock_total_horizon"] = float(stock_cap)
-
     for k, v in factors.items():
-        if str(k).startswith("user_factor_num__") or str(k).startswith("user_factor_cat__"):
+        if str(k).startswith("user_factor_"):
             overrides[k] = v
+    scenario_ctx = apply_user_overrides(current_ctx, overrides)
 
-    weekly_baseline = trained_bundle.get("weekly_baseline_forecast_native", trained_bundle.get("weekly_baseline_forecast", pd.DataFrame())).copy()
-    if not weekly_baseline.empty and "sales" in weekly_baseline.columns:
-        weekly_baseline = weekly_baseline.rename(columns={"sales": "baseline_pred_weekly"})
-    if weekly_baseline.empty:
-        # fallback for legacy bundles
-        baseline_override = trained_bundle.get("neutral_baseline_forecast", trained_bundle.get("baseline_forecast", pd.DataFrame()))
-        if isinstance(baseline_override, pd.DataFrame) and not baseline_override.empty:
-            from pricing_core.baseline_model import aggregate_daily_to_weekly
+    horizon_weeks = max(1, int((len(future_dates) + 6) // 7))
+    fut_as_is = build_future_weekly_frame(weekly_history["week_start"].max(), horizon_weeks, current_ctx)
+    fut_scn = build_future_weekly_frame(weekly_history["week_start"].max(), horizon_weeks, scenario_ctx)
+    wk_as_is = recursive_weekly_forecast(model, weekly_history, fut_as_is)
+    wk_scn = recursive_weekly_forecast(model, weekly_history, fut_scn)
+    wk_scn["sales_week"] = wk_scn["sales_week"] * float(demand_multiplier)
 
-            weekly_baseline = aggregate_daily_to_weekly(baseline_override.rename(columns={"baseline_pred": "sales"})).rename(columns={"sales": "baseline_pred_weekly"})
+    as_is = disaggregate_weekly_to_daily(wk_as_is.rename(columns={"sales_week": "baseline_pred_weekly"}), future_dates[["date"]], weekday_profile).rename(columns={"baseline_pred": "actual_sales"})
+    scn = disaggregate_weekly_to_daily(wk_scn.rename(columns={"sales_week": "baseline_pred_weekly"}), future_dates[["date"]], weekday_profile).rename(columns={"baseline_pred": "actual_sales"})
 
-    weekly_result = run_weekly_scenario_forecast(
-        weekly_baseline_forecast=weekly_baseline[["week_start", "baseline_pred_weekly"]],
-        trained_weekly_factor=trained_bundle.get("trained_weekly_factor"),
-        current_ctx=current_ctx,
-        scenario_ctx=overrides,
-        shocks=(scenario or {}).get("shocks"),
-        confidence_level=str((trained_bundle.get("confidence", {}) or {}).get("overall_confidence", "medium")),
-    )
-    weekday_profile = trained_bundle.get("weekday_profile")
-    if weekday_profile is None:
-        weekday_profile = pd.Series([1.0 / 7.0] * 7, index=range(7), dtype=float)
-    as_is_forecast = disaggregate_weekly_to_daily(
-        weekly_result["weekly_as_is_forecast"][["week_start", "actual_as_is"]].rename(columns={"actual_as_is": "baseline_pred_weekly"}),
-        future_dates[["date"]],
-        weekday_profile,
-    ).rename(columns={"baseline_pred": "actual_sales"})
-    as_is_lost = disaggregate_weekly_to_daily(
-        weekly_result["weekly_as_is_forecast"][["week_start", "lost_as_is"]].rename(columns={"lost_as_is": "baseline_pred_weekly"}),
-        future_dates[["date"]],
-        weekday_profile,
-    ).rename(columns={"baseline_pred": "lost_sales"})
-    sf = disaggregate_weekly_to_daily(
-        weekly_result["weekly_scenario_forecast"][["week_start", "actual_scenario"]].rename(columns={"actual_scenario": "baseline_pred_weekly"}),
-        future_dates[["date"]],
-        weekday_profile,
-    ).rename(columns={"baseline_pred": "actual_sales"})
-    sf_lost = disaggregate_weekly_to_daily(
-        weekly_result["weekly_scenario_forecast"][["week_start", "lost_scenario"]].rename(columns={"lost_scenario": "baseline_pred_weekly"}),
-        future_dates[["date"]],
-        weekday_profile,
-    ).rename(columns={"baseline_pred": "lost_sales"})
-    as_is_forecast = as_is_forecast.merge(as_is_lost, on="date", how="left")
-    sf = sf.merge(sf_lost, on="date", how="left")
-    sf["scenario_demand_raw"] = pd.to_numeric(sf["actual_sales"], errors="coerce").fillna(0.0) + pd.to_numeric(sf["lost_sales"], errors="coerce").fillna(0.0)
-    as_is_forecast["scenario_demand_raw"] = pd.to_numeric(as_is_forecast["actual_sales"], errors="coerce").fillna(0.0) + pd.to_numeric(as_is_forecast["lost_sales"], errors="coerce").fillna(0.0)
-    week_map = future_dates[["date"]].copy()
-    week_map["week_start"] = pd.to_datetime(week_map["date"], errors="coerce").dt.to_period("W-SUN").dt.start_time
-    as_is_mult = week_map.merge(
-        weekly_result["weekly_as_is_forecast"][["week_start", "factor_effect_as_is", "shock_effect"]],
-        on="week_start",
-        how="left",
-    )[["date", "factor_effect_as_is", "shock_effect"]]
-    scn_mult = week_map.merge(
-        weekly_result["weekly_scenario_forecast"][["week_start", "factor_effect_scenario", "shock_effect"]],
-        on="week_start",
-        how="left",
-    )[["date", "factor_effect_scenario", "shock_effect"]]
+    as_is["lost_sales"] = 0.0
+    scn["lost_sales"] = 0.0
+    if stock_cap is not None:
+        total = max(float(stock_cap), 0.0)
+        running = 0.0
+        for i in range(len(scn)):
+            raw = float(scn.at[i, "actual_sales"])
+            keep = max(min(raw, total - running), 0.0)
+            scn.at[i, "lost_sales"] = raw - keep
+            scn.at[i, "actual_sales"] = keep
+            running += keep
 
-    sf["price"] = max(float(overrides.get("price", manual_price)), 1e-6)
-    sf["discount"] = float(overrides.get("discount", 0.0))
-    sf["cost"] = float(overrides.get("cost", 0.0))
-    sf["freight_value"] = float(overrides.get("freight_value", 0.0))
-    as_is_input = as_is_forecast.copy()
-    as_is_input["scenario_demand_raw"] = as_is_input["scenario_demand_raw"]
-    as_is_input["lost_sales"] = pd.to_numeric(as_is_input["lost_sales"], errors="coerce").fillna(0.0)
-    as_is_input["price"] = max(float(current_ctx.get("price", manual_price)), 1e-6)
-    as_is_input["discount"] = float(current_ctx.get("discount", 0.0))
-    as_is_input["cost"] = float(current_ctx.get("cost", 0.0))
-    as_is_input["freight_value"] = float(current_ctx.get("freight_value", 0.0))
-    daily_final_as_is = as_is_input[["date", "actual_sales", "lost_sales"]].copy()
-    daily_final_as_is["baseline_pred"] = disaggregate_weekly_to_daily(
-        weekly_result["weekly_neutral_baseline_forecast"][["week_start", "baseline_pred_weekly"]],
-        future_dates[["date"]],
-        weekday_profile,
-    )["baseline_pred"].values
-    daily_final_as_is = daily_final_as_is.merge(as_is_mult, on="date", how="left")
-    daily_final_as_is["factor_effect"] = pd.to_numeric(daily_final_as_is["factor_effect_as_is"], errors="coerce").fillna(1.0)
-    daily_final_as_is["shock_effect"] = pd.to_numeric(daily_final_as_is["shock_effect"], errors="coerce").fillna(1.0)
-    daily_final_as_is = daily_final_as_is.drop(columns=["factor_effect_as_is"])
-    daily_final_as_is["price"] = as_is_input["price"]
-    daily_final_as_is["discount"] = as_is_input["discount"]
-    daily_final_as_is["cost"] = as_is_input["cost"]
-    daily_final_as_is["freight_value"] = as_is_input["freight_value"]
-    as_is_eco, _ = compute_daily_unit_economics(
-        daily_final_as_is,
-        quantity_col="actual_sales",
-        unit_price_input_type=str(trained_bundle.get("unit_price_input_type", "net")),
-        economics_mode=str(trained_bundle.get("economics_mode", "net_price")),
-    )
-    daily_final_scenario = sf[["date", "actual_sales", "lost_sales"]].copy()
-    daily_final_scenario["baseline_pred"] = daily_final_as_is["baseline_pred"].values
-    daily_final_scenario = daily_final_scenario.merge(scn_mult, on="date", how="left")
-    daily_final_scenario["factor_effect"] = pd.to_numeric(daily_final_scenario["factor_effect_scenario"], errors="coerce").fillna(1.0)
-    daily_final_scenario["shock_effect"] = pd.to_numeric(daily_final_scenario["shock_effect"], errors="coerce").fillna(1.0)
-    daily_final_scenario = daily_final_scenario.drop(columns=["factor_effect_scenario"])
-    daily_final_scenario["price"] = sf["price"]
-    daily_final_scenario["discount"] = sf["discount"]
-    daily_final_scenario["cost"] = sf["cost"]
-    daily_final_scenario["freight_value"] = sf["freight_value"]
-    scenario_eco, _ = compute_daily_unit_economics(
-        daily_final_scenario,
-        quantity_col="actual_sales",
-        unit_price_input_type=str(trained_bundle.get("unit_price_input_type", "net")),
-        economics_mode=str(trained_bundle.get("economics_mode", "net_price")),
-    )
+    for df, ctx in [(as_is, current_ctx), (scn, scenario_ctx)]:
+        df["price"] = float(ctx.get("price", manual_price))
+        df["discount"] = float(ctx.get("discount", 0.0))
+        df["cost"] = float(ctx.get("cost", df["price"].iloc[0] * 0.65))
+        df["freight_value"] = float(ctx.get("freight_value", 0.0))
 
-    conf_state = trained_bundle.get("confidence", {}) or {}
-    conf_label = str(conf_state.get("overall_confidence", "low"))
-    conf_score = _confidence_map(conf_label)
-    as_is_demand_total = float(as_is_forecast["actual_sales"].sum())
-    scenario_demand_total = float(sf["actual_sales"].sum())
-    as_is_revenue_total = float(as_is_eco["total_revenue"].sum())
-    scenario_revenue_total = float(scenario_eco["total_revenue"].sum())
-    as_is_profit_total = float(as_is_eco["profit"].sum())
-    scenario_profit_total = float(scenario_eco["profit"].sum())
+    as_is_eco, _ = compute_daily_unit_economics(as_is, quantity_col="actual_sales", unit_price_input_type=str(trained_bundle.get("unit_price_input_type", "net")), economics_mode=str(trained_bundle.get("economics_mode", "net_price")))
+    scn_eco, _ = compute_daily_unit_economics(scn, quantity_col="actual_sales", unit_price_input_type=str(trained_bundle.get("unit_price_input_type", "net")), economics_mode=str(trained_bundle.get("economics_mode", "net_price")))
+
+    conf = trained_bundle.get("confidence", {}) or {}
+    label = str(conf.get("overall_confidence", "low"))
+    score = _confidence_map(label)
+    as_is_d = float(as_is["actual_sales"].sum())
+    scn_d = float(scn["actual_sales"].sum())
+    as_is_r = float(as_is_eco["total_revenue"].sum())
+    scn_r = float(scn_eco["total_revenue"].sum())
+    as_is_p = float(as_is_eco["profit"].sum())
+    scn_p = float(scn_eco["profit"].sum())
+
     return {
-        "demand_total": float(sf["scenario_demand_raw"].sum()),  # backward-compat
-        "actual_sales_total": scenario_demand_total,  # backward-compat
-        "lost_sales_total": float(sf["lost_sales"].sum()),
-        "revenue_total": scenario_revenue_total,  # backward-compat
-        "profit_total": scenario_profit_total,  # backward-compat
-        "margin": float(scenario_eco["profit"].sum() / scenario_eco["total_revenue"].sum()) if float(scenario_eco["total_revenue"].sum()) > 0 else 0.0,
-        "as_is_demand_total": as_is_demand_total,
-        "scenario_demand_total": scenario_demand_total,
-        "demand_delta_abs": scenario_demand_total - as_is_demand_total,
-        "demand_delta_pct": 0.0 if abs(as_is_demand_total) < 1e-9 else (scenario_demand_total - as_is_demand_total) / as_is_demand_total,
-        "as_is_revenue_total": as_is_revenue_total,
-        "scenario_revenue_total": scenario_revenue_total,
-        "revenue_delta_abs": scenario_revenue_total - as_is_revenue_total,
-        "as_is_profit_total": as_is_profit_total,
-        "scenario_profit_total": scenario_profit_total,
-        "profit_delta_abs": scenario_profit_total - as_is_profit_total,
-        "confidence_label": conf_label,
-        "confidence_score": conf_score,
-        "uncertainty_score": float(max(0.0, 1.0 - conf_score)),
-        "ood_flags": weekly_result.get("ood_flags", []),
+        "demand_total": scn_d,
+        "actual_sales_total": scn_d,
+        "lost_sales_total": float(scn["lost_sales"].sum()),
+        "revenue_total": scn_r,
+        "profit_total": scn_p,
+        "margin": 0.0 if scn_r <= 0 else scn_p / scn_r,
+        "as_is_demand_total": as_is_d,
+        "scenario_demand_total": scn_d,
+        "demand_delta_abs": scn_d - as_is_d,
+        "demand_delta_pct": 0.0 if abs(as_is_d) < 1e-9 else (scn_d - as_is_d) / as_is_d,
+        "as_is_revenue_total": as_is_r,
+        "scenario_revenue_total": scn_r,
+        "revenue_delta_abs": scn_r - as_is_r,
+        "as_is_profit_total": as_is_p,
+        "scenario_profit_total": scn_p,
+        "profit_delta_abs": scn_p - as_is_p,
+        "confidence_label": label,
+        "confidence_score": score,
+        "uncertainty_score": max(0.0, 1.0 - score),
+        "ood_flags": list((conf.get("baseline_confidence", {}) or {}).get("ood_flags", [])),
         "scenario_mode": "weekly_native",
-        "factor_role": str(trained_bundle.get("factor_role", "unavailable")),
-        "scenario_effect_source": weekly_result.get("factor_effect_source", "bounded_rules"),
-        "factor_effect_source": weekly_result.get("factor_effect_source", "bounded_rules"),
-        "shock_applied": bool(weekly_result.get("shock_applied", False)),
-        "baseline_component_total": float(pd.to_numeric(weekly_result["weekly_scenario_forecast"].get("baseline_component", 0.0), errors="coerce").fillna(0.0).sum()) if "weekly_scenario_forecast" in weekly_result else 0.0,
-        "factor_effect_avg": float(pd.to_numeric(weekly_result["weekly_factor_effect_scenario"].get("factor_effect_scenario", 1.0), errors="coerce").fillna(1.0).mean()) if "weekly_factor_effect_scenario" in weekly_result else 1.0,
-        "shock_effect_avg": float(pd.to_numeric(weekly_result["weekly_scenario_forecast"].get("shock_effect", 1.0), errors="coerce").fillna(1.0).mean()) if "weekly_scenario_forecast" in weekly_result else 1.0,
+        "factor_role": "removed",
+        "scenario_effect_source": "scenario_direct",
+        "factor_effect_source": "scenario_direct",
+        "shock_applied": False,
+        "baseline_component_total": as_is_d,
+        "factor_effect_avg": 1.0,
+        "shock_effect_avg": 1.0,
         "economics_mode": str(trained_bundle.get("economics_mode", "net_price")),
         "unit_price_input_type": str(trained_bundle.get("unit_price_input_type", "net")),
     }

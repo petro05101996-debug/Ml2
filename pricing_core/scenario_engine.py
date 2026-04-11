@@ -500,8 +500,18 @@ def run_weekly_scenario_forecast(
 
     cur_feat = build_weekly_future_factor_frame(wk, current_ctx, scenario_ctx, use_scenario=False, shocks=shocks)
     scn_feat = build_weekly_future_factor_frame(wk, current_ctx, scenario_ctx, use_scenario=True, shocks=shocks)
-    cur_mult = predict_weekly_factor_effect(cur_feat, trained_weekly_factor)
-    scn_mult = predict_weekly_factor_effect(scn_feat, trained_weekly_factor)
+    # v1 stabilized weekly path: no factor-role gating, direct scenario multipliers only
+    price_ref = max(float(pd.to_numeric(pd.Series([current_ctx.get("price", 1.0)]), errors="coerce").fillna(1.0).iloc[0]), 1e-6)
+    price_scn = max(float(pd.to_numeric(pd.Series([scenario_ctx.get("price", price_ref)]), errors="coerce").fillna(price_ref).iloc[0]), 1e-6)
+    promo_ref = float(pd.to_numeric(pd.Series([current_ctx.get("promotion", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    promo_scn = float(pd.to_numeric(pd.Series([scenario_ctx.get("promotion", promo_ref)]), errors="coerce").fillna(promo_ref).iloc[0])
+    disc_ref = float(pd.to_numeric(pd.Series([current_ctx.get("discount", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    disc_scn = float(pd.to_numeric(pd.Series([scenario_ctx.get("discount", disc_ref)]), errors="coerce").fillna(disc_ref).iloc[0])
+    elasticity = -1.1
+    rel_price = price_scn / price_ref
+    scn_shift = float(np.clip((rel_price ** elasticity) * (1.0 + 0.25 * (disc_scn - disc_ref)) * (1.0 + 0.15 * (promo_scn - promo_ref)), 0.65, 1.35))
+    cur_mult = pd.Series(np.ones(len(wk), dtype=float))
+    scn_mult = pd.Series(np.full(len(wk), scn_shift, dtype=float))
     ood_flags: List[str] = []
     warnings: List[str] = []
     for c in ["avg_price_week", "avg_discount_week", "avg_freight_week", "avg_cost_week"]:
@@ -569,7 +579,7 @@ def run_weekly_scenario_forecast(
         "weekly_scenario_forecast": out[["week_start", "baseline_component", "factor_effect_scenario", "shock_effect", "final_scenario", "actual_scenario", "lost_scenario", "remaining_stock_scenario"]],
         "weekly_factor_effect_as_is": out[["week_start", "factor_effect_as_is"]],
         "weekly_factor_effect_scenario": out[["week_start", "factor_effect_scenario"]],
-        "factor_effect_source": "ml_uplift" if trained_weekly_factor is not None else "bounded_rules",
+        "factor_effect_source": "scenario_direct",
         "shock_applied": bool(shocks),
         "ood_flags": sorted(set(ood_flags)),
         "warnings": warnings,

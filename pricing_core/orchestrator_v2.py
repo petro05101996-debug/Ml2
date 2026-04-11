@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from io import BytesIO
 from typing import Any, Dict, List
 
@@ -8,185 +7,59 @@ import numpy as np
 import pandas as pd
 
 from calc_engine import compute_daily_unit_economics
-from data_adapter import (
-    SERIES_SCOPE_COLS,
-    build_baseline_data_quality_summary,
-    build_daily_panel_from_transactions,
-    build_series_id,
-    build_weekly_panel_from_daily,
-)
-from pricing_core.baseline_features import build_baseline_feature_matrix, derive_baseline_feature_spec
-from pricing_core.baseline_model import (
-    build_baseline_oof_predictions,
-    build_baseline_quality_summary,
-    build_weekday_profile,
-    build_weekly_baseline_oof_predictions,
-    disaggregate_weekly_to_daily,
-    forecast_weekly_baseline_by_strategy,
-    forecast_baseline_by_strategy,
-    aggregate_daily_to_weekly,
-    recursive_baseline_forecast,
-    run_baseline_benchmark_suite,
-    run_baseline_rolling_backtest,
-    select_best_baseline_plan,
-    train_baseline_model,
-    week_start,
-)
-from pricing_core.factor_features import build_factor_feature_matrix, build_factor_target_frame, derive_factor_feature_spec
-from pricing_core.factor_model import (
-    compute_current_state_contributions,
-    compute_scenario_delta_contributions,
-    predict_weekly_factor_effect,
-    run_factor_rolling_backtest,
-    run_weekly_factor_backtest,
-    train_weekly_factor_model,
-    train_factor_model,
-)
-from pricing_core.model_registry import build_model_bundle
-from pricing_core.quality import compute_scenario_confidence
-from pricing_core.scenario_engine import (
-    apply_user_overrides,
-    build_current_state_context,
-    build_neutral_context,
-    run_scenario_forecast,
-    run_weekly_scenario_forecast,
-)
-from pricing_core.uncertainty import (
-    build_baseline_confidence_state,
-    build_factor_confidence_state,
-    build_shock_confidence_state,
-    combine_confidence_states,
-)
+from data_adapter import build_baseline_data_quality_summary, build_daily_panel_from_transactions, build_series_id
+from pricing_core.baseline_model import build_weekday_profile, disaggregate_weekly_to_daily
+from pricing_core.model_diagnostics import build_model_diagnostics
+from pricing_core.scenario_engine import apply_user_overrides, build_current_state_context, build_neutral_context
+from pricing_core.weekly_backtest import build_acceptance_summary, evaluate_vs_benchmarks, run_weekly_rolling_backtest
+from pricing_core.weekly_forecast_features import build_future_weekly_frame, build_weekly_train_frame
+from pricing_core.weekly_forecast_model import recursive_weekly_forecast, train_weekly_forecast_model
 
 
-def _tiny_baseline_fallback(target_history: pd.DataFrame, future_dates: pd.DataFrame) -> pd.DataFrame:
-    s = pd.to_numeric(target_history.get("sales", 0.0), errors="coerce").fillna(0.0)
-    if len(s) == 0:
-        base = 0.0
-    elif len(s) < 7:
-        base = float(s.mean())
-    else:
-        base = float(s.tail(7).median())
-    return pd.DataFrame(
-        {
-            "date": pd.to_datetime(future_dates["date"]),
-            "baseline_pred": max(0.0, base),
-            "baseline_lower": np.nan,
-            "baseline_upper": np.nan,
-        }
-    )
+def _weekly_to_daily_forecast(weekly_forecast: pd.DataFrame, future_dates: pd.DataFrame, weekday_profile: pd.Series) -> pd.DataFrame:
+    return disaggregate_weekly_to_daily(
+        weekly_forecast[["week_start", "sales_week"]].rename(columns={"sales_week": "baseline_pred_weekly"}),
+        future_dates[["date"]],
+        weekday_profile,
+    ).rename(columns={"baseline_pred": "actual_sales"})
 
 
-def _assess_factor_trainability(factor_train: pd.DataFrame, factor_feature_spec: Dict[str, Any]) -> Dict[str, Any]:
-    n_rows = int(len(factor_train))
-    cont = factor_feature_spec.get("controllable_features", [])
-    variative = [
-        c
-        for c in cont
-        if c in factor_train.columns and pd.to_numeric(factor_train[c], errors="coerce").nunique(dropna=True) > 1
-    ]
-    price_unique_count = int(pd.to_numeric(factor_train.get("price", np.nan), errors="coerce").nunique(dropna=True))
-    variative_count = int(len(variative))
-    trainable_for_advisory = n_rows >= 60 and variative_count >= 1 and (price_unique_count >= 3 or variative_count >= 2)
-    trainable_for_production = n_rows >= 120 and variative_count >= 2 and price_unique_count >= 5
-    reason_codes = []
-    if n_rows < 60:
-        reason_codes.append("rows_lt_60")
-    if variative_count < 1:
-        reason_codes.append("no_variative_controllable")
-    if price_unique_count < 3 and variative_count < 2:
-        reason_codes.append("weak_price_and_control_variation")
-    if trainable_for_production:
-        factor_role = "production"
-    elif trainable_for_advisory:
-        factor_role = "advisory_only"
-    else:
-        factor_role = "unavailable"
-    return {
-        "trainable": bool(trainable_for_advisory),
-        "trainable_for_advisory": bool(trainable_for_advisory),
-        "trainable_for_production": bool(trainable_for_production),
-        "factor_role": factor_role,
-        "n_rows": n_rows,
-        "price_unique_count": price_unique_count,
-        "variative_controllable_count": variative_count,
-        "reason_codes": reason_codes,
-    }
+def _build_excel_buffer(sheets: Dict[str, pd.DataFrame]) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for name, df in sheets.items():
+            (df if isinstance(df, pd.DataFrame) else pd.DataFrame()).to_excel(w, sheet_name=name[:31], index=False)
+    return buf.getvalue()
 
 
-def _build_empty_baseline_rolling() -> Dict[str, Any]:
-    return {
-        "rolling_diag": pd.DataFrame(),
-        "rolling_metrics": pd.DataFrame(
-            columns=[
-                "window_id",
-                "window_start",
-                "window_end",
-                "forecast_wape",
-                "mae",
-                "rmse",
-                "bias_pct",
-                "sum_ratio",
-                "pred_std",
-                "actual_std",
-                "std_ratio",
-                "pred_nunique",
-                "actual_nunique",
-                "is_flat_forecast",
-                "weekday_shape_error",
-            ]
-        ),
-        "rolling_summary": {
-            "n_valid_windows": 0,
-            "median_wape": np.nan,
-            "median_bias_pct": np.nan,
-            "median_sum_ratio": np.nan,
-            "max_wape": np.nan,
-        },
-    }
+def _apply_total_stock_cap(raw_series: pd.Series, total_stock: float | None) -> pd.DataFrame:
+    raw = pd.to_numeric(raw_series, errors="coerce").fillna(0.0).clip(lower=0.0)
+    if total_stock is None:
+        return pd.DataFrame({"actual_sales": raw, "lost_sales": np.zeros(len(raw))})
+    remaining = max(float(total_stock), 0.0)
+    actual, lost = [], []
+    for v in raw:
+        keep = min(float(v), remaining)
+        actual.append(keep)
+        lost.append(max(float(v) - keep, 0.0))
+        remaining = max(0.0, remaining - keep)
+    return pd.DataFrame({"actual_sales": actual, "lost_sales": lost})
 
 
-def _build_pooled_factor_train(panel_train: pd.DataFrame, target_category: str, max_series: int = 8) -> Dict[str, Any]:
-    rows = []
-    used_series: List[str] = []
-    scope_panel = panel_train[panel_train["category"].astype(str) == str(target_category)].copy()
-    if scope_panel.empty:
-        return {"factor_train": pd.DataFrame(), "pooled_series_used": [], "pooled_rows_used": 0}
-
-    sku_rank = (
-        scope_panel.groupby("series_id", dropna=False)
-        .agg(
-            n_rows=("date", "size"),
-            price_unique=("price", lambda s: pd.to_numeric(s, errors="coerce").nunique(dropna=True)),
-            non_na_share=("sales", lambda s: float(pd.Series(s).notna().mean())),
-        )
-        .reset_index()
-    )
-    sku_rank = sku_rank.sort_values(["price_unique", "n_rows", "non_na_share"], ascending=False)
-
-    for series_id in sku_rank["series_id"].astype(str).dropna().head(max_series):
-        series_hist = scope_panel[scope_panel["series_id"].astype(str) == str(series_id)].copy()
-        if series_hist.empty:
+def _ctx_controls_changed(current_ctx: Dict[str, Any], scenario_ctx: Dict[str, Any]) -> bool:
+    controls = ["price", "discount", "promotion"] + [k for k in current_ctx.keys() if str(k).startswith("user_factor_")]
+    for c in controls:
+        av = current_ctx.get(c)
+        bv = scenario_ctx.get(c)
+        if isinstance(av, str) or isinstance(bv, str):
+            if str(av) != str(bv):
+                return True
             continue
-        sku = str(series_hist["product_id"].astype(str).iloc[0])
-        selected = select_best_baseline_plan(scope_panel, target_category, sku, target_series_id=str(series_id))
-        sku_strategy = str(selected.get("selected_strategy", "xgb_recursive"))
-        sku_granularity = str(selected.get("granularity", "daily"))
-        sku_hist = series_hist.copy()
-        if sku_granularity == "weekly":
-            oof = build_weekly_baseline_oof_predictions(sku_hist, strategy=sku_strategy)
-        else:
-            oof = build_baseline_oof_predictions(scope_panel, target_category, sku, target_series_id=str(series_id), strategy=sku_strategy)
-        if oof.empty:
-            continue
-        merged = sku_hist.merge(oof[["date", "baseline_oof"]], on="date", how="left")
-        if merged["baseline_oof"].notna().sum() < 10:
-            continue
-        rows.append(merged)
-        used_series.append(str(series_id))
-
-    factor_train = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    return {"factor_train": factor_train, "pooled_series_used": used_series, "pooled_rows_used": int(len(factor_train))}
+        a = float(pd.to_numeric(pd.Series([av]), errors="coerce").fillna(0.0).iloc[0])
+        b = float(pd.to_numeric(pd.Series([bv]), errors="coerce").fillna(0.0).iloc[0])
+        if abs(a - b) > 1e-9:
+            return True
+    return False
 
 
 def run_full_pricing_analysis_v2(
@@ -201,916 +74,357 @@ def run_full_pricing_analysis_v2(
     unit_price_input_type: str = "net",
     economics_mode: str = "net_price",
 ) -> Dict[str, Any]:
-    baseline_strategy_lock = str(os.getenv("BASELINE_STRATEGY_LOCK", "")).strip() or None
-    panel_daily = build_daily_panel_from_transactions(normalized_txn)
-    if "series_id" not in panel_daily.columns:
-        panel_daily["series_id"] = build_series_id(panel_daily)
-    panel_features_baseline = build_baseline_feature_matrix(panel_daily)
+    panel = build_daily_panel_from_transactions(normalized_txn)
+    if "series_id" not in panel.columns:
+        panel["series_id"] = build_series_id(panel)
+
     if target_series_id is None:
-        selector = panel_features_baseline[
-            (panel_features_baseline["category"].astype(str) == str(target_category))
-            & (panel_features_baseline["product_id"].astype(str) == str(target_sku))
-        ].copy()
-        if selector.empty:
+        pick = panel[(panel["category"].astype(str) == str(target_category)) & (panel["product_id"].astype(str) == str(target_sku))].copy()
+        if pick.empty:
             raise ValueError("Target history is empty")
-        target_series_id = str(selector["series_id"].astype(str).mode().iloc[0])
-    target_history = panel_features_baseline[
-        panel_features_baseline["series_id"].astype(str) == str(target_series_id)
-    ].copy().sort_values("date")
+        target_series_id = str(pick["series_id"].astype(str).mode().iloc[0])
+
+    target_history = panel[panel["series_id"].astype(str) == str(target_series_id)].copy().sort_values("date")
     if target_history.empty:
         raise ValueError("Target history is empty")
-    target_category = str(target_history["category"].astype(str).iloc[0]) if "category" in target_history.columns else str(target_category)
-    target_sku = str(target_history["product_id"].astype(str).iloc[0]) if "product_id" in target_history.columns else str(target_sku)
-    baseline_data_quality = build_baseline_data_quality_summary(target_history)
-
-    unique_dates = sorted(panel_features_baseline["date"].dropna().unique())
-    holdout_n = max(1, int(np.ceil(len(unique_dates) * 0.2)))
-    holdout_start = pd.Timestamp(unique_dates[-holdout_n])
-    panel_train = panel_features_baseline[panel_features_baseline["date"] < holdout_start].copy()
-    target_train = target_history[target_history["date"] < holdout_start].copy()
-
-    baseline_feature_spec_train = derive_baseline_feature_spec(panel_train)
-    baseline_feature_spec_full = derive_baseline_feature_spec(panel_features_baseline)
 
     future_dates = pd.DataFrame({"date": pd.date_range(pd.Timestamp(target_history["date"].max()) + pd.Timedelta(days=1), periods=int(horizon_days), freq="D")})
+    weekly = build_weekly_train_frame(target_history)
+    weekly = weekly.dropna(subset=["sales_week"]).reset_index(drop=True)
 
-    tiny_mode = target_history["date"].nunique() < 14
-    trained_baseline_bt = None
-    trained_baseline_final = None
-    best_baseline_strategy = "xgb_recursive"
-    baseline_granularity = "daily"
-    baseline_selector_reason = "daily selected: tiny_mode fallback"
-    baseline_plan_selection = {"granularity": "daily", "selected_strategy": "median7"}
-    baseline_strategy_selection = {"best_strategy": "xgb_recursive", "strategy_metrics": pd.DataFrame(), "strategy_summary": pd.DataFrame()}
-    baseline_benchmark_suite = pd.DataFrame()
-    baseline_quality_gate: Dict[str, Any] = {}
-    best_daily_strategy = "xgb_recursive"
-    best_weekly_strategy = "weekly_median4w"
-    baseline_selection_result: Dict[str, Any] = {}
-    plan_selected_strategy = "median7"
-    plan_selected_granularity = "daily"
+    current_ctx = build_current_state_context(target_history, {})
+    neutral_ctx = build_neutral_context(target_history, {})
+    scenario_ctx = apply_user_overrides(current_ctx, scenario_overrides)
 
-    if tiny_mode:
-        baseline_forecast = _tiny_baseline_fallback(target_history, future_dates)
-        baseline_rolling = _build_empty_baseline_rolling()
-        baseline_oof = target_train[["date", "sales"]].copy()
-        baseline_oof["baseline_oof"] = np.nan
-        best_baseline_strategy = "median7"
-        baseline_granularity = "daily"
-        baseline_selector_reason = "daily selected: tiny_mode fallback"
-        baseline_plan_selection = {
-            "granularity": "daily",
-            "daily_selection": baseline_strategy_selection,
-            "weekly_selection": {"strategy_metrics": pd.DataFrame(), "strategy_summary": pd.DataFrame(), "best_strategy": best_weekly_strategy},
-            "best_daily_strategy": best_baseline_strategy,
-            "best_weekly_strategy": best_weekly_strategy,
-            "selected_strategy": best_baseline_strategy,
-            "selector_reason": baseline_selector_reason,
-        }
-        plan_selected_strategy = str(baseline_plan_selection.get("selected_strategy", best_baseline_strategy))
-        plan_selected_granularity = str(baseline_plan_selection.get("granularity", baseline_granularity))
-        baseline_strategy_selection["best_strategy"] = best_baseline_strategy
-        baseline_benchmark_suite = pd.DataFrame(
-            [
-                {
-                    "strategy": best_baseline_strategy,
-                    "granularity": "daily",
-                    "composite_score": np.nan,
-                    "goal_wape_median_le_25": False,
-                    "goal_wape_max_le_35": False,
-                    "goal_abs_bias_le_7pct": False,
-                    "goal_sum_ratio_in_range": False,
-                    "goal_std_ratio_ge_055": False,
-                    "acceptance_pass": False,
-                }
-            ]
-        )
-        baseline_selection_result = {
-            "best_available_strategy": best_baseline_strategy,
-            "best_available_granularity": baseline_granularity,
-            "baseline_meets_quality_gate": False,
-            "baseline_rejection_reason": "tiny_history",
-            "runner_up_strategy": "",
-            "runner_up_score": np.nan,
-        }
+    horizon_weeks = max(1, int(np.ceil(horizon_days / 7)))
+    model = train_weekly_forecast_model(weekly)
+
+    future_as_is = build_future_weekly_frame(weekly["week_start"].max(), horizon_weeks, current_ctx)
+    future_scn = build_future_weekly_frame(weekly["week_start"].max(), horizon_weeks, scenario_ctx)
+
+    wk_as_is = recursive_weekly_forecast(model, weekly, future_as_is)
+    wk_scn = recursive_weekly_forecast(model, weekly, future_scn)
+    wk_scn_raw = wk_scn.copy()
+    wk_baseline = recursive_weekly_forecast(model, weekly, build_future_weekly_frame(weekly["week_start"].max(), horizon_weeks, neutral_ctx))
+    controls_changed = _ctx_controls_changed(current_ctx, scenario_ctx)
+    manual_scenario_fallback_applied = False
+    if controls_changed:
+        base_total_raw = float(pd.to_numeric(wk_as_is["sales_week"], errors="coerce").fillna(0.0).sum())
+        scn_total_raw = float(pd.to_numeric(wk_scn["sales_week"], errors="coerce").fillna(0.0).sum())
+        if abs(scn_total_raw - base_total_raw) <= max(1e-6, abs(base_total_raw) * 0.0025):
+            p_ref = max(float(pd.to_numeric(pd.Series([current_ctx.get("price", 1.0)]), errors="coerce").fillna(1.0).iloc[0]), 1e-6)
+            p_scn = max(float(pd.to_numeric(pd.Series([scenario_ctx.get("price", p_ref)]), errors="coerce").fillna(p_ref).iloc[0]), 1e-6)
+            d_ref = float(pd.to_numeric(pd.Series([current_ctx.get("discount", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+            d_scn = float(pd.to_numeric(pd.Series([scenario_ctx.get("discount", d_ref)]), errors="coerce").fillna(d_ref).iloc[0])
+            m_ref = float(pd.to_numeric(pd.Series([current_ctx.get("promotion", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+            m_scn = float(pd.to_numeric(pd.Series([scenario_ctx.get("promotion", m_ref)]), errors="coerce").fillna(m_ref).iloc[0])
+            scenario_mult = float(np.clip((p_scn / p_ref) ** -1.1 * (1.0 + 0.25 * (d_scn - d_ref)) * (1.0 + 0.15 * (m_scn - m_ref)), 0.85, 1.15))
+            wk_scn["sales_week"] = pd.to_numeric(wk_scn["sales_week"], errors="coerce").fillna(0.0) * scenario_mult
+            manual_scenario_fallback_applied = True
+
+    ood_flags: List[str] = []
+    p_hist = pd.to_numeric(weekly.get("price_week", np.nan), errors="coerce").dropna()
+    if len(p_hist):
+        p5, p95 = float(p_hist.quantile(0.05)), float(p_hist.quantile(0.95))
+        ps = float(pd.to_numeric(pd.Series([scenario_ctx.get("price", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
+        if np.isfinite(ps) and (ps < p5 or ps > p95):
+            ood_flags.append("scenario_out_of_training_range:price")
+    d_hist = pd.to_numeric(weekly.get("discount_week", np.nan), errors="coerce").dropna()
+    if len(d_hist):
+        d5, d95 = float(d_hist.quantile(0.05)), float(d_hist.quantile(0.95))
+        ds = float(pd.to_numeric(pd.Series([scenario_ctx.get("discount", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
+        if np.isfinite(ds) and (ds < d5 or ds > d95):
+            ood_flags.append("scenario_out_of_training_range:discount")
+    pmo_hist = pd.to_numeric(weekly.get("promo_week", np.nan), errors="coerce").dropna()
+    if len(pmo_hist):
+        pm = float(pd.to_numeric(pd.Series([scenario_ctx.get("promotion", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
+        if np.isfinite(pm) and (pm < float(pmo_hist.quantile(0.05)) or pm > float(pmo_hist.quantile(0.95))):
+            ood_flags.append("scenario_out_of_training_range:promo")
+    for c in [k for k in weekly.columns if str(k).startswith("user_factor_cat__")]:
+        known = set(weekly[c].dropna().astype(str).unique())
+        incoming = str(scenario_ctx.get(c, ""))
+        if incoming and known and incoming not in known:
+            ood_flags.append(f"scenario_out_of_training_range:{c}")
+    data_suff = {
+        "n_weeks": int(len(weekly)),
+        "price_unique_count": int(pd.to_numeric(weekly.get("price_week", np.nan), errors="coerce").nunique()),
+        "promo_transitions": int(pd.to_numeric(weekly.get("promo_week", 0.0), errors="coerce").diff().abs().fillna(0.0).gt(1e-9).sum()),
+    }
+
+    backtest = run_weekly_rolling_backtest(weekly)
+    benchmark = evaluate_vs_benchmarks(backtest)
+    # behavior checks
+    base_total = float(wk_as_is["sales_week"].sum())
+    scn_total = float(wk_scn["sales_week"].sum())
+    scn_raw_total = float(wk_scn_raw["sales_week"].sum())
+    same_controls = not controls_changed
+    scenario_changed_but_forecast_unchanged = controls_changed and (abs(scn_total - base_total) <= max(1e-6, abs(base_total) * 0.005))
+    scenario_unchanged_but_forecast_changed = same_controls and (abs(scn_total - base_total) > max(1e-6, abs(base_total) * 0.005))
+    # monotonicity sanity check
+    ctx_up = dict(scenario_ctx)
+    ctx_up["price"] = float(scenario_ctx.get("price", current_ctx.get("price", 0.0))) * 1.02
+    wk_up = recursive_weekly_forecast(model, weekly, build_future_weekly_frame(weekly["week_start"].max(), horizon_weeks, ctx_up))
+    if manual_scenario_fallback_applied:
+        p_ref_u = max(float(pd.to_numeric(pd.Series([current_ctx.get("price", 1.0)]), errors="coerce").fillna(1.0).iloc[0]), 1e-6)
+        p_up = max(float(pd.to_numeric(pd.Series([ctx_up.get("price", p_ref_u)]), errors="coerce").fillna(p_ref_u).iloc[0]), 1e-6)
+        d_ref_u = float(pd.to_numeric(pd.Series([current_ctx.get("discount", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        d_up = float(pd.to_numeric(pd.Series([ctx_up.get("discount", d_ref_u)]), errors="coerce").fillna(d_ref_u).iloc[0])
+        m_ref_u = float(pd.to_numeric(pd.Series([current_ctx.get("promotion", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        m_up = float(pd.to_numeric(pd.Series([ctx_up.get("promotion", m_ref_u)]), errors="coerce").fillna(m_ref_u).iloc[0])
+        up_mult = float(np.clip((p_up / p_ref_u) ** -1.1 * (1.0 + 0.25 * (d_up - d_ref_u)) * (1.0 + 0.15 * (m_up - m_ref_u)), 0.85, 1.15))
+        wk_up["sales_week"] = pd.to_numeric(wk_up["sales_week"], errors="coerce").fillna(0.0) * up_mult
+    price_monotonicity_violation = float(wk_up["sales_week"].sum()) > float(wk_scn["sales_week"].sum()) * 1.01
+    promo_now = float(pd.to_numeric(pd.Series([scenario_ctx.get("promotion", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    if promo_now >= 0.99:
+        promo_sensitivity_missing = False
     else:
-        baseline_plan_selection = select_best_baseline_plan(panel_train, target_category, target_sku, target_series_id=str(target_series_id))
-        plan_selected_strategy = str(baseline_plan_selection.get("selected_strategy", "xgb_recursive"))
-        plan_selected_granularity = str(baseline_plan_selection.get("granularity", "daily"))
-        baseline_granularity = str(baseline_plan_selection.get("granularity", "daily"))
-        best_baseline_strategy = str(baseline_plan_selection.get("selected_strategy", "xgb_recursive"))
-        baseline_selector_reason = str(baseline_plan_selection.get("selector_reason", "daily selected"))
-        baseline_strategy_selection = baseline_plan_selection.get("daily_selection", baseline_strategy_selection)
-        best_daily_strategy = str(baseline_plan_selection.get("best_daily_strategy", baseline_strategy_selection.get("best_strategy", "xgb_recursive")))
-        best_weekly_strategy = str(baseline_plan_selection.get("best_weekly_strategy", best_weekly_strategy))
-        baseline_benchmark_suite = run_baseline_benchmark_suite(
-            panel_train=panel_train,
-            target_category=target_category,
-            target_sku=target_sku,
-            target_series_id=str(target_series_id),
-        )
-        bench_rank = baseline_benchmark_suite.copy()
-        if not bench_rank.empty:
-            if "composite_score" not in bench_rank.columns:
-                bench_rank["composite_score"] = np.nan
-            if "median_wape" not in bench_rank.columns:
-                bench_rank["median_wape"] = np.nan
-            top1 = bench_rank.sort_values(["composite_score", "median_wape"]).head(1).copy()
-            baseline_selection_result = {
-                "best_available_strategy": str(top1.iloc[0].get("strategy", best_baseline_strategy)),
-                "best_available_granularity": str(top1.iloc[0].get("granularity", baseline_granularity)),
-                "baseline_meets_quality_gate": bool(top1.iloc[0].get("acceptance_pass", False)),
-                "baseline_rejection_reason": "" if bool(top1.iloc[0].get("acceptance_pass", False)) else "quality_gate_failed",
-                "runner_up_strategy": "",
-                "runner_up_score": np.nan,
-            }
-        else:
-            baseline_selection_result = {
-                "best_available_strategy": best_baseline_strategy,
-                "best_available_granularity": baseline_granularity,
-                "baseline_meets_quality_gate": False,
-                "baseline_rejection_reason": "no_benchmark_candidates",
-                "runner_up_strategy": "",
-                "runner_up_score": np.nan,
-            }
-
-        if baseline_strategy_lock:
-            best_baseline_strategy = str(baseline_strategy_lock)
-            baseline_granularity = "daily"
-            baseline_selector_reason = (
-                f"selected via strategy_lock ({best_baseline_strategy}/{baseline_granularity}); "
-                f"plan suggested ({plan_selected_strategy}/{plan_selected_granularity}); "
-                "benchmark suite diagnostics only"
-            )
-        else:
-            baseline_selector_reason = (
-                f"selected by plan ({best_baseline_strategy}/{baseline_granularity}); "
-                "benchmark suite diagnostics only"
-            )
-        runner_up_strategy = ""
-        runner_up_score = np.nan
-
-        if not baseline_benchmark_suite.empty:
-            ranked = baseline_benchmark_suite.copy()
-            if "composite_score" not in ranked.columns:
-                ranked["composite_score"] = np.nan
-            if "median_wape" not in ranked.columns:
-                ranked["median_wape"] = np.nan
-
-            ranked = ranked[
-                ~(
-                    (ranked["strategy"].astype(str) == str(best_baseline_strategy))
-                    & (ranked["granularity"].astype(str) == str(baseline_granularity))
-                )
-            ].copy()
-
-            ranked = ranked.sort_values(["composite_score", "median_wape"], ascending=[True, True])
-
-            if not ranked.empty:
-                runner_up_strategy = str(ranked.iloc[0].get("strategy", ""))
-                runner_up_score = float(ranked.iloc[0].get("composite_score", np.nan))
-
-        baseline_selection_result["runner_up_strategy"] = runner_up_strategy
-        baseline_selection_result["runner_up_score"] = runner_up_score
-        baseline_selection_result["best_available_strategy"] = str(best_baseline_strategy)
-        baseline_selection_result["best_available_granularity"] = str(baseline_granularity)
-
-        if not baseline_benchmark_suite.empty:
-            baseline_benchmark_suite["winner_scope"] = "rejected"
-            best_mask = (
-                (baseline_benchmark_suite["strategy"].astype(str) == best_baseline_strategy)
-                & (baseline_benchmark_suite["granularity"].astype(str) == baseline_granularity)
-            )
-            baseline_benchmark_suite.loc[best_mask, "winner_scope"] = "best_available"
-
-        base_ctx = {
-            c: (target_history[c].dropna().astype(str).iloc[-1] if c in ["series_id", "product_id", "category", "region", "channel", "segment"] and c in target_history else "unknown")
-            for c in baseline_feature_spec_full.get("baseline_context_features", [])
-        }
-        if baseline_granularity == "weekly":
-            trained_baseline_bt = None
-            trained_baseline_final = None
-            weekly_history = aggregate_daily_to_weekly(target_history)
-            weekday_profile = build_weekday_profile(target_history)
-            future_week_starts = pd.DataFrame({"week_start": sorted(week_start(future_dates["date"]).dropna().unique())})
-            weekly_forecast = forecast_weekly_baseline_by_strategy(best_baseline_strategy, weekly_history, future_week_starts)
-            baseline_forecast = disaggregate_weekly_to_daily(weekly_forecast, future_dates[["date"]], weekday_profile)
-            baseline_oof = build_weekly_baseline_oof_predictions(target_train, strategy=best_baseline_strategy)
-            baseline_rolling = baseline_plan_selection.get("weekly_selection", _build_empty_baseline_rolling())
-        elif best_baseline_strategy == "xgb_recursive":
-            trained_baseline_bt = train_baseline_model(panel_train, baseline_feature_spec_train, small_mode=len(panel_train) < 200, training_profile="backtest")
-            trained_baseline_final = train_baseline_model(panel_features_baseline, baseline_feature_spec_full, small_mode=len(panel_features_baseline) < 200, training_profile="final")
-            baseline_forecast = recursive_baseline_forecast(trained_baseline_final, target_history, future_dates, base_ctx, baseline_feature_spec_full)
-            baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, target_series_id=str(target_series_id), strategy=best_baseline_strategy)
-            baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, target_series_id=str(target_series_id), strategy=best_baseline_strategy)
-        else:
-            trained_baseline_bt = None
-            trained_baseline_final = None
-            baseline_forecast = forecast_baseline_by_strategy(best_baseline_strategy, None, target_history, future_dates, base_ctx, baseline_feature_spec_full)
-            baseline_rolling = run_baseline_rolling_backtest(panel_train, target_category, target_sku, target_series_id=str(target_series_id), strategy=best_baseline_strategy)
-            baseline_oof = build_baseline_oof_predictions(panel_train, target_category, target_sku, target_series_id=str(target_series_id), strategy=best_baseline_strategy)
-        baseline_forecast["baseline_lower"] = np.nan
-        baseline_forecast["baseline_upper"] = np.nan
-
-    baseline_plan_selection["plan_selected_strategy"] = plan_selected_strategy
-    baseline_plan_selection["plan_selected_granularity"] = plan_selected_granularity
-    baseline_plan_selection["final_selected_strategy"] = best_baseline_strategy
-    baseline_plan_selection["final_selected_granularity"] = baseline_granularity
-    final_baseline_source = "strategy_lock" if baseline_strategy_lock else "plan_selection"
-    baseline_plan_selection["final_selection_source"] = final_baseline_source
-
-    bench_match = pd.DataFrame()
-    if not baseline_benchmark_suite.empty:
-        bench_match = baseline_benchmark_suite[
-            (baseline_benchmark_suite["strategy"].astype(str) == str(best_baseline_strategy))
-            & (baseline_benchmark_suite["granularity"].astype(str) == str(baseline_granularity))
-        ].copy()
-        if bench_match.empty:
-            bench_match = baseline_benchmark_suite[baseline_benchmark_suite["strategy"].astype(str) == str(best_baseline_strategy)].copy()
-    if not bench_match.empty:
-        r = bench_match.iloc[0]
-        baseline_quality_gate = {
-            "baseline_meets_quality_gate": bool(r.get("acceptance_pass", False)),
-            "baseline_goal_wape_median_le_25": bool(r.get("goal_wape_median_le_25", False)),
-            "baseline_goal_wape_max_le_35": bool(r.get("goal_wape_max_le_35", False)),
-            "baseline_goal_abs_bias_le_7pct": bool(r.get("goal_abs_bias_le_7pct", False)),
-            "baseline_goal_sum_ratio_in_range": bool(r.get("goal_sum_ratio_in_range", False)),
-            "baseline_goal_std_ratio_ge_055": bool(r.get("goal_std_ratio_ge_055", False)),
-                "baseline_rejection_reason": "" if bool(r.get("acceptance_pass", False)) else str(baseline_selection_result.get("baseline_rejection_reason", "quality_gate_failed")),
-        }
-    else:
-        baseline_quality_gate = {
-            "baseline_meets_quality_gate": False,
-            "baseline_goal_wape_median_le_25": False,
-            "baseline_goal_wape_max_le_35": False,
-            "baseline_goal_abs_bias_le_7pct": False,
-            "baseline_goal_sum_ratio_in_range": False,
-            "baseline_goal_std_ratio_ge_055": False,
-            "baseline_rejection_reason": "no_benchmark_match",
-        }
-
-    factor_train_target = target_train.merge(baseline_oof[["date", "baseline_oof"]], on="date", how="left")
-    factor_feature_spec_target = derive_factor_feature_spec(factor_train_target)
-    factor_train_target = build_factor_feature_matrix(factor_train_target, factor_feature_spec_target)
-    factor_train_target = factor_train_target[factor_train_target["baseline_oof"].notna()].copy()
-    target_frame = build_factor_target_frame(factor_train_target)
-    factor_train_target = pd.concat([factor_train_target, target_frame], axis=1)
-    factor_train_target = factor_train_target[factor_train_target["factor_target_valid"].astype(bool)].copy()
-    weekly_train_panel = build_weekly_panel_from_daily(target_train)
-    weekly_factor_target = pd.DataFrame(columns=["week_start", "sales_week", "baseline_oof_week", "factor_target_week"])
-    if not weekly_train_panel.get("weekly_panel", pd.DataFrame()).empty:
-        wk_sales = weekly_train_panel["weekly_panel"][
-            ["week_start", "sales_week", "avg_price_week", "avg_discount_week", "promo_share_week", "avg_freight_week", "avg_cost_week"]
-        ].copy()
-        wk_oof = (
-            baseline_oof[["date", "baseline_oof"]]
-            .assign(week_start=week_start(baseline_oof["date"]))
-            .groupby("week_start", dropna=False)["baseline_oof"]
-            .sum()
-            .reset_index(name="baseline_oof_week")
-        )
-        weekly_factor_target = wk_sales.merge(wk_oof, on="week_start", how="left")
-        weekly_factor_target["factor_target_week"] = (
-            weekly_factor_target["sales_week"] / weekly_factor_target["baseline_oof_week"].clip(lower=1e-6)
-        ).clip(lower=0.4, upper=1.8)
-    target_assess = _assess_factor_trainability(factor_train_target, factor_feature_spec_target)
-
-    use_target_direct = (
-        target_assess["n_rows"] >= 120
-        and target_assess["price_unique_count"] >= 6
-        and target_assess["variative_controllable_count"] >= 2
-    )
-
-    factor_train_scope = "none"
-    factor_train = pd.DataFrame()
-    factor_feature_spec = factor_feature_spec_target
-    pooled_series_used: List[str] = []
-    pooled_rows_used = 0
-
-    if target_assess["trainable"] and use_target_direct:
-        factor_train_scope = "target"
-        factor_train = factor_train_target
-    else:
-        pooled_info = _build_pooled_factor_train(panel_train, target_category)
-        pooled_candidate = pooled_info.get("factor_train", pd.DataFrame())
-        pooled_series_used = pooled_info.get("pooled_series_used", [])
-        pooled_rows_used = int(pooled_info.get("pooled_rows_used", 0))
-        if not pooled_candidate.empty:
-            factor_feature_spec = derive_factor_feature_spec(pooled_candidate)
-            pooled_candidate = build_factor_feature_matrix(pooled_candidate, factor_feature_spec)
-            pooled_candidate = pooled_candidate[pooled_candidate["baseline_oof"].notna()].copy()
-            pooled_frame = build_factor_target_frame(pooled_candidate)
-            pooled_candidate = pd.concat([pooled_candidate, pooled_frame], axis=1)
-            pooled_candidate = pooled_candidate[pooled_candidate["factor_target_valid"].astype(bool)].copy()
-            pooled_assess = _assess_factor_trainability(pooled_candidate, factor_feature_spec)
-            if pooled_assess["trainable"]:
-                factor_train_scope = "pooled"
-                factor_train = pooled_candidate
-            elif target_assess["trainable"]:
-                factor_train_scope = "target"
-                factor_train = factor_train_target
-                factor_feature_spec = factor_feature_spec_target
-        elif target_assess["trainable"]:
-            factor_train_scope = "target"
-            factor_train = factor_train_target
-            factor_feature_spec = factor_feature_spec_target
-
-    factor_train_stats = _assess_factor_trainability(factor_train if not factor_train.empty else factor_train_target, factor_feature_spec_target if factor_train.empty else factor_feature_spec)
-    factor_model_trained = factor_train_scope in {"target", "pooled"} and len(factor_train) > 0
-
-    if factor_model_trained:
-        trained_factor = train_factor_model(factor_train, factor_feature_spec, small_mode=len(factor_train) < 200, training_profile="final")
-        factor_backtest = run_factor_rolling_backtest(factor_train, factor_feature_spec)
-    else:
-        trained_factor = None
-        factor_backtest = {"trained": False, "reason": "factor signal insufficient", "n_valid_windows": 0, "factor_ood_share": 0.0}
-
-    factor_backtest.update(
-        {
-            "n_train_rows": int(len(factor_train)),
-            "price_unique_count": int(factor_train_stats["price_unique_count"]),
-            "variative_controllable_count": int(factor_train_stats["variative_controllable_count"]),
-            "train_scope": factor_train_scope,
-            "pooled_series_used": pooled_series_used,
-            "pooled_rows_used": pooled_rows_used,
-        }
-    )
-
-    use_baseline_override = tiny_mode or (baseline_granularity == "weekly") or (best_baseline_strategy != "xgb_recursive")
-    pre_conf = compute_scenario_confidence(
-        baseline_quality_gate=baseline_quality_gate,
-        factor_backtest=factor_backtest,
-        factor_effect_source="ml_uplift" if trained_factor is not None else "bounded_rules",
-        ood_flags=[],
-    )
-    prelim_conf = str(pre_conf.get("overall_confidence", "medium"))
-    feature_spec_for_ctx = factor_feature_spec if factor_model_trained else {"controllable_features": ["price", "discount", "promotion"]}
-    neutral_ctx = build_neutral_context(target_history, feature_spec_for_ctx)
-    current_ctx = build_current_state_context(target_history, feature_spec_for_ctx)
-    scn_ctx = apply_user_overrides(current_ctx, scenario_overrides)
-    neutral_baseline_forecast = baseline_forecast.copy()
-
-    user_weekly_num = [c for c in weekly_factor_target.columns if str(c).startswith("user_factor_num__")]
-    user_weekly_cat = [c for c in weekly_factor_target.columns if str(c).startswith("user_factor_cat__")]
-    weekly_factor_feature_cols = ["avg_price_week", "avg_discount_week", "promo_share_week", "avg_freight_week", "avg_cost_week"] + user_weekly_num + user_weekly_cat
-    trained_weekly_factor = train_weekly_factor_model(weekly_factor_target, weekly_factor_feature_cols)
-    weekly_factor_backtest = run_weekly_factor_backtest(weekly_factor_target, weekly_factor_feature_cols)
-    factor_backtest["weekly_factor_backtest"] = weekly_factor_backtest
-
-    weekly_history_native = aggregate_daily_to_weekly(target_history)
-    weekly_future_starts = pd.DataFrame({"week_start": sorted(week_start(future_dates["date"]).dropna().unique())})
-    weekly_baseline_forecast_native = forecast_weekly_baseline_by_strategy(
-        best_weekly_strategy,
-        weekly_history_native,
-        weekly_future_starts,
-    )
-    weekly_path_ready = (not weekly_baseline_forecast_native.empty) and ("baseline_pred_weekly" in weekly_baseline_forecast_native.columns)
-    if weekly_path_ready:
-        ood_flags_weekly: List[str] = []
-        hist_price = pd.to_numeric(target_history.get("price", np.nan), errors="coerce").dropna()
-        if len(hist_price):
-            p_lo, p_hi = float(hist_price.quantile(0.01)), float(hist_price.quantile(0.99))
-            scn_price = float(pd.to_numeric(pd.Series([scn_ctx.get("price", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
-            if np.isfinite(scn_price) and (scn_price < p_lo or scn_price > p_hi):
-                ood_flags_weekly.append("ood_numeric:price")
-        for c in [col for col in target_history.columns if str(col).startswith("user_factor_cat__")]:
-            known = set(target_history[c].dropna().astype(str).unique())
-            incoming = str(scn_ctx.get(c, ""))
-            if incoming and known and incoming not in known:
-                ood_flags_weekly.append(f"ood_category:{c}")
-        weekly_scn = run_weekly_scenario_forecast(
-            weekly_baseline_forecast=weekly_baseline_forecast_native[["week_start", "baseline_pred_weekly"]],
-            trained_weekly_factor=trained_weekly_factor,
-            current_ctx=current_ctx,
-            scenario_ctx=scn_ctx,
-            shocks=shocks,
-            confidence_level=prelim_conf,
-        )
-        scenario_result = {
-            "warnings": [],
-            "mode": "weekly_native",
-            "scenario_mode": "weekly_native",
-            "scenario_effect_source": weekly_scn.get("factor_effect_source", "bounded_rules"),
-            "factor_effect_source": weekly_scn.get("factor_effect_source", "bounded_rules"),
-            "shock_applied": bool(weekly_scn.get("shock_applied", False)),
-            "ood_flags": sorted(set(list(weekly_scn.get("ood_flags", [])) + ood_flags_weekly)),
-            "neutral_ctx": neutral_ctx,
-            "current_ctx": current_ctx,
-            "scenario_ctx": scn_ctx,
-        }
-    else:
-        scenario_result = run_scenario_forecast(
-            trained_baseline=trained_baseline_final,
-            trained_factor=trained_factor,
-            base_history=target_history,
-            future_dates_df=future_dates,
-            baseline_feature_spec=baseline_feature_spec_full,
-            factor_feature_spec=factor_feature_spec if factor_model_trained else None,
-            scenario_overrides=scenario_overrides,
-            shocks=shocks,
-            baseline_override_df=baseline_forecast[["date", "baseline_pred"]] if use_baseline_override else None,
-            factor_backtest_summary=factor_backtest,
-            confidence_level=str(pre_conf.get("overall_confidence", "medium")),
-        )
-        weekly_scn = {
-            "weekly_neutral_baseline_forecast": aggregate_daily_to_weekly(scenario_result["neutral_baseline_forecast"].rename(columns={"baseline_pred": "sales"})).rename(columns={"sales": "baseline_pred_weekly"}),
-            "weekly_as_is_forecast": aggregate_daily_to_weekly(scenario_result["as_is_forecast"].rename(columns={"actual_sales": "sales"})).rename(columns={"sales": "final_as_is"}),
-            "weekly_scenario_forecast": aggregate_daily_to_weekly(scenario_result["scenario_forecast"].rename(columns={"actual_sales": "sales"})).rename(columns={"sales": "final_scenario"}),
-            "weekly_factor_effect_as_is": aggregate_daily_to_weekly(scenario_result["as_is_forecast"].rename(columns={"factor_multiplier": "sales"})).rename(columns={"sales": "factor_effect_as_is"}),
-            "weekly_factor_effect_scenario": aggregate_daily_to_weekly(scenario_result["scenario_forecast"].rename(columns={"factor_multiplier": "sales"})).rename(columns={"sales": "factor_effect_scenario"}),
-            "factor_effect_source": scenario_result.get("factor_effect_source", scenario_result.get("scenario_effect_source", "bounded_rules")),
-            "shock_applied": bool(scenario_result.get("shock_applied", False)),
-        }
+        ctx_promo = dict(scenario_ctx)
+        ctx_promo["promotion"] = 1.0
+        wk_promo = recursive_weekly_forecast(model, weekly, build_future_weekly_frame(weekly["week_start"].max(), horizon_weeks, ctx_promo))
+        promo_sensitivity_missing = abs(float(wk_promo["sales_week"].sum()) - float(wk_scn["sales_week"].sum())) <= max(1e-6, abs(float(wk_scn["sales_week"].sum())) * 0.005)
+    behavior_checks = {
+        "controls_changed": controls_changed,
+        "scenario_changed_but_forecast_unchanged": scenario_changed_but_forecast_unchanged,
+        "scenario_unchanged_but_forecast_changed": scenario_unchanged_but_forecast_changed,
+        "price_monotonicity_violation": price_monotonicity_violation,
+        "promo_sensitivity_missing": promo_sensitivity_missing,
+        "manual_scenario_fallback_applied": manual_scenario_fallback_applied,
+        "scenario_effect_only_from_fallback": bool(controls_changed and manual_scenario_fallback_applied and (abs(scn_raw_total - base_total) <= max(1e-6, abs(base_total) * 0.0025))),
+        "model_direct_sensitivity_present": bool((abs(scn_raw_total - base_total) > max(1e-6, abs(base_total) * 0.0025)) if controls_changed else True),
+        "price_direction_suspicious": bool(float(pd.to_numeric(pd.Series([scenario_ctx.get("price", np.nan)]), errors="coerce").fillna(np.nan).iloc[0]) > float(pd.to_numeric(pd.Series([current_ctx.get("price", np.nan)]), errors="coerce").fillna(np.nan).iloc[0]) and scn_total > base_total * 1.01),
+    }
+    diagnostics = build_model_diagnostics(backtest, benchmark, ood_flags, data_suff, behavior_checks=behavior_checks)
+    scenario_effect_source = "manual_fallback" if manual_scenario_fallback_applied else "model_direct"
+    acceptance_summary = build_acceptance_summary(backtest, benchmark, manual_scenario_fallback_applied, diagnostics.get("issues", []))
 
     weekday_profile = build_weekday_profile(target_history)
-    daily_presented_as_is = disaggregate_weekly_to_daily(
-        weekly_scn["weekly_as_is_forecast"][["week_start", "actual_as_is"]].rename(columns={"actual_as_is": "baseline_pred_weekly"}),
-        future_dates[["date"]],
-        weekday_profile,
-    ).rename(columns={"baseline_pred": "actual_sales"})
-    daily_lost_as_is = disaggregate_weekly_to_daily(
-        weekly_scn["weekly_as_is_forecast"][["week_start", "lost_as_is"]].rename(columns={"lost_as_is": "baseline_pred_weekly"}),
-        future_dates[["date"]],
-        weekday_profile,
-    ).rename(columns={"baseline_pred": "lost_sales"})
-    daily_presented_scenario = disaggregate_weekly_to_daily(
-        weekly_scn["weekly_scenario_forecast"][["week_start", "actual_scenario"]].rename(columns={"actual_scenario": "baseline_pred_weekly"}),
-        future_dates[["date"]],
-        weekday_profile,
-    ).rename(columns={"baseline_pred": "actual_sales"})
-    daily_lost_scenario = disaggregate_weekly_to_daily(
-        weekly_scn["weekly_scenario_forecast"][["week_start", "lost_scenario"]].rename(columns={"lost_scenario": "baseline_pred_weekly"}),
-        future_dates[["date"]],
-        weekday_profile,
-    ).rename(columns={"baseline_pred": "lost_sales"})
-    future_week_map = future_dates[["date"]].copy()
-    future_week_map["week_start"] = week_start(future_week_map["date"])
-    as_is_week_effect = weekly_scn["weekly_as_is_forecast"][["week_start", "factor_effect_as_is", "shock_effect"]].copy()
-    as_is_week_effect = as_is_week_effect.rename(columns={"factor_effect_as_is": "factor_multiplier", "shock_effect": "shock_multiplier"})
-    scn_week_effect = weekly_scn["weekly_scenario_forecast"][["week_start", "factor_effect_scenario", "shock_effect"]].copy()
-    scn_week_effect = scn_week_effect.rename(columns={"factor_effect_scenario": "factor_multiplier", "shock_effect": "shock_multiplier"})
-    as_is_effect_daily = future_week_map.merge(as_is_week_effect, on="week_start", how="left")[["date", "factor_multiplier", "shock_multiplier"]]
-    scn_effect_daily = future_week_map.merge(scn_week_effect, on="week_start", how="left")[["date", "factor_multiplier", "shock_multiplier"]]
+    as_is_daily = _weekly_to_daily_forecast(wk_as_is, future_dates, weekday_profile)
+    scn_daily = _weekly_to_daily_forecast(wk_scn, future_dates, weekday_profile)
+    baseline_daily = _weekly_to_daily_forecast(wk_baseline, future_dates, weekday_profile).rename(columns={"actual_sales": "baseline_pred"})
 
-    baseline_by_date = neutral_baseline_forecast[["date", "baseline_pred"]].copy()
-    as_is_forecast = daily_presented_as_is.merge(baseline_by_date, on="date", how="left").merge(daily_lost_as_is, on="date", how="left")
-    as_is_forecast = as_is_forecast.merge(as_is_effect_daily, on="date", how="left")
-    as_is_forecast["factor_multiplier"] = pd.to_numeric(as_is_forecast["factor_multiplier"], errors="coerce").fillna(1.0)
-    as_is_forecast["shock_multiplier"] = pd.to_numeric(as_is_forecast["shock_multiplier"], errors="coerce").fillna(1.0)
-    as_is_forecast["demand_raw"] = as_is_forecast["actual_sales"] + as_is_forecast["lost_sales"].fillna(0.0)
-    as_is_forecast["final_demand"] = as_is_forecast["actual_sales"]
-    as_is_forecast["scenario_demand_raw"] = as_is_forecast["demand_raw"]
-    as_is_forecast["remaining_stock"] = np.nan
-
-    scenario_forecast = daily_presented_scenario.merge(baseline_by_date, on="date", how="left").merge(daily_lost_scenario, on="date", how="left")
-    scenario_forecast = scenario_forecast.merge(scn_effect_daily, on="date", how="left")
-    scenario_forecast["factor_multiplier"] = pd.to_numeric(scenario_forecast["factor_multiplier"], errors="coerce").fillna(1.0)
-    scenario_forecast["shock_multiplier"] = pd.to_numeric(scenario_forecast["shock_multiplier"], errors="coerce").fillna(1.0)
-    scenario_forecast["demand_raw"] = scenario_forecast["actual_sales"] + scenario_forecast["lost_sales"].fillna(0.0)
-    scenario_forecast["final_demand"] = scenario_forecast["actual_sales"]
-    scenario_forecast["scenario_demand_raw"] = scenario_forecast["demand_raw"]
-    scenario_forecast["remaining_stock"] = np.nan
-
-    n_input = disaggregate_weekly_to_daily(
-        weekly_scn["weekly_neutral_baseline_forecast"][["week_start", "baseline_pred_weekly"]],
-        future_dates[["date"]],
-        weekday_profile,
+    as_is_forecast = future_dates[["date"]].merge(as_is_daily, on="date", how="left").merge(baseline_daily, on="date", how="left")
+    scenario_forecast = future_dates[["date"]].merge(scn_daily, on="date", how="left").merge(baseline_daily, on="date", how="left")
+    neutral_baseline_forecast = baseline_daily[["date", "baseline_pred"]].copy()
+    # stock cap + shocks on top of direct scenario forecast
+    as_is_stock = None
+    if bool(current_ctx.get("use_stock_cap", False)):
+        as_is_stock = float(pd.to_numeric(pd.Series([current_ctx.get("stock_total_horizon", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
+    scn_stock = None
+    if bool(scenario_ctx.get("use_stock_cap", False)):
+        scn_stock = float(pd.to_numeric(pd.Series([scenario_ctx.get("stock_total_horizon", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
+    as_is_cap = _apply_total_stock_cap(as_is_forecast["actual_sales"], as_is_stock)
+    scn_cap = _apply_total_stock_cap(scenario_forecast["actual_sales"], scn_stock)
+    as_is_forecast["actual_sales"] = as_is_cap["actual_sales"].values
+    as_is_forecast["lost_sales"] = as_is_cap["lost_sales"].values
+    scenario_forecast["actual_sales"] = scn_cap["actual_sales"].values
+    scenario_forecast["lost_sales"] = scn_cap["lost_sales"].values
+    shock_multiplier = 1.0 + sum(
+        [float(pd.to_numeric(pd.Series([sh.get("intensity", 0.0)]), errors="coerce").fillna(0.0).iloc[0]) for sh in (shocks or [])]
     )
-    n_input["price"] = max(float(neutral_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])), 1e-6)
-    n_input["discount"] = float(neutral_ctx.get("discount", target_history.get("discount", pd.Series([0.0])).iloc[-1]))
-    n_input["cost"] = float(neutral_ctx.get("cost", target_history.get("cost", pd.Series([0.0])).iloc[-1]))
-    n_input["freight_value"] = float(neutral_ctx.get("freight_value", target_history.get("freight_value", pd.Series([0.0])).iloc[-1]))
+    shock_multiplier = float(np.clip(shock_multiplier, 0.5, 1.5))
+    for ddf in (as_is_forecast, scenario_forecast):
+        ddf["shock_multiplier"] = shock_multiplier
+        ddf["actual_sales"] = pd.to_numeric(ddf["actual_sales"], errors="coerce").fillna(0.0) * shock_multiplier
+        ddf["demand_raw"] = ddf["actual_sales"] + ddf["lost_sales"]
+        ddf["scenario_demand_raw"] = ddf["demand_raw"]
+
+    as_is_forecast["price"] = float(current_ctx.get("price", 0.0))
+    as_is_forecast["discount"] = float(current_ctx.get("discount", 0.0))
+    as_is_forecast["cost"] = float(current_ctx.get("cost", as_is_forecast["price"].iloc[0] * 0.65))
+    as_is_forecast["freight_value"] = float(current_ctx.get("freight_value", 0.0))
+    scenario_forecast["price"] = float(scenario_ctx.get("price", as_is_forecast["price"].iloc[0]))
+    scenario_forecast["discount"] = float(scenario_ctx.get("discount", as_is_forecast["discount"].iloc[0]))
+    scenario_forecast["cost"] = float(scenario_ctx.get("cost", as_is_forecast["cost"].iloc[0]))
+    scenario_forecast["freight_value"] = float(scenario_ctx.get("freight_value", as_is_forecast["freight_value"].iloc[0]))
+
     neutral_baseline_economics, _ = compute_daily_unit_economics(
-        n_input,
+        neutral_baseline_forecast.assign(
+            price=float(neutral_ctx.get("price", as_is_forecast["price"].iloc[0])),
+            discount=float(neutral_ctx.get("discount", 0.0)),
+            cost=float(neutral_ctx.get("cost", as_is_forecast["cost"].iloc[0])),
+            freight_value=float(neutral_ctx.get("freight_value", 0.0)),
+        ),
         quantity_col="baseline_pred",
         unit_price_input_type=unit_price_input_type,
         economics_mode=economics_mode,
     )
+    as_is_economics, _ = compute_daily_unit_economics(as_is_forecast, quantity_col="actual_sales", unit_price_input_type=unit_price_input_type, economics_mode=economics_mode)
+    scenario_economics, _ = compute_daily_unit_economics(scenario_forecast, quantity_col="actual_sales", unit_price_input_type=unit_price_input_type, economics_mode=economics_mode)
 
-    daily_final_as_is = as_is_forecast[["date", "actual_sales", "lost_sales", "baseline_pred"]].copy()
-    daily_final_as_is["factor_effect"] = as_is_forecast["factor_multiplier"]
-    daily_final_as_is["shock_effect"] = as_is_forecast["shock_multiplier"]
-    daily_final_as_is["price"] = max(float(current_ctx.get("price", n_input["price"].iloc[0])), 1e-6)
-    daily_final_as_is["discount"] = float(current_ctx.get("discount", n_input["discount"].iloc[0]))
-    daily_final_as_is["cost"] = float(current_ctx.get("cost", n_input["cost"].iloc[0]))
-    daily_final_as_is["freight_value"] = float(current_ctx.get("freight_value", n_input["freight_value"].iloc[0]))
-    as_is_economics, _ = compute_daily_unit_economics(
-        daily_final_as_is,
-        quantity_col="actual_sales",
-        unit_price_input_type=unit_price_input_type,
-        economics_mode=economics_mode,
-    )
+    delta_current_vs = pd.DataFrame([{
+        "as_is_total_demand": float(as_is_forecast["actual_sales"].sum()),
+        "scenario_total_demand": float(scenario_forecast["actual_sales"].sum()),
+        "demand_delta_abs": float(scenario_forecast["actual_sales"].sum() - as_is_forecast["actual_sales"].sum()),
+        "demand_delta_pct": float((scenario_forecast["actual_sales"].sum() - as_is_forecast["actual_sales"].sum()) / max(float(as_is_forecast["actual_sales"].sum()), 1e-9)),
+        "as_is_total_revenue": float(as_is_economics["total_revenue"].sum()),
+        "scenario_total_revenue": float(scenario_economics["total_revenue"].sum()),
+        "revenue_delta_abs": float(scenario_economics["total_revenue"].sum() - as_is_economics["total_revenue"].sum()),
+        "revenue_delta_pct": float((scenario_economics["total_revenue"].sum() - as_is_economics["total_revenue"].sum()) / max(float(as_is_economics["total_revenue"].sum()), 1e-9)),
+        "as_is_total_profit": float(as_is_economics["profit"].sum()),
+        "scenario_total_profit": float(scenario_economics["profit"].sum()),
+        "profit_delta_abs": float(scenario_economics["profit"].sum() - as_is_economics["profit"].sum()),
+        "profit_delta_pct": float((scenario_economics["profit"].sum() - as_is_economics["profit"].sum()) / max(abs(float(as_is_economics["profit"].sum())), 1e-9)),
+    }])
 
-    daily_final_scenario = scenario_forecast[["date", "actual_sales", "lost_sales", "baseline_pred"]].copy()
-    daily_final_scenario["factor_effect"] = scenario_forecast["factor_multiplier"]
-    daily_final_scenario["shock_effect"] = scenario_forecast["shock_multiplier"]
-    daily_final_scenario["price"] = max(float(scn_ctx.get("price", daily_final_as_is["price"].iloc[0])), 1e-6)
-    daily_final_scenario["discount"] = float(scn_ctx.get("discount", daily_final_as_is["discount"].iloc[0]))
-    daily_final_scenario["cost"] = float(scn_ctx.get("cost", daily_final_as_is["cost"].iloc[0]))
-    daily_final_scenario["freight_value"] = float(scn_ctx.get("freight_value", daily_final_as_is["freight_value"].iloc[0]))
-    scenario_economics, _ = compute_daily_unit_economics(
-        daily_final_scenario,
-        quantity_col="actual_sales",
-        unit_price_input_type=unit_price_input_type,
-        economics_mode=economics_mode,
-    )
+    delta_neutral_vs = pd.DataFrame([{
+        "neutral_total_demand": float(neutral_baseline_forecast["baseline_pred"].sum()),
+        "as_is_total_demand": float(as_is_forecast["actual_sales"].sum()),
+        "demand_delta_abs": float(as_is_forecast["actual_sales"].sum() - neutral_baseline_forecast["baseline_pred"].sum()),
+    }])
 
-    as_is_total_demand = float(pd.to_numeric(as_is_forecast["actual_sales"], errors="coerce").fillna(0.0).sum())
-    scenario_total_demand = float(pd.to_numeric(scenario_forecast["actual_sales"], errors="coerce").fillna(0.0).sum())
-    demand_delta_abs = scenario_total_demand - as_is_total_demand
-    demand_delta_pct = demand_delta_abs / max(as_is_total_demand, 1e-9)
-    baseline_total_revenue = float(as_is_economics["total_revenue"].sum())
-    scenario_total_revenue = float(scenario_economics["total_revenue"].sum())
-    baseline_total_profit = float(as_is_economics["profit"].sum())
-    scenario_total_profit = float(scenario_economics["profit"].sum())
-    delta_summary_current_vs_scenario = pd.DataFrame(
-        [
-            {
-                "as_is_total_demand": as_is_total_demand,
-                "scenario_total_demand": scenario_total_demand,
-                "demand_delta_abs": demand_delta_abs,
-                "demand_delta_pct": demand_delta_pct,
-                "as_is_total_revenue": baseline_total_revenue,
-                "scenario_total_revenue": scenario_total_revenue,
-                "revenue_delta_abs": scenario_total_revenue - baseline_total_revenue,
-                "revenue_delta_pct": 0.0 if abs(baseline_total_revenue) < 1e-9 else (scenario_total_revenue - baseline_total_revenue) / baseline_total_revenue,
-                "as_is_total_profit": baseline_total_profit,
-                "scenario_total_profit": scenario_total_profit,
-                "profit_delta_abs": scenario_total_profit - baseline_total_profit,
-                "profit_delta_pct": 0.0 if abs(baseline_total_profit) < 1e-9 else (scenario_total_profit - baseline_total_profit) / baseline_total_profit,
-            }
-        ]
-    )
-    neutral_total_demand = float(pd.to_numeric(neutral_baseline_forecast["baseline_pred"], errors="coerce").fillna(0.0).sum())
-    neutral_total_revenue = float(neutral_baseline_economics["total_revenue"].sum())
-    neutral_total_profit = float(neutral_baseline_economics["profit"].sum())
-    delta_summary_neutral_vs_current = pd.DataFrame(
-        [
-            {
-                "neutral_total_demand": neutral_total_demand,
-                "as_is_total_demand": as_is_total_demand,
-                "demand_delta_abs": as_is_total_demand - neutral_total_demand,
-                "demand_delta_pct": 0.0 if abs(neutral_total_demand) < 1e-9 else (as_is_total_demand - neutral_total_demand) / neutral_total_demand,
-                "neutral_total_revenue": neutral_total_revenue,
-                "as_is_total_revenue": baseline_total_revenue,
-                "revenue_delta_abs": baseline_total_revenue - neutral_total_revenue,
-                "revenue_delta_pct": 0.0 if abs(neutral_total_revenue) < 1e-9 else (baseline_total_revenue - neutral_total_revenue) / neutral_total_revenue,
-                "neutral_total_profit": neutral_total_profit,
-                "as_is_total_profit": baseline_total_profit,
-                "profit_delta_abs": baseline_total_profit - neutral_total_profit,
-                "profit_delta_pct": 0.0 if abs(neutral_total_profit) < 1e-9 else (baseline_total_profit - neutral_total_profit) / neutral_total_profit,
-            }
-        ]
-    )
-
-    isolated_current_factor_deltas = compute_current_state_contributions(target_history, future_dates, neutral_ctx, current_ctx, trained_factor, factor_feature_spec if factor_model_trained else {"controllable_features": []}) if factor_model_trained else pd.DataFrame(columns=["factor_name", "from_value", "to_value", "multiplier_delta", "contribution_pct", "confidence", "note"])
-    isolated_scenario_factor_deltas = compute_scenario_delta_contributions(target_history, future_dates, current_ctx, scn_ctx, trained_factor, factor_feature_spec if factor_model_trained else {"controllable_features": []}) if factor_model_trained else pd.DataFrame(columns=["factor_name", "from_value", "to_value", "multiplier_delta", "contribution_pct", "confidence", "note"])
-
-    baseline_conf = build_baseline_confidence_state(baseline_rolling.get("rolling_summary", {}))
-    factor_role = factor_train_stats.get("factor_role", "unavailable")
-    if factor_train_scope == "pooled":
-        factor_role = "advisory_only"
-    if not bool(baseline_quality_gate.get("baseline_meets_quality_gate", False)):
-        factor_role = "advisory_only"
-    if baseline_conf.get("level") != "high" and factor_role == "production":
-        factor_role = "advisory_only"
-    factor_conf = build_factor_confidence_state(
-        factor_backtest,
-        ood_flags=scenario_result.get("ood_flags", []),
-        baseline_level=baseline_conf.get("level", "low"),
-        scenario_outside_factor_backtest_range=("scenario_outside_factor_backtest_range" in scenario_result.get("warnings", [])),
-    )
-    shock_conf = build_shock_confidence_state(shocks)
-    has_current_effect = any(neutral_ctx.get(c) != current_ctx.get(c) for c in (factor_feature_spec or {}).get("controllable_features", []))
-    has_override_effect = any(current_ctx.get(c) != scn_ctx.get(c) for c in (factor_feature_spec or {}).get("controllable_features", []))
-    explainability_available = True
-    if has_current_effect and isolated_current_factor_deltas.empty:
-        explainability_available = False
-    if has_override_effect and isolated_scenario_factor_deltas.empty:
-        explainability_available = False
-
-    confidence = combine_confidence_states(
-        baseline_conf,
-        factor_conf,
-        shock_conf,
-        intervals_available=False,
-        factor_role=factor_role,
-        scenario_outside_factor_backtest_range=("scenario_outside_factor_backtest_range" in scenario_result.get("warnings", [])),
-        scenario_equals_current_but_delta_nonzero=("scenario_equals_current_but_delta_nonzero" in scenario_result.get("warnings", [])),
-        explainability_available=explainability_available,
-    )
-    confidence.update(baseline_quality_gate)
-
-    confidence_flat = pd.DataFrame(
-        [
-            {
-                "overall_confidence": confidence.get("overall_confidence"),
-                "issues": "; ".join([str(x) for x in confidence.get("issues", [])]),
-                "intervals_available": bool(confidence.get("intervals_available", False)),
-                "baseline_confidence_level": confidence.get("baseline_confidence", {}).get("level"),
-                "factor_confidence_level": confidence.get("factor_confidence", {}).get("level"),
-                "shock_confidence_level": confidence.get("shock_confidence", {}).get("level"),
-                "factor_role": factor_role,
-                **baseline_quality_gate,
-            }
-        ]
-    )
-
-    baseline_quality_summary = build_baseline_quality_summary(
-        baseline_benchmark_suite,
-        {
-            "best_available_strategy": best_baseline_strategy,
-            "best_available_granularity": baseline_granularity,
-            "baseline_meets_quality_gate": baseline_quality_gate.get("baseline_meets_quality_gate", False),
-            "runner_up_strategy": baseline_selection_result.get("runner_up_strategy", ""),
-            "runner_up_score": baseline_selection_result.get("runner_up_score", np.nan),
-        },
-        baseline_selector_reason,
-    )
-
-    runner_up_note = "n/a"
-    runner_up_strategy = str(baseline_selection_result.get("runner_up_strategy", ""))
-    if runner_up_strategy:
-        runner_up_granularity = ""
-        if not baseline_benchmark_suite.empty and "strategy" in baseline_benchmark_suite.columns:
-            ru = baseline_benchmark_suite[baseline_benchmark_suite["strategy"].astype(str) == runner_up_strategy].head(1)
-            if not ru.empty:
-                runner_up_granularity = str(ru.iloc[0].get("granularity", ""))
-        runner_up_score = float(baseline_selection_result.get("runner_up_score", np.nan))
-        runner_up_note = f"{runner_up_strategy} ({runner_up_granularity}) score={runner_up_score:.2f}"
-    diagnostic_summary = pd.DataFrame(
-        [
-            {"item": "selected_baseline", "value": f"{best_baseline_strategy} ({baseline_granularity})"},
-            {"item": "selector_reason", "value": baseline_selector_reason},
-            {"item": "plan_selected_baseline", "value": f"{plan_selected_strategy} ({plan_selected_granularity})"},
-            {"item": "final_baseline_source", "value": final_baseline_source},
-            {"item": "runner_up", "value": runner_up_note},
-            {"item": "overall_confidence", "value": str(confidence.get("overall_confidence", "low"))},
-            {"item": "confidence_issues", "value": "; ".join([str(x) for x in confidence.get("issues", [])])},
-            {"item": "scenario_equals_as_is_demand", "value": str(abs(demand_delta_pct) <= 1e-9)},
-            {"item": "scenario_demand_delta_pct", "value": f"{float(demand_delta_pct) * 100.0:.2f}%"},
-            {"item": "baseline_meets_quality_gate", "value": str(bool(baseline_quality_gate.get("baseline_meets_quality_gate", False)))},
-            {"item": "baseline_rejection_reason", "value": str(baseline_quality_gate.get("baseline_rejection_reason", ""))},
-        ]
-    )
-    scenario_inputs_echo = pd.DataFrame(
-        [
-            {
-                "control_name": c,
-                "current_value": current_ctx.get(c),
-                "scenario_value": scn_ctx.get(c),
-                "changed_flag": current_ctx.get(c) != scn_ctx.get(c),
-                "supported_flag": True,
-            }
-            for c in (factor_feature_spec or {}).get("controllable_features", [])
-        ]
-    )
-    if scenario_overrides:
-        known_controls = set((factor_feature_spec or {}).get("controllable_features", []))
-        for k, v in scenario_overrides.items():
-            if k not in known_controls:
-                scenario_inputs_echo = pd.concat(
-                    [
-                        scenario_inputs_echo,
-                        pd.DataFrame([{"control_name": k, "current_value": current_ctx.get(k), "scenario_value": v, "changed_flag": False, "supported_flag": False}]),
-                    ],
-                    ignore_index=True,
-                )
-
-    scenario_changed_any = bool(scenario_inputs_echo["changed_flag"].any()) if not scenario_inputs_echo.empty else False
-    unsupported_override_count = int((scenario_inputs_echo["supported_flag"] == False).sum()) if not scenario_inputs_echo.empty else 0  # noqa: E712
-    scenario_delta_zero_reason = ""
-    if abs(float(demand_delta_pct)) <= 1e-9:
-        if not scenario_overrides:
-            scenario_delta_zero_reason = "no_overrides"
-        elif unsupported_override_count > 0 and not scenario_changed_any:
-            scenario_delta_zero_reason = "unsupported_overrides"
-        elif not scenario_changed_any:
-            scenario_delta_zero_reason = "scenario_equals_current_state"
-        else:
-            scenario_delta_zero_reason = "no_material_effect"
-
-    diagnostic_summary = pd.concat(
-        [
-            diagnostic_summary,
-            pd.DataFrame(
-                [
-                    {"item": "scenario_controls_changed", "value": str(scenario_changed_any)},
-                    {"item": "scenario_unsupported_overrides", "value": str(unsupported_override_count)},
-                    {"item": "scenario_delta_zero_reason", "value": scenario_delta_zero_reason},
-                ]
-            ),
-        ],
-        ignore_index=True,
-    )
-
-    rolling_metrics_export = baseline_rolling.get("rolling_metrics", pd.DataFrame()).copy()
-    rolling_diag_export = baseline_rolling.get("rolling_diag", pd.DataFrame()).copy()
-    required_roll_cols = [
-        "window_id",
-        "window_start",
-        "window_end",
-        "forecast_wape",
-        "mae",
-        "rmse",
-        "bias_pct",
-        "sum_ratio",
-        "pred_std",
-        "actual_std",
-        "std_ratio",
-        "pred_nunique",
-        "actual_nunique",
-        "is_flat_forecast",
-        "weekday_shape_error",
-    ]
-    for c in required_roll_cols:
-        if c not in rolling_metrics_export.columns:
-            rolling_metrics_export[c] = np.nan
-    required_diag_cols = ["date", "sales", "baseline_pred", "window_id", "window_start", "window_end"]
-    for c in required_diag_cols:
-        if c not in rolling_diag_export.columns:
-            rolling_diag_export[c] = np.nan
-
-    excel_buffer = BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        target_history.to_excel(writer, sheet_name="history", index=False)
-        neutral_baseline_forecast.to_excel(writer, sheet_name="neutral_baseline_forecast", index=False)
-        as_is_forecast.to_excel(writer, sheet_name="as_is_forecast", index=False)
-        scenario_forecast.to_excel(writer, sheet_name="scenario_forecast", index=False)
-        neutral_baseline_economics.to_excel(writer, sheet_name="neutral_baseline_economics", index=False)
-        as_is_economics.to_excel(writer, sheet_name="as_is_economics", index=False)
-        scenario_economics.to_excel(writer, sheet_name="scenario_economics", index=False)
-        delta_summary_current_vs_scenario.to_excel(writer, sheet_name="delta_summary_current_vs_scenario", index=False)
-        delta_summary_neutral_vs_current.to_excel(writer, sheet_name="delta_summary_neutral_vs_current", index=False)
-        rolling_metrics_export[required_roll_cols].to_excel(writer, sheet_name="baseline_rolling_metrics", index=False)
-        rolling_diag_export[required_diag_cols].to_excel(writer, sheet_name="baseline_rolling_diag", index=False)
-        (pd.DataFrame([factor_backtest]) if isinstance(factor_backtest, dict) else pd.DataFrame(factor_backtest)).to_excel(writer, sheet_name="factor_backtest", index=False)
-        isolated_current_factor_deltas.to_excel(writer, sheet_name="isolated_current_factor_deltas", index=False)
-        isolated_scenario_factor_deltas.to_excel(writer, sheet_name="isolated_scenario_factor_deltas", index=False)
-        baseline_quality_summary.to_excel(writer, sheet_name="baseline_quality_summary", index=False)
-        baseline_data_quality.to_excel(writer, sheet_name="baseline_data_quality", index=False)
-        scenario_inputs_echo.to_excel(writer, sheet_name="scenario_inputs_echo", index=False)
-        diagnostic_summary.to_excel(writer, sheet_name="diagnostic_summary", index=False)
-        baseline_benchmark_suite.to_excel(writer, sheet_name="baseline_benchmark_suite", index=False)
-        pd.DataFrame([confidence]).to_excel(writer, sheet_name="confidence", index=False)
-        confidence_flat.to_excel(writer, sheet_name="confidence_flat", index=False)
-    excel_buffer.seek(0)
-
-    mode = scenario_result.get("mode", "baseline_only")
-    if not scenario_changed_any:
-        mode = "as_is_only"
-    ood_flags = scenario_result.get("ood_flags", [])
-    intervals_available = False
-
-
-    scenario_feature_spec = {
-        "user_numeric_features": [c for c in (factor_feature_spec or {}).get("controllable_features", []) if str(c).startswith("user_factor_num__")],
-        "user_categorical_features": [c for c in (factor_feature_spec or {}).get("controllable_features", []) if str(c).startswith("user_factor_cat__")],
-        "supported_controls": list((factor_feature_spec or {}).get("controllable_features", [])),
+    overall_conf = diagnostics["overall_confidence"]
+    if manual_scenario_fallback_applied and overall_conf == "high":
+        overall_conf = "medium"
+    confidence = {
+        "baseline_confidence": diagnostics,
+        "shock_confidence": {"overall_confidence": "medium", "issues": []},
+        "overall_confidence": overall_conf,
+        "intervals_available": False,
     }
 
-    bundle = build_model_bundle(
-        trained_baseline_bt=trained_baseline_bt,
-        trained_baseline_final=trained_baseline_final,
-        trained_factor=trained_factor,
-        baseline_feature_spec_train=baseline_feature_spec_train,
-        baseline_feature_spec_full=baseline_feature_spec_full,
-        factor_feature_spec=factor_feature_spec,
-        baseline_rolling_backtest=baseline_rolling,
-        factor_backtest=factor_backtest,
-        weekly_factor_backtest=weekly_factor_backtest,
-        baseline_oof=baseline_oof,
-        target_history=target_history,
-        panel_daily=panel_daily,
-        future_dates=future_dates,
-        confidence=confidence,
-        warnings=scenario_result.get("warnings", []) + ood_flags,
-        model_backend_info={"baseline_bt": (trained_baseline_bt or {}).get("model_backend"), "baseline_final": (trained_baseline_final or {}).get("model_backend"), "factor": trained_factor.get("model_backend") if trained_factor else None},
-        engine_version="v2_decomposed_baseline_factor_shock",
-        factor_train_scope=factor_train_scope,
-        factor_train_rows=int(len(factor_train)),
-        baseline_strategy=best_baseline_strategy,
-        baseline_strategy_selection=baseline_strategy_selection,
-        baseline_granularity=baseline_granularity,
-        baseline_plan_selection=baseline_plan_selection,
-        best_daily_strategy=best_daily_strategy,
-        best_weekly_strategy=best_weekly_strategy,
-        baseline_selector_reason=baseline_selector_reason,
-        baseline_benchmark_suite=baseline_benchmark_suite,
-        baseline_quality_gate=baseline_quality_gate,
-        baseline_runner_up_strategy=str(baseline_selection_result.get("runner_up_strategy", "")),
-        baseline_runner_up_score=float(baseline_selection_result.get("runner_up_score", np.nan)),
-        final_baseline_strategy=best_baseline_strategy,
-        final_baseline_granularity=baseline_granularity,
-        final_baseline_source=final_baseline_source,
-        scenario_controls_changed=scenario_changed_any,
-        scenario_delta_zero_reason=scenario_delta_zero_reason,
-        mode=mode,
-        ood_flags=ood_flags,
-        intervals_available=intervals_available,
-        pooled_series_used=pooled_series_used,
-        pooled_rows_used=pooled_rows_used,
-        neutral_ctx=neutral_ctx,
-        current_ctx=current_ctx,
-        base_ctx=current_ctx,
-        scenario_mode=scenario_result.get("scenario_mode", mode),
-        scenario_effect_source=scenario_result.get("scenario_effect_source", mode),
-        target_series_id=str(target_series_id),
-        series_scope={c: str(target_history[c].iloc[-1]) if c in target_history.columns else "unknown" for c in SERIES_SCOPE_COLS},
-        unit_price_input_type=str(unit_price_input_type),
-        economics_mode=str(economics_mode),
-        neutral_baseline_forecast=neutral_baseline_forecast.copy(),
-        as_is_forecast=as_is_forecast.copy(),
-        factor_role=factor_role,
-        decision_validity=(
-            "production_candidate"
-            if (confidence.get("overall_confidence") == "high" and bool(baseline_quality_gate.get("baseline_meets_quality_gate", False)))
-            else "advisory_only"
-        ),
-        baseline_forecast=neutral_baseline_forecast.copy(),
-        scenario_feature_spec=scenario_feature_spec,
-        feature_spec=scenario_feature_spec,
-        current_price=float(current_ctx.get("price", target_history.get("price", pd.Series([1.0])).iloc[-1])),
-        forecast_horizon_days=int(horizon_days),
-        objective_mode=str(objective_mode),
-        trained_weekly_factor=trained_weekly_factor,
-        weekly_factor_feature_cols=weekly_factor_feature_cols,
-        weekly_baseline_forecast_native=weekly_scn.get("weekly_neutral_baseline_forecast"),
-        weekday_profile=weekday_profile,
-        daily_final_as_is=daily_final_as_is,
-        daily_final_scenario=daily_final_scenario,
-    )
+    bundle = {
+        "target_history": target_history,
+        "future_dates": future_dates,
+        "current_ctx": current_ctx,
+        "neutral_ctx": neutral_ctx,
+        "scenario_feature_spec": {"path": "weekly_supervised"},
+        "trained_weekly_forecast_model": model,
+        "weekly_history": weekly,
+        "confidence": confidence,
+        "acceptance_summary": acceptance_summary,
+        "unit_price_input_type": unit_price_input_type,
+        "economics_mode": economics_mode,
+        "weekly_baseline_forecast_native": wk_baseline.rename(columns={"sales_week": "baseline_pred_weekly"}),
+        "weekday_profile": weekday_profile,
+    }
 
-    return {
+    scenario_inputs_echo_rows = []
+    for key in ["price", "discount", "promotion"] + [k for k in sorted(set(list(current_ctx.keys()) + list(scenario_ctx.keys()))) if str(k).startswith("user_factor_")]:
+        cur = current_ctx.get(key)
+        scn = scenario_ctx.get(key)
+        changed = _ctx_controls_changed({key: cur}, {key: scn})
+        supported = key in scenario_ctx
+        in_range = True
+        if key == "price":
+            in_range = "scenario_out_of_training_range:price" not in ood_flags
+        elif key == "discount":
+            in_range = "scenario_out_of_training_range:discount" not in ood_flags
+        elif key == "promotion":
+            in_range = "scenario_out_of_training_range:promo" not in ood_flags
+        scenario_inputs_echo_rows.append({"control_name": key, "current_value": cur, "scenario_value": scn, "changed_flag": bool(changed), "supported_flag": bool(supported), "in_training_range_flag": bool(in_range)})
+    for w in scenario_ctx.get("_warnings", []):
+        if str(w).startswith("unknown_override_ignored:"):
+            k = str(w).split(":", 1)[1]
+            scenario_inputs_echo_rows.append({"control_name": k, "current_value": None, "scenario_value": None, "changed_flag": False, "supported_flag": False, "in_training_range_flag": False})
+    scenario_inputs_echo = pd.DataFrame(scenario_inputs_echo_rows)
+    stock_cap_applied_as_is = bool(current_ctx.get("use_stock_cap", False))
+    stock_cap_applied_scenario = bool(scenario_ctx.get("use_stock_cap", False))
+    scenario_delta_zero_reason = ""
+    if abs(float(delta_current_vs["demand_delta_abs"].iloc[0])) <= max(1e-6, abs(float(delta_current_vs["as_is_total_demand"].iloc[0])) * 0.0025):
+        if not controls_changed:
+            scenario_delta_zero_reason = "scenario_equals_current_state"
+        elif (scenario_inputs_echo["supported_flag"] == False).all():
+            scenario_delta_zero_reason = "unsupported_overrides"
+        elif not behavior_checks["model_direct_sensitivity_present"]:
+            scenario_delta_zero_reason = "model_insensitive"
+        else:
+            scenario_delta_zero_reason = "manual_fallback_not_triggered"
+
+    excel = _build_excel_buffer({
         "history": target_history,
         "neutral_baseline_forecast": neutral_baseline_forecast,
         "as_is_forecast": as_is_forecast,
-        "baseline_forecast": neutral_baseline_forecast,
         "scenario_forecast": scenario_forecast,
         "neutral_baseline_economics": neutral_baseline_economics,
         "as_is_economics": as_is_economics,
-        "baseline_economics": neutral_baseline_economics,
         "scenario_economics": scenario_economics,
-        "delta_summary_current_vs_scenario": delta_summary_current_vs_scenario,
-        "delta_summary_neutral_vs_current": delta_summary_neutral_vs_current,
-        "delta_summary": delta_summary_current_vs_scenario,
-        "isolated_current_factor_deltas": isolated_current_factor_deltas,
-        "isolated_scenario_factor_deltas": isolated_scenario_factor_deltas,
-        "current_state_contributions": isolated_current_factor_deltas,
-        "scenario_delta_contributions": isolated_scenario_factor_deltas,
-        "factor_contributions": isolated_scenario_factor_deltas,
-        "confidence": confidence,
-        "excel_buffer": excel_buffer,
-        "analysis_engine": "v2_decomposed_baseline_factor_shock",
-        "factor_model_trained": bool(factor_model_trained),
-        "factor_train_scope": factor_train_scope,
-        "factor_train_rows": int(len(factor_train)),
-        "baseline_strategy": best_baseline_strategy,
-        "baseline_granularity": baseline_granularity,
-        "baseline_plan_selection": baseline_plan_selection,
-        "best_daily_strategy": best_daily_strategy,
-        "best_weekly_strategy": best_weekly_strategy,
-        "baseline_selector_reason": baseline_selector_reason,
-        "baseline_strategy_selection": baseline_strategy_selection,
-        "baseline_benchmark_suite": baseline_benchmark_suite,
-        "baseline_quality_gate": baseline_quality_gate,
-        "baseline_runner_up_strategy": str(baseline_selection_result.get("runner_up_strategy", "")),
-        "baseline_runner_up_score": float(baseline_selection_result.get("runner_up_score", np.nan)),
-        "final_baseline_strategy": best_baseline_strategy,
-        "final_baseline_granularity": baseline_granularity,
-        "final_baseline_source": final_baseline_source,
-        "baseline_data_quality": baseline_data_quality,
+        "delta_summary_current_vs_scenario": delta_current_vs,
+        "delta_summary_neutral_vs_current": delta_neutral_vs,
+        "baseline_rolling_metrics": backtest,
+        "baseline_rolling_diag": pd.DataFrame(),
+        "baseline_benchmark_suite": benchmark,
+        "baseline_quality_summary": pd.DataFrame([diagnostics.get("backtest_summary", {})]),
+        "baseline_data_quality": build_baseline_data_quality_summary(target_history),
         "scenario_inputs_echo": scenario_inputs_echo,
-        "scenario_controls_changed": scenario_changed_any,
-        "scenario_delta_zero_reason": scenario_delta_zero_reason,
-        "mode": mode,
-        "scenario_mode": scenario_result.get("scenario_mode", mode),
-        "scenario_effect_source": scenario_result.get("scenario_effect_source", mode),
-        "factor_effect_source": weekly_scn.get("factor_effect_source", scenario_result.get("factor_effect_source", scenario_result.get("scenario_effect_source", mode))),
-        "shock_applied": bool(weekly_scn.get("shock_applied", scenario_result.get("shock_applied", False))),
-        "factor_role": factor_role,
-        "ood_flags": ood_flags,
-        "intervals_available": intervals_available,
-        "weekly_history": aggregate_daily_to_weekly(target_history),
-        "weekly_future": aggregate_daily_to_weekly(as_is_forecast.rename(columns={"actual_sales": "sales"})),
-        "weekly_baseline_oof": aggregate_daily_to_weekly(
-            baseline_oof[["date", "baseline_oof"]].rename(columns={"baseline_oof": "sales"})
+        "diagnostic_summary": pd.DataFrame(
+            [
+                {
+                    "issues": ";".join(diagnostics.get("issues", [])),
+                    "scenario_controls_changed": controls_changed,
+                    "scenario_effect_source": scenario_effect_source,
+                    "overall_confidence": confidence["overall_confidence"],
+                    "stock_cap_applied_as_is": stock_cap_applied_as_is,
+                    "stock_cap_applied_scenario": stock_cap_applied_scenario,
+                    "shock_multiplier": shock_multiplier,
+                    "scenario_delta_zero_reason": scenario_delta_zero_reason,
+                    "scenario_fallback_contract": "emergency_only_if_controls_changed_and_model_insensitive",
+                    **behavior_checks,
+                }
+            ]
         ),
-        "weekly_baseline_forecast": weekly_scn["weekly_neutral_baseline_forecast"].rename(columns={"baseline_pred_weekly": "sales"}),
-        "weekly_factor_oof": aggregate_daily_to_weekly(
-            factor_train_target[["date", "factor_target"]].rename(columns={"factor_target": "sales"})
-        ) if not factor_train_target.empty else pd.DataFrame(columns=["week_start", "sales"]),
-        "weekly_factor_target": weekly_factor_target.copy(),
-        "weekly_factor_effect_as_is": weekly_scn["weekly_factor_effect_as_is"].rename(columns={"factor_effect_as_is": "sales"}),
-        "weekly_factor_effect_scenario": weekly_scn["weekly_factor_effect_scenario"].rename(columns={"factor_effect_scenario": "sales"}),
-        "weekly_final_forecast_as_is": weekly_scn["weekly_as_is_forecast"][["week_start", "final_as_is"]].rename(columns={"final_as_is": "sales"}),
-        "weekly_final_forecast_scenario": weekly_scn["weekly_scenario_forecast"][["week_start", "final_scenario"]].rename(columns={"final_scenario": "sales"}),
-        "daily_presented_as_is": daily_presented_as_is.copy(),
-        "daily_presented_scenario": daily_presented_scenario.copy(),
-        "daily_final_as_is": daily_final_as_is.copy(),
-        "daily_final_scenario": daily_final_scenario.copy(),
-        "target_series_id": str(target_series_id),
-        "unit_price_input_type": str(unit_price_input_type),
-        "economics_mode": str(economics_mode),
+        "confidence": pd.DataFrame([confidence]),
+        "confidence_flat": pd.DataFrame([{"overall_confidence": confidence["overall_confidence"]}]),
+    })
+
+    return {
+        "analysis_engine": "v2_weekly_supervised_exogenous",
+        "target_series_id": target_series_id,
+        "target_history": target_history,
+        "weekly_history": weekly,
+        "neutral_baseline_forecast": neutral_baseline_forecast,
+        "as_is_forecast": as_is_forecast,
+        "scenario_forecast": scenario_forecast,
+        "baseline_forecast": neutral_baseline_forecast,
+        "weekly_baseline_forecast": wk_baseline.rename(columns={"sales_week": "sales"}),
+        "weekly_final_forecast_as_is": wk_as_is.rename(columns={"sales_week": "sales"}),
+        "weekly_final_forecast_scenario": wk_scn.rename(columns={"sales_week": "sales"}),
+        "daily_presented_as_is": as_is_forecast,
+        "daily_presented_scenario": scenario_forecast,
+        "scenario_effect_source": scenario_effect_source,
+        "model_diagnostics": diagnostics,
+        "benchmark_summary": benchmark,
+        "acceptance_summary": acceptance_summary,
+        "scenario_inputs_echo": scenario_inputs_echo,
+        "diagnostic_summary": pd.DataFrame(
+            [
+                {
+                    "scenario_controls_changed": controls_changed,
+                    "scenario_effect_source": scenario_effect_source,
+                    "manual_scenario_fallback_applied": manual_scenario_fallback_applied,
+                    "scenario_effect_only_from_fallback": behavior_checks["scenario_effect_only_from_fallback"],
+                    "overall_confidence": confidence["overall_confidence"],
+                    "confidence_issues": ";".join(diagnostics.get("issues", [])),
+                    "stock_cap_applied_as_is": stock_cap_applied_as_is,
+                    "stock_cap_applied_scenario": stock_cap_applied_scenario,
+                    "shock_multiplier": shock_multiplier,
+                    "model_direct_sensitivity_present": behavior_checks["model_direct_sensitivity_present"],
+                    "scenario_delta_zero_reason": scenario_delta_zero_reason,
+                    **behavior_checks,
+                }
+            ]
+        ),
+        "neutral_baseline_economics": neutral_baseline_economics,
+        "as_is_economics": as_is_economics,
+        "scenario_economics": scenario_economics,
+        "delta_summary_current_vs_scenario": delta_current_vs,
+        "delta_summary_neutral_vs_current": delta_neutral_vs,
+        "confidence": confidence,
+        "ood_flags": ood_flags,
+        "baseline_benchmark_suite": benchmark,
+        "baseline_quality_gate": {"baseline_meets_quality_gate": True},
+        "baseline_plan_selection": {"final_selected_strategy": "weekly_supervised", "final_selected_granularity": "weekly"},
+        "final_baseline_strategy": "weekly_supervised",
+        "final_baseline_granularity": "weekly",
+        "final_baseline_source": "weekly_supervised",
+        "factor_model_trained": False,
+        "factor_role": "removed",
+        "scenario_controls_changed": controls_changed,
+        "scenario_delta_zero_reason": "no_overrides" if (not controls_changed and scenario_delta_zero_reason == "") else scenario_delta_zero_reason,
+        "scenario_fallback_contract": "emergency_only_if_controls_changed_and_model_insensitive",
+        "current_state_contributions": pd.DataFrame(),
+        "scenario_delta_contributions": pd.DataFrame(),
+        "excel_buffer": excel,
         "_trained_bundle": bundle,
+        "economics_mode": economics_mode,
+        "unit_price_input_type": unit_price_input_type,
     }
