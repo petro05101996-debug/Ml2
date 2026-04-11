@@ -1,5 +1,0 @@
-services:
-  - type: web
-    name: ai-dynamic-pricing
-    runtime: docker
-    plan: free
