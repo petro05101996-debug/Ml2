@@ -185,6 +185,25 @@ def apply_total_stock_cap(raw_series: pd.Series, total_stock: float) -> pd.DataF
     return pd.DataFrame({"actual_sales": actual_list, "lost_sales": lost_list, "remaining_stock": rem_list})
 
 
+def apply_total_stock_cap_weekly(raw_weekly: pd.Series, total_stock: float) -> pd.DataFrame:
+    remaining = max(0.0, float(total_stock))
+    actual_list, lost_list, rem_list = [], [], []
+    for raw in pd.to_numeric(raw_weekly, errors="coerce").fillna(0.0).clip(lower=0.0):
+        actual = min(float(raw), remaining)
+        lost = max(0.0, float(raw) - actual)
+        remaining = max(0.0, remaining - actual)
+        actual_list.append(actual)
+        lost_list.append(lost)
+        rem_list.append(remaining)
+    return pd.DataFrame(
+        {
+            "actual_sales_weekly": actual_list,
+            "lost_sales_weekly": lost_list,
+            "remaining_stock_weekly": rem_list,
+        }
+    )
+
+
 def _fallback_multiplier(base_history: pd.DataFrame, ctx: Dict[str, Any], n_rows: int) -> np.ndarray:
     hist = base_history.copy()
     hist["price"] = pd.to_numeric(hist.get("price", np.nan), errors="coerce")
@@ -254,6 +273,71 @@ def _contexts_equal_on_controls(a: Dict[str, Any], b: Dict[str, Any], controls: 
             if abs(float(pd.to_numeric(pd.Series([va]), errors="coerce").fillna(0.0).iloc[0]) - float(pd.to_numeric(pd.Series([vb]), errors="coerce").fillna(0.0).iloc[0])) > 1e-9:
                 return False
     return True
+
+
+def build_weekly_future_factor_frame(
+    weekly_baseline_forecast: pd.DataFrame,
+    current_ctx: Dict[str, Any],
+    scenario_ctx: Dict[str, Any],
+    future_week_starts: pd.Series | None = None,
+    shocks: List[Dict[str, Any]] | None = None,
+    use_scenario: bool = True,
+    weekly_overrides: Dict[pd.Timestamp, Dict[str, Any]] | None = None,
+) -> pd.DataFrame:
+    wk = weekly_baseline_forecast.copy()
+    if future_week_starts is not None:
+        wk = pd.DataFrame({"week_start": pd.to_datetime(future_week_starts, errors="coerce")})
+    wk["week_start"] = pd.to_datetime(wk["week_start"], errors="coerce")
+    wk = wk.dropna(subset=["week_start"]).sort_values("week_start").reset_index(drop=True)
+    ctx = scenario_ctx if use_scenario else current_ctx
+    rows: List[Dict[str, Any]] = []
+    user_num = sorted([k for k in ctx.keys() if str(k).startswith("user_factor_num__")])
+    user_cat = sorted([k for k in ctx.keys() if str(k).startswith("user_factor_cat__")])
+    recent_price_ref = float(pd.to_numeric(pd.Series([current_ctx.get("price", 1.0)]), errors="coerce").fillna(1.0).iloc[0])
+    prev_price = recent_price_ref
+    for ws in wk["week_start"]:
+        row_ctx = dict(ctx)
+        ov = (weekly_overrides or {}).get(pd.Timestamp(ws), {})
+        row_ctx.update(ov)
+        price = float(pd.to_numeric(pd.Series([row_ctx.get("price", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        discount = float(pd.to_numeric(pd.Series([row_ctx.get("discount", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        promo = float(pd.to_numeric(pd.Series([row_ctx.get("promotion", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        freight = float(pd.to_numeric(pd.Series([row_ctx.get("freight_value", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        cost = float(pd.to_numeric(pd.Series([row_ctx.get("cost", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        row: Dict[str, Any] = {
+            "week_start": pd.Timestamp(ws),
+            "avg_price_week": price,
+            "avg_discount_week": discount,
+            "promo_share_week": 1.0 if promo > 0 else 0.0,
+            "avg_freight_week": freight,
+            "avg_cost_week": cost,
+            "week_of_year": int(pd.Timestamp(ws).isocalendar().week),
+            "month": int(pd.Timestamp(ws).month),
+            "quarter": int(pd.Timestamp(ws).quarter),
+            "promo_flag": 1.0 if promo > 0 else 0.0,
+            "discount_x_promo": discount * (1.0 if promo > 0 else 0.0),
+            "price_vs_recent_mean": 0.0 if abs(recent_price_ref) < 1e-9 else (price / recent_price_ref - 1.0),
+            "price_change_vs_prev_week": 0.0 if abs(prev_price) < 1e-9 else (price / prev_price - 1.0),
+        }
+        prev_price = price
+        for c in user_num:
+            row[c] = float(pd.to_numeric(pd.Series([row_ctx.get(c, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        for c in user_cat:
+            row[c] = str(row_ctx.get(c, "unknown"))
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    shock_weekly = pd.Series(1.0, index=out.index, dtype=float)
+    if shocks and not out.empty:
+        for sh in shocks:
+            ws = pd.Timestamp(sh.get("start_date"))
+            we = pd.Timestamp(sh.get("end_date"))
+            intensity = float(pd.to_numeric(pd.Series([sh.get("intensity", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+            direction = str(sh.get("direction", "positive")).lower()
+            mult = 1.0 + abs(intensity) if direction == "positive" else max(0.0, 1.0 - abs(intensity))
+            mask = (out["week_start"] >= ws) & (out["week_start"] <= we)
+            shock_weekly.loc[mask] = shock_weekly.loc[mask] * mult
+    out["shock_effect"] = shock_weekly.clip(lower=0.5, upper=1.5).values if len(out) else []
+    return out
 
 
 def run_scenario_forecast(
@@ -414,49 +498,79 @@ def run_weekly_scenario_forecast(
     if "baseline_pred_weekly" not in wk.columns and "baseline_pred" in wk.columns:
         wk["baseline_pred_weekly"] = pd.to_numeric(wk["baseline_pred"], errors="coerce").fillna(0.0)
 
-    def _weekly_ctx_features(ctx: Dict[str, Any]) -> pd.DataFrame:
-        out = wk[["week_start"]].copy()
-        out["avg_price_week"] = float(pd.to_numeric(pd.Series([ctx.get("price", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-        out["avg_discount_week"] = float(pd.to_numeric(pd.Series([ctx.get("discount", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-        out["promo_share_week"] = 1.0 if float(pd.to_numeric(pd.Series([ctx.get("promotion", 0.0)]), errors="coerce").fillna(0.0).iloc[0]) > 0 else 0.0
-        out["avg_freight_week"] = float(pd.to_numeric(pd.Series([ctx.get("freight_value", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-        out["avg_cost_week"] = float(pd.to_numeric(pd.Series([ctx.get("cost", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-        return out
-
-    cur_feat = _weekly_ctx_features(current_ctx)
-    scn_feat = _weekly_ctx_features(scenario_ctx)
+    cur_feat = build_weekly_future_factor_frame(wk, current_ctx, scenario_ctx, use_scenario=False, shocks=shocks)
+    scn_feat = build_weekly_future_factor_frame(wk, current_ctx, scenario_ctx, use_scenario=True, shocks=shocks)
     cur_mult = predict_weekly_factor_effect(cur_feat, trained_weekly_factor)
     scn_mult = predict_weekly_factor_effect(scn_feat, trained_weekly_factor)
-    cur_mult = _bounded_effect(cur_mult, confidence_level, ood_count=0)
-    scn_mult = _bounded_effect(scn_mult, confidence_level, ood_count=0)
-
-    shock_weekly = pd.Series(1.0, index=wk.index, dtype=float)
-    if shocks:
-        for sh in shocks:
-            ws = pd.Timestamp(sh.get("start_date"))
-            we = pd.Timestamp(sh.get("end_date"))
-            intensity = float(pd.to_numeric(pd.Series([sh.get("intensity", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-            direction = str(sh.get("direction", "positive")).lower()
-            mult = 1.0 + abs(intensity) if direction == "positive" else max(0.0, 1.0 - abs(intensity))
-            mask = (wk["week_start"] >= ws) & (wk["week_start"] <= we)
-            shock_weekly.loc[mask] = shock_weekly.loc[mask] * mult
-    shock_weekly = shock_weekly.clip(lower=0.5, upper=1.5)
+    ood_flags: List[str] = []
+    warnings: List[str] = []
+    for c in ["avg_price_week", "avg_discount_week", "avg_freight_week", "avg_cost_week"]:
+        h = pd.to_numeric(cur_feat.get(c, np.nan), errors="coerce").dropna()
+        s = pd.to_numeric(scn_feat.get(c, np.nan), errors="coerce").dropna()
+        if h.empty or s.empty:
+            continue
+        lo, hi = float(h.quantile(0.01)), float(h.quantile(0.99))
+        if ((s < lo) | (s > hi)).any():
+            ood_flags.append(f"ood_numeric:{c}")
+    for c in [k for k in current_ctx.keys() if str(k).startswith("user_factor_cat__")]:
+        if str(scenario_ctx.get(c, "")) and str(scenario_ctx.get(c, "")) != str(current_ctx.get(c, "")):
+            ood_flags.append(f"ood_category:{c}")
+    for c in [k for k in current_ctx.keys() if str(k).startswith("user_factor_num__")]:
+        base_v = float(pd.to_numeric(pd.Series([current_ctx.get(c, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        scn_v = float(pd.to_numeric(pd.Series([scenario_ctx.get(c, 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        if abs(scn_v - base_v) > max(1.0, abs(base_v) * 0.5):
+            ood_flags.append(f"ood_numeric:{c}")
+    cur_mult = _bounded_effect(cur_mult, confidence_level, ood_count=len(ood_flags))
+    scn_mult = _bounded_effect(scn_mult, confidence_level, ood_count=len(ood_flags))
 
     out = wk.copy()
     out["baseline_component"] = pd.to_numeric(out["baseline_pred_weekly"], errors="coerce").fillna(0.0).clip(lower=0.0)
     out["factor_effect_as_is"] = cur_mult.values
     out["factor_effect_scenario"] = scn_mult.values
-    out["shock_effect"] = shock_weekly.values
+    out["shock_effect"] = pd.to_numeric(scn_feat.get("shock_effect", 1.0), errors="coerce").fillna(1.0).values
     out["final_as_is"] = (out["baseline_component"] * out["factor_effect_as_is"] * out["shock_effect"]).clip(lower=0.0)
     out["final_scenario"] = (out["baseline_component"] * out["factor_effect_scenario"] * out["shock_effect"]).clip(lower=0.0)
+    current_use_cap = bool(current_ctx.get("use_stock_cap", False))
+    current_total_stock = float(pd.to_numeric(pd.Series([current_ctx.get("stock_total_horizon", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
+    scenario_use_cap = bool(scenario_ctx.get("use_stock_cap", False))
+    scenario_total_stock = float(pd.to_numeric(pd.Series([scenario_ctx.get("stock_total_horizon", np.nan)]), errors="coerce").fillna(np.nan).iloc[0])
+
+    if current_use_cap and np.isfinite(current_total_stock) and current_total_stock >= 0:
+        cap_as_is = apply_total_stock_cap_weekly(out["final_as_is"], current_total_stock)
+    else:
+        cap_as_is = pd.DataFrame(
+            {
+                "actual_sales_weekly": out["final_as_is"].values,
+                "lost_sales_weekly": np.zeros(len(out)),
+                "remaining_stock_weekly": [np.nan] * len(out),
+            }
+        )
+    if scenario_use_cap and np.isfinite(scenario_total_stock) and scenario_total_stock >= 0:
+        cap_scn = apply_total_stock_cap_weekly(out["final_scenario"], scenario_total_stock)
+    else:
+        cap_scn = pd.DataFrame(
+            {
+                "actual_sales_weekly": out["final_scenario"].values,
+                "lost_sales_weekly": np.zeros(len(out)),
+                "remaining_stock_weekly": [np.nan] * len(out),
+            }
+        )
+    out["actual_as_is"] = cap_as_is["actual_sales_weekly"].values
+    out["lost_as_is"] = cap_as_is["lost_sales_weekly"].values
+    out["remaining_stock_as_is"] = cap_as_is["remaining_stock_weekly"].values
+    out["actual_scenario"] = cap_scn["actual_sales_weekly"].values
+    out["lost_scenario"] = cap_scn["lost_sales_weekly"].values
+    out["remaining_stock_scenario"] = cap_scn["remaining_stock_weekly"].values
+    if ood_flags:
+        warnings.append("scenario_outside_weekly_training_range")
     return {
         "weekly_neutral_baseline_forecast": out[["week_start", "baseline_component"]].rename(columns={"baseline_component": "baseline_pred_weekly"}),
-        "weekly_as_is_forecast": out[["week_start", "baseline_component", "factor_effect_as_is", "shock_effect", "final_as_is"]],
-        "weekly_scenario_forecast": out[["week_start", "baseline_component", "factor_effect_scenario", "shock_effect", "final_scenario"]],
+        "weekly_as_is_forecast": out[["week_start", "baseline_component", "factor_effect_as_is", "shock_effect", "final_as_is", "actual_as_is", "lost_as_is", "remaining_stock_as_is"]],
+        "weekly_scenario_forecast": out[["week_start", "baseline_component", "factor_effect_scenario", "shock_effect", "final_scenario", "actual_scenario", "lost_scenario", "remaining_stock_scenario"]],
         "weekly_factor_effect_as_is": out[["week_start", "factor_effect_as_is"]],
         "weekly_factor_effect_scenario": out[["week_start", "factor_effect_scenario"]],
         "factor_effect_source": "ml_uplift" if trained_weekly_factor is not None else "bounded_rules",
         "shock_applied": bool(shocks),
-        "ood_flags": [],
-        "warnings": [],
+        "ood_flags": sorted(set(ood_flags)),
+        "warnings": warnings,
     }

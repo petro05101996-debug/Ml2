@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 
 from pricing_core.model_utils import HAS_XGBOOST, XGBRegressor, clean_feature_frame
 
@@ -304,9 +305,41 @@ def train_weekly_factor_model(weekly_train_df: pd.DataFrame, feature_cols: List[
         return None
     if float(pd.to_numeric(y.loc[m], errors="coerce").std()) < 0.03:
         return None
+    x["promo_flag"] = (pd.to_numeric(x.get("promo_share_week", 0.0), errors="coerce").fillna(0.0) > 0).astype(float)
+    x["discount_x_promo"] = pd.to_numeric(x.get("avg_discount_week", 0.0), errors="coerce").fillna(0.0) * x["promo_flag"]
+    x["price_vs_recent_mean"] = (
+        pd.to_numeric(x.get("avg_price_week", 0.0), errors="coerce").fillna(0.0)
+        / max(float(pd.to_numeric(x.get("avg_price_week", 0.0), errors="coerce").fillna(0.0).tail(8).mean()), 1e-6)
+        - 1.0
+    )
+    x["price_change_vs_prev_week"] = pd.to_numeric(x.get("avg_price_week", 0.0), errors="coerce").fillna(0.0).pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    x["week_of_year"] = pd.to_datetime(x.get("week_start"), errors="coerce").dt.isocalendar().week.astype(float)
+    x["month"] = pd.to_datetime(x.get("week_start"), errors="coerce").dt.month.astype(float)
+    x["quarter"] = pd.to_datetime(x.get("week_start"), errors="coerce").dt.quarter.astype(float)
+
+    user_num = [c for c in x.columns if str(c).startswith("user_factor_num__")]
+    user_cat = [c for c in x.columns if str(c).startswith("user_factor_cat__")]
+    all_feature_cols = list(dict.fromkeys(list(feature_cols) + ["price_vs_recent_mean", "price_change_vs_prev_week", "discount_x_promo", "promo_flag", "week_of_year", "month", "quarter"] + user_num + user_cat))
+    z = x.loc[m, all_feature_cols].copy()
+    for c in all_feature_cols:
+        if c in user_cat:
+            z[c] = z[c].astype(str).fillna("unknown")
+        else:
+            z[c] = pd.to_numeric(z[c], errors="coerce").fillna(0.0)
+    z = pd.get_dummies(z, columns=[c for c in user_cat if c in z.columns], dummy_na=True)
+    scaler = StandardScaler()
+    z_scaled = scaler.fit_transform(z.values)
     model = Ridge(alpha=1.0, random_state=42)
-    model.fit(x.loc[m, feature_cols], np.log(y.loc[m]))
-    return {"model": model, "feature_cols": feature_cols, "model_backend": "ridge_weekly", "target": "factor_target_week"}
+    model.fit(z_scaled, np.log(y.loc[m]))
+    return {
+        "model": model,
+        "scaler": scaler,
+        "feature_cols": all_feature_cols,
+        "encoded_feature_cols": list(z.columns),
+        "categorical_feature_cols": user_cat,
+        "model_backend": "ridge_weekly",
+        "target": "factor_target_week",
+    }
 
 
 def predict_weekly_factor_effect(weekly_df: pd.DataFrame, trained_weekly_factor: Dict[str, Any] | None, clip_low: float = 0.7, clip_high: float = 1.3) -> pd.Series:
@@ -314,12 +347,81 @@ def predict_weekly_factor_effect(weekly_df: pd.DataFrame, trained_weekly_factor:
         return pd.Series(1.0, index=weekly_df.index, dtype=float)
     feature_cols = list(trained_weekly_factor.get("feature_cols", []))
     x = weekly_df.copy()
+    x["promo_flag"] = (pd.to_numeric(x.get("promo_share_week", 0.0), errors="coerce").fillna(0.0) > 0).astype(float)
+    x["discount_x_promo"] = pd.to_numeric(x.get("avg_discount_week", 0.0), errors="coerce").fillna(0.0) * x["promo_flag"]
+    x["price_vs_recent_mean"] = (
+        pd.to_numeric(x.get("avg_price_week", 0.0), errors="coerce").fillna(0.0)
+        / max(float(pd.to_numeric(x.get("avg_price_week", 0.0), errors="coerce").fillna(0.0).tail(8).mean()), 1e-6)
+        - 1.0
+    )
+    x["price_change_vs_prev_week"] = pd.to_numeric(x.get("avg_price_week", 0.0), errors="coerce").fillna(0.0).pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    x["week_of_year"] = pd.to_datetime(x.get("week_start"), errors="coerce").dt.isocalendar().week.astype(float)
+    x["month"] = pd.to_datetime(x.get("week_start"), errors="coerce").dt.month.astype(float)
+    x["quarter"] = pd.to_datetime(x.get("week_start"), errors="coerce").dt.quarter.astype(float)
+    user_cat = list(trained_weekly_factor.get("categorical_feature_cols", []))
     for c in feature_cols:
         if c not in x.columns:
             x[c] = 0.0
-        x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
-    pred_log = trained_weekly_factor["model"].predict(x[feature_cols])
+        if c in user_cat:
+            x[c] = x[c].astype(str).fillna("unknown")
+        else:
+            x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
+    xp = pd.get_dummies(x[feature_cols], columns=[c for c in user_cat if c in x.columns], dummy_na=True)
+    for c in trained_weekly_factor.get("encoded_feature_cols", []):
+        if c not in xp.columns:
+            xp[c] = 0.0
+    xp = xp[trained_weekly_factor.get("encoded_feature_cols", list(xp.columns))]
+    scaler = trained_weekly_factor.get("scaler")
+    xp_scaled = scaler.transform(xp.values) if scaler is not None else xp.values
+    pred_log = trained_weekly_factor["model"].predict(xp_scaled)
     return pd.Series(np.exp(pred_log), index=weekly_df.index).clip(lower=clip_low, upper=clip_high)
+
+
+def run_weekly_factor_backtest(
+    weekly_train_df: pd.DataFrame,
+    feature_cols: List[str],
+    n_windows: int = 3,
+    test_weeks: int = 4,
+) -> Dict[str, Any]:
+    df = weekly_train_df.copy().sort_values("week_start")
+    if df.empty or len(df) < 16:
+        return {"trained": False, "n_valid_windows": 0}
+    rows: List[Dict[str, Any]] = []
+    for i in range(1, n_windows + 1):
+        split = len(df) - i * test_weeks
+        if split < 12:
+            continue
+        tr = df.iloc[:split].copy()
+        te = df.iloc[split : split + test_weeks].copy()
+        m = train_weekly_factor_model(tr, feature_cols)
+        if m is None or te.empty:
+            continue
+        pred = predict_weekly_factor_effect(te, m)
+        y = pd.to_numeric(te.get("factor_target_week", np.nan), errors="coerce").clip(lower=0.4, upper=1.8)
+        valid = y.notna()
+        if int(valid.sum()) == 0:
+            continue
+        yp = pd.to_numeric(pred[valid], errors="coerce").fillna(1.0)
+        yt = pd.to_numeric(y[valid], errors="coerce").fillna(1.0)
+        rows.append(
+            {
+                "mae_uplift": float(np.mean(np.abs(yt - yp))),
+                "sign_consistency": float(np.mean(((yt - 1.0) * (yp - 1.0)) >= 0)),
+                "stability": float(np.std(yp)),
+                "clipping_rate": float(np.mean((yp <= 0.7001) | (yp >= 1.2999))),
+            }
+        )
+    if not rows:
+        return {"trained": False, "n_valid_windows": 0}
+    m = pd.DataFrame(rows)
+    return {
+        "trained": True,
+        "n_valid_windows": int(len(m)),
+        "weekly_factor_mae_uplift": float(m["mae_uplift"].mean()),
+        "weekly_factor_sign_consistency": float(m["sign_consistency"].mean()),
+        "weekly_factor_stability": float(m["stability"].mean()),
+        "weekly_factor_clipping_rate": float(m["clipping_rate"].mean()),
+    }
 
 
 def compute_factor_contributions(target_history: pd.DataFrame, future_dates_df: pd.DataFrame, base_ctx: Dict[str, Any], scenario_ctx: Dict[str, Any], trained_factor: Dict[str, Any], feature_spec: Dict[str, Any]) -> pd.DataFrame:

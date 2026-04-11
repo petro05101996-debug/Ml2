@@ -109,13 +109,33 @@ def compute_scenario_confidence(
     ood_count = len(ood_flags or [])
     baseline_ok = bool(baseline_quality_gate.get("baseline_meets_quality_gate", False))
     sign_stability = float(factor_backtest.get("price_sign_stability", 0.0) or 0.0)
+    weekly_bt = factor_backtest.get("weekly_factor_backtest", {}) if isinstance(factor_backtest, dict) else {}
+    weekly_trained = bool((weekly_bt or {}).get("trained", False))
+    weekly_sign = float((weekly_bt or {}).get("weekly_factor_sign_consistency", 0.0) or 0.0)
+    weekly_mae = float((weekly_bt or {}).get("weekly_factor_mae_uplift", np.nan))
+    weekly_clip = float((weekly_bt or {}).get("weekly_factor_clipping_rate", np.nan))
     trained = bool(factor_backtest.get("trained", False))
     src = str(factor_effect_source or "bounded_rules")
     reasons: List[str] = []
     level = "medium"
     if (not baseline_ok) or ood_count > 0:
         level = "low"
-    elif trained and sign_stability >= 0.7 and src.startswith("ml_uplift"):
+    elif (trained or weekly_trained) and src.startswith("ml_uplift"):
+        if weekly_trained:
+            if weekly_sign >= 0.65 and (not np.isfinite(weekly_mae) or weekly_mae <= 0.18) and (not np.isfinite(weekly_clip) or weekly_clip <= 0.35):
+                level = "high"
+            else:
+                level = "medium"
+        elif sign_stability >= 0.7:
+            level = "high"
+    if weekly_trained and np.isfinite(weekly_clip) and weekly_clip > 0.45 and level == "high":
+        level = "medium"
+        reasons.append("weekly_factor_high_clipping")
+    if weekly_trained and np.isfinite(weekly_mae) and weekly_mae > 0.25:
+        reasons.append("weekly_factor_mae_high")
+    if weekly_trained and weekly_sign < 0.55:
+        reasons.append("weekly_factor_sign_weak")
+    if not weekly_trained and trained and sign_stability >= 0.7 and src.startswith("ml_uplift"):
         level = "high"
     if not baseline_ok:
         reasons.append("baseline_quality_gate_failed")
