@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import json
 import logging
@@ -124,27 +125,45 @@ def robust_clean_dirty_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def detect_small_mode(daily_df: pd.DataFrame) -> bool:
-    if len(daily_df) == 0:
-        return True
-    n_days = int(len(daily_df))
-    non_zero_days = int((pd.to_numeric(daily_df.get("sales", 0.0), errors="coerce").fillna(0.0) > 0).sum())
-    net_price = pd.to_numeric(daily_df.get("net_unit_price", daily_df.get("price", 0.0)), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    unique_prices = int(net_price.nunique()) if len(net_price) else 0
-    price_changes = int((net_price.diff().abs() > 1e-9).sum()) if len(net_price) else 0
-    if len(net_price):
-        pmin = float(net_price.min())
-        pmax = float(net_price.max())
-        rel_span = (pmax - pmin) / max(pmin, 1e-9)
+def detect_small_mode_info(df: pd.DataFrame) -> Dict[str, Any]:
+    sales = pd.to_numeric(df.get("sales"), errors="coerce").fillna(0.0)
+    price = pd.to_numeric(df.get("price"), errors="coerce")
+
+    n_days = int(len(df))
+    positive_days = int((sales > 0).sum())
+    unique_prices = int(price.dropna().nunique())
+
+    price_ffill = price.ffill()
+    price_changes = int(price_ffill.diff().abs().gt(1e-9).sum()) if len(price_ffill) else 0
+
+    price_non_null = price.dropna()
+    if len(price_non_null):
+        median_price = float(price_non_null.median())
+        price_span = float((price_non_null.max() - price_non_null.min()) / max(median_price, 1e-9))
     else:
-        rel_span = 0.0
-    return bool(
-        n_days < 120
-        or non_zero_days < 60
-        or unique_prices < CONFIG["MIN_UNIQUE_PRICES"]
-        or price_changes < CONFIG["MIN_PRICE_CHANGES"]
-        or rel_span < CONFIG["MIN_REL_PRICE_SPAN"]
-    )
+        price_span = 0.0
+
+    reasons = []
+    if n_days < 120:
+        reasons.append(f"short_history:{n_days}_days")
+    if positive_days < 45:
+        reasons.append(f"few_positive_days:{positive_days}")
+    if unique_prices < 6:
+        reasons.append(f"few_unique_prices:{unique_prices}")
+    if price_changes < 5:
+        reasons.append(f"few_price_changes:{price_changes}")
+    if price_span < 0.08:
+        reasons.append(f"narrow_price_span:{price_span:.3f}")
+
+    return {
+        "small_mode": bool(len(reasons) > 0),
+        "reasons": reasons,
+        "n_days": n_days,
+        "positive_days": positive_days,
+        "unique_prices": unique_prices,
+        "price_changes": price_changes,
+        "price_span": price_span,
+    }
 
 
 def safe_median(series: pd.Series, default: float = 0.0) -> float:
@@ -710,7 +729,12 @@ def _safe_split_sizes(n: int) -> Tuple[int, int]:
     return train_end, val_end
 
 
-def make_walk_forward_oof_baseline(train_df: pd.DataFrame, features: List[str], n_splits: int = 4) -> np.ndarray:
+def make_walk_forward_oof_baseline(
+    train_df: pd.DataFrame,
+    features: List[str],
+    n_splits: int = 4,
+    small_mode: bool = True,
+) -> np.ndarray:
     n = len(train_df)
     if n < 20:
         return np.full(n, float(train_df["log_sales"].median()) if "log_sales" in train_df.columns else 0.0, dtype=float)
@@ -731,7 +755,7 @@ def make_walk_forward_oof_baseline(train_df: pd.DataFrame, features: List[str], 
             fold_train["log_sales"].astype(float),
             features,
             kind="baseline",
-            small_mode=True,
+            small_mode=small_mode,
         )
         pred, _ = ensemble_predict(fold_models, fold_valid[features].astype(float))
         oof[train_end:valid_end] = pred
@@ -908,7 +932,6 @@ def simulate_horizon_profit(base_row: Dict[str, Any], price_candidate: float, fu
     }
 
 
-@st.cache_resource
 def run_full_pricing_analysis_universal(
     normalized_txn: pd.DataFrame,
     target_category: str,
@@ -918,6 +941,7 @@ def run_full_pricing_analysis_universal(
     segment: Optional[str] = None,
 ):
     txn = normalized_txn.copy()
+    raw_columns = set(normalized_txn.columns.tolist())
     if len(txn) == 0:
         raise ValueError("Пустой датасет после нормализации.")
     daily_base = build_daily_from_transactions(
@@ -932,6 +956,7 @@ def run_full_pricing_analysis_universal(
     daily_base = build_feature_matrix(daily_base).dropna(subset=["sales", "price", "log_sales", "log_price"]).reset_index(drop=True)
     if len(daily_base) < 5:
         raise ValueError("Слишком мало дневных наблюдений после агрегации.")
+    daily_columns = set(daily_base.columns.tolist())
 
     n = len(daily_base)
     train_end = max(3, int(n * 0.8))
@@ -944,7 +969,8 @@ def run_full_pricing_analysis_universal(
         train_raw["freight_value"] = 0.0
     train_raw["promo_x_weekend"] = train_raw["promotion"].astype(float) * train_raw["is_weekend"].astype(float)
 
-    small_mode = detect_small_mode(daily_base)
+    small_mode_info = detect_small_mode_info(daily_base)
+    small_mode = bool(small_mode_info["small_mode"])
     baseline_features_used = select_eligible_features(train_raw, BASELINE_FEATURES)
     uplift_candidates = UPLIFT_FEATURES.copy()
     if "review_score" in train_raw.columns and train_raw["review_score"].nunique(dropna=True) > 3:
@@ -962,7 +988,7 @@ def run_full_pricing_analysis_universal(
     baseline_models = build_models(X_train_base, y_train, baseline_features_used, kind="baseline", small_mode=small_mode)
     baseline_bundle = {"models": baseline_models, "features": baseline_features_used, "feature_stats": FEATURE_STATS}
 
-    base_log_oof = make_walk_forward_oof_baseline(train_df.copy(), baseline_features_used, n_splits=4)
+    base_log_oof = make_walk_forward_oof_baseline(train_df.copy(), baseline_features_used, n_splits=4, small_mode=small_mode)
     fixed_log_price_coef = estimate_pooled_elasticity(train_df, small_mode=small_mode)
     shrunk_random_effects, _ = compute_monthly_group_elasticities(train_df, fixed_log_price_coef, small_mode=small_mode)
     ref_net_price = safe_median(train_df.get("net_unit_price", train_df["price"]), safe_median(train_df["price"], 1.0))
@@ -1001,6 +1027,37 @@ def run_full_pricing_analysis_universal(
         holdout_metrics = {"rmse": float("nan"), "mae": float("nan"), "mape": float("nan"), "smape": float("nan"), "wape": float("nan"), "sigma_log": float("nan")}
         holdout_predictions = pd.DataFrame(columns=["date", "series_id", "actual_sales", "baseline_pred_sales", "price_effect_multiplier", "uplift_multiplier", "final_pred_sales", "abs_error", "signed_error"])
 
+    zero_mask = holdout_predictions["actual_sales"] <= 0
+    pos_mask = holdout_predictions["actual_sales"] > 0
+
+    mean_pred_on_zero_days = (
+        float(holdout_predictions.loc[zero_mask, "final_pred_sales"].mean())
+        if zero_mask.any() else float("nan")
+    )
+
+    false_positive_rate_on_zero_days = (
+        float((holdout_predictions.loc[zero_mask, "final_pred_sales"] > 0.1).mean())
+        if zero_mask.any() else float("nan")
+    )
+
+    wape_positive_days = (
+        float(calculate_wape(
+            holdout_predictions.loc[pos_mask, "actual_sales"],
+            holdout_predictions.loc[pos_mask, "final_pred_sales"],
+        ))
+        if pos_mask.any() else float("nan")
+    )
+
+    warnings = []
+    if small_mode:
+        warnings.append(
+            "Датасет нестабилен для свободного обучения модели. "
+            f"Причины: {', '.join(small_mode_info['reasons'])}"
+        )
+    wape_val = holdout_metrics.get("wape", float("nan"))
+    if pd.notna(wape_val) and float(wape_val) > 40:
+        warnings.append(f"Высокий holdout WAPE: {float(wape_val):.1f}%")
+
     full_raw = daily_base.copy()
     full_raw["promo_x_weekend"] = full_raw.get("promotion", pd.Series(np.zeros(len(full_raw)))).astype(float) * full_raw.get("is_weekend", pd.Series(np.zeros(len(full_raw)))).astype(float)
     full_feats = list(dict.fromkeys(baseline_features_used + uplift_features_used + ["promotion", "freight_value", "net_unit_price", "price", "log_sales"]))
@@ -1009,7 +1066,7 @@ def run_full_pricing_analysis_universal(
     y_full = full_df["log_sales"].astype(float).copy()
     full_baseline_models = build_models(full_df[baseline_features_used].astype(float), y_full, baseline_features_used, kind="baseline", small_mode=small_mode)
     baseline_bundle = {"models": full_baseline_models, "features": baseline_features_used, "feature_stats": FEATURE_STATS}
-    full_base_log_oof = make_walk_forward_oof_baseline(full_df.copy(), baseline_features_used, n_splits=4)
+    full_base_log_oof = make_walk_forward_oof_baseline(full_df.copy(), baseline_features_used, n_splits=4, small_mode=small_mode)
     fixed_log_price_coef = estimate_pooled_elasticity(full_df, small_mode=small_mode)
     shrunk_random_effects, _ = compute_monthly_group_elasticities(full_df, fixed_log_price_coef, small_mode=small_mode)
     ref_net_price = safe_median(full_df.get("net_unit_price", full_df["price"]), safe_median(full_df["price"], 1.0))
@@ -1042,26 +1099,6 @@ def run_full_pricing_analysis_universal(
         as_is_sim["daily"].to_excel(writer, sheet_name="as_is", index=False)
         pd.DataFrame([holdout_metrics]).to_excel(writer, sheet_name="metrics", index=False)
     excel_buffer.seek(0)
-    feature_usage_rows = []
-    report_features = list(dict.fromkeys(BASELINE_FEATURES + UPLIFT_FEATURES + ["price", "discount", "cost", "stock", "freight_value", "promotion"]))
-    for f in report_features:
-        source_found = f in daily_base.columns
-        source_missing = float(daily_base[f].isna().mean()) if source_found else 1.0
-        source_unique = int(daily_base[f].nunique(dropna=True)) if source_found else 0
-        feature_usage_rows.append(
-            {
-                "feature": f,
-                "source_found": bool(source_found),
-                "source_missing_share": source_missing,
-                "source_unique_count": source_unique,
-                "present_in_daily": bool(source_found),
-                "used_in_baseline": bool(f in baseline_features_used),
-                "used_in_uplift": bool(f in uplift_features_used),
-                "used_in_price_effect": bool(f in {"price", "discount", "net_unit_price"}),
-                "used_only_in_economics": bool(f in {"cost", "stock"}),
-            }
-        )
-    feature_usage_report = pd.DataFrame(feature_usage_rows)
     delta_vs_as_is = {
         "demand_total": float((scenario_sim["daily"]["actual_sales"].sum() - as_is_sim["daily"]["actual_sales"].sum())) if scenario_sim else float("nan"),
         "revenue_total": float((scenario_sim["daily"]["revenue"].sum() - as_is_sim["daily"]["revenue"].sum())) if scenario_sim else float("nan"),
@@ -1076,7 +1113,7 @@ def run_full_pricing_analysis_universal(
         scenario_daily_source = scenario_sim["daily"]
     else:
         scenario_daily_source = pd.DataFrame({"date": as_is_sim["daily"]["date"]})
-        for c in ["actual_sales", "revenue", "profit", "price", "discount", "promotion", "freight_value", "stock_cap", "lost_sales"]:
+        for c in ["actual_sales", "revenue", "profit", "price", "discount", "promotion", "freight_value", "lost_sales"]:
             scenario_daily_source[c] = np.nan
     scenario_daily_output = pd.DataFrame({
         "date": pd.to_datetime(as_is_sim["daily"]["date"]).dt.strftime("%Y-%m-%d"),
@@ -1094,26 +1131,61 @@ def run_full_pricing_analysis_universal(
         "scenario_discount": scenario_daily_source["discount"].values,
         "scenario_promotion": scenario_daily_source["promotion"].values,
         "scenario_freight_value": scenario_daily_source["freight_value"].values,
-        "scenario_stock_cap": scenario_daily_source.get("stock_cap", pd.Series([np.nan] * len(scenario_daily_source))).values,
         "lost_sales": scenario_daily_source.get("lost_sales", pd.Series([np.nan] * len(scenario_daily_source))).values,
     })
-    feature_report = feature_usage_report.rename(
-        columns={
-            "feature": "factor_name",
-            "source_found": "found_raw",
-        }
-    ).copy()
-    feature_report["aggregated_daily"] = feature_report["found_raw"]
-    feature_report["used_in_scenario"] = feature_report["factor_name"].isin(["price", "discount", "promotion", "freight_value", "cost", "stock"])
-    feature_report["used_in_model"] = feature_report["used_in_baseline"] | feature_report["used_in_uplift"] | feature_report["used_in_price_effect"]
-    feature_report["role"] = feature_report["factor_name"].map({f.name: f.role for f in CANONICAL_FIELDS}).fillna("unknown")
-    feature_report["dtype"] = feature_report["factor_name"].map({f.name: f.dtype for f in CANONICAL_FIELDS}).fillna("unknown")
-    feature_report["missing_share"] = feature_report["source_missing_share"]
-    feature_report["n_unique"] = feature_report["source_unique_count"]
-    feature_report["variability_flag"] = feature_report["n_unique"] > 1
-    feature_report["reason_excluded"] = np.where(~feature_report["used_in_model"], "not_eligible_or_missing", "")
-    feature_report = feature_report[["factor_name", "found_raw", "aggregated_daily", "used_in_model", "used_in_scenario", "role", "dtype", "missing_share", "n_unique", "variability_flag", "reason_excluded"]]
+    feature_usage_rows = []
+    report_features = list(dict.fromkeys(BASELINE_FEATURES + UPLIFT_FEATURES + ["price", "discount", "cost", "stock", "freight_value", "promotion"]))
+    engineered_features = {
+        "sales_lag1", "sales_lag7", "sales_lag14",
+        "sales_ma7", "sales_ma14", "sales_ma28",
+        "sales_std28",
+        "day_of_week", "month", "is_weekend",
+        "month_sin", "month_cos",
+        "time_index", "time_index_norm",
+        "promo_x_weekend", "baseline_log_feature",
+        "log_sales", "uplift_target_log", "net_unit_price",
+    }
+    for f in report_features:
+        found_in_raw = f in raw_columns
+        present_in_daily = f in daily_columns
+        daily_missing_share = float(daily_base[f].isna().mean()) if present_in_daily else 1.0
+        daily_unique_count = int(daily_base[f].nunique(dropna=True)) if present_in_daily else 0
+        engineered_feature = f in engineered_features
+        used_in_baseline = f in baseline_features_used
+        used_in_uplift = f in uplift_features_used
+        used_in_price_effect = f in {"price", "discount", "net_unit_price"}
+        used_only_in_economics = f in {"cost"}
+        used_in_model = used_in_baseline or used_in_uplift or used_in_price_effect
+        used_in_scenario = f in {"price", "discount", "promotion", "freight_value", "cost"}
 
+        if not present_in_daily:
+            reason_excluded = "absent_after_daily_pipeline"
+        elif present_in_daily and not used_in_model and daily_unique_count <= 1:
+            reason_excluded = "no_variability"
+        elif present_in_daily and not used_in_model:
+            reason_excluded = "not_in_active_model"
+        else:
+            reason_excluded = ""
+
+        feature_usage_rows.append(
+            {
+                "factor_name": f,
+                "found_in_raw": bool(found_in_raw),
+                "present_in_daily": bool(present_in_daily),
+                "engineered_feature": bool(engineered_feature),
+                "daily_missing_share": daily_missing_share,
+                "daily_unique_count": daily_unique_count,
+                "used_in_baseline": bool(used_in_baseline),
+                "used_in_uplift": bool(used_in_uplift),
+                "used_in_price_effect": bool(used_in_price_effect),
+                "used_only_in_economics": bool(used_only_in_economics),
+                "used_in_model": bool(used_in_model),
+                "used_in_scenario": bool(used_in_scenario),
+                "reason_excluded": reason_excluded,
+            }
+        )
+
+    feature_report = pd.DataFrame(feature_usage_rows)
     run_summary = {
         "config": {
             "commit": _safe_git_commit(),
@@ -1130,7 +1202,8 @@ def run_full_pricing_analysis_universal(
         },
         "dataset_passport": _build_dataset_passport(txn),
         "metrics_summary": {"holdout": holdout_metrics},
-        "warnings": [],
+        "warnings": warnings,
+        "small_mode_info": small_mode_info,
         "feature_usage_report": feature_report.to_dict("records"),
         "scenario_inputs": {"as_is": {"price": float(base_ctx.get("price")), "discount": float(base_ctx.get("discount", 0.0))}, "neutral_baseline": neutral_overrides},
         "scenario_output_summary": {
@@ -1150,8 +1223,9 @@ def run_full_pricing_analysis_universal(
             "bias_median": float(holdout_predictions["signed_error"].median()) if len(holdout_predictions) else float("nan"),
             "wape_baseline": float(calculate_wape(holdout_predictions["actual_sales"], holdout_predictions["baseline_pred_sales"])) if len(holdout_predictions) else float("nan"),
             "wape_final": float(calculate_wape(holdout_predictions["actual_sales"], holdout_predictions["final_pred_sales"])) if len(holdout_predictions) else float("nan"),
-            "wape_zero_demand": float(calculate_wape(holdout_predictions.loc[holdout_predictions["actual_sales"] <= 0, "actual_sales"], holdout_predictions.loc[holdout_predictions["actual_sales"] <= 0, "final_pred_sales"])) if len(holdout_predictions) else float("nan"),
-            "wape_positive_demand": float(calculate_wape(holdout_predictions.loc[holdout_predictions["actual_sales"] > 0, "actual_sales"], holdout_predictions.loc[holdout_predictions["actual_sales"] > 0, "final_pred_sales"])) if len(holdout_predictions) else float("nan"),
+            "mean_pred_on_zero_days": mean_pred_on_zero_days,
+            "false_positive_rate_on_zero_days": false_positive_rate_on_zero_days,
+            "wape_positive_days": wape_positive_days,
             "wape_promo_days": float(calculate_wape(test_df[test_df.get("promotion", 0.0) > 0]["sales"], holdout_predictions.loc[test_df.get("promotion", 0.0) > 0, "final_pred_sales"])) if len(test_df) and (test_df.get("promotion", pd.Series([0.0] * len(test_df))) > 0).any() else float("nan"),
             "wape_non_promo_days": float(calculate_wape(test_df[test_df.get("promotion", 0.0) <= 0]["sales"], holdout_predictions.loc[test_df.get("promotion", 0.0) <= 0, "final_pred_sales"])) if len(test_df) else float("nan"),
         },
@@ -1180,14 +1254,15 @@ def run_full_pricing_analysis_universal(
     return {
         "history_daily": daily_base,
         "quality_report": {"holdout_metrics": holdout_metrics},
-        "feature_usage_report": feature_usage_report,
+        "feature_usage_report": feature_report,
         "feature_report": feature_report,
         "neutral_baseline_forecast": baseline_sim["daily"],
         "as_is_forecast": as_is_sim["daily"],
         "scenario_forecast": scenario_forecast,
         "delta_vs_as_is": delta_vs_as_is,
         "delta_vs_baseline": delta_vs_baseline,
-        "warnings": [],
+        "warnings": warnings,
+        "small_mode_info": small_mode_info,
         "profit_curve": profit_curve,
         "holdout_metrics": pd.DataFrame([holdout_metrics]),
         "elasticity_map": shrunk_random_effects,
@@ -1684,7 +1759,7 @@ if ctx and ctx.get("run_requested"):
                     target_category,
                     target_sku,
                 )
-                st.session_state.results = results
+                st.session_state.results = copy.deepcopy(results)
                 st.session_state.selected_category_for_results = target_category
                 st.session_state.selected_sku_for_results = target_sku
                 st.session_state.what_if_result = None
@@ -1713,12 +1788,15 @@ if st.session_state.results is not None:
         scenario_forecast = r.get("forecast_scenario", r.get("forecast_optimal", current_forecast))
         baseline_forecast = current_forecast
     st.markdown('<div class="section-title">KPI и ключевой вывод</div>', unsafe_allow_html=True)
+    if r.get("warnings"):
+        for msg in r["warnings"]:
+            st.warning(msg)
     if scenario_not_run:
         st.info("Сценарий ещё не запускался")
     st.markdown('<div class="micro-note">Цель интерфейса — показать baseline/as-is и эффект what-if сценариев без ложной оптимизационной ветки.</div>', unsafe_allow_html=True)
     k1, k2, k3, k4 = st.columns(4)
     current_price = float(r["current_price"])
-    raw_scenario_price = r.get("scenario_price")
+    raw_scenario_price = r.get("scenario_price_modeled", r.get("scenario_price"))
     best_price = float(raw_scenario_price) if raw_scenario_price is not None and np.isfinite(raw_scenario_price) else float(r.get("current_price", 0.0))
     delta_pct = ((best_price - current_price) / current_price * 100) if current_price else 0.0
 
@@ -1772,7 +1850,7 @@ if st.session_state.results is not None:
         fig_p = px.line(r["profit_curve"], x="price", y="adjusted_profit", template="plotly_dark")
         fig_p.update_traces(line_color="#FF8A00", line_width=3)
         fig_p.add_vline(x=r["current_price"], line_dash="dash", line_color="#ffffff", annotation_text="Текущая")
-        vline_price = r.get("scenario_price")
+        vline_price = r.get("scenario_price_modeled", r.get("scenario_price"))
         if vline_price is None or not np.isfinite(vline_price):
             vline_price = r["current_price"]
         fig_p.add_vline(x=vline_price, line_dash="solid", line_color="#00D4FF", annotation_text="Scenario")
@@ -1795,7 +1873,9 @@ if st.session_state.results is not None:
             if st.session_state.what_if_result is not None:
                 wr = st.session_state.what_if_result
                 r["scenario_forecast"] = wr["daily"]
-                r["scenario_price"] = float(wr.get("requested_price", manual_price))
+                r["scenario_price_requested"] = float(wr.get("requested_price", manual_price))
+                r["scenario_price_modeled"] = float(wr.get("price_for_model", manual_price))
+                r["scenario_price"] = r["scenario_price_modeled"]
                 r["best_profit"] = float(wr.get("profit_total_adjusted", wr.get("profit_total", 0.0)))
                 r["profit_lift_pct"] = ((r["best_profit"] - r["current_profit"]) / max(abs(r["current_profit"]), 1e-9)) * 100.0
 
@@ -1847,7 +1927,7 @@ if st.session_state.results is not None:
             f = st.slider(f"Freight x{i}", 0.5, 1.5, 1.0, 0.05, key=f"sc_freight_{i}")
             c = st.slider(f"Cost x{i}", 0.7, 1.3, 1.0, 0.05, key=f"sc_cost_{i}")
             h = st.slider(f"Horizon x{i}", 7, 90, 30, 1, key=f"sc_hor_{i}")
-            scenario_inputs.append({"name": default_names[i], "price": p, "demand_multiplier": d, "freight_multiplier": f, "cost_multiplier": c, "discount_multiplier": 1.0, "stock_cap": 0.0, "horizon_days": h, "overrides": {"discount_multiplier": 1.0}})
+            scenario_inputs.append({"name": default_names[i], "price": p, "demand_multiplier": d, "freight_multiplier": f, "cost_multiplier": c, "discount_multiplier": 1.0, "horizon_days": h, "overrides": {"discount_multiplier": 1.0}})
     if st.button("Сравнить 4 сценария", use_container_width=True):
         st.session_state.scenario_table = run_scenario_set(r["_trained_bundle"], scenario_inputs, run_what_if_projection)
         st.session_state.sensitivity_df = build_sensitivity_grid(r["_trained_bundle"], base_price=base_price, runner=run_what_if_projection)
@@ -1859,8 +1939,8 @@ if st.session_state.results is not None:
         st.plotly_chart(fig_sc, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
     if st.session_state.get("sensitivity_df") is not None:
         sens = st.session_state.sensitivity_df.copy()
-        fig_heat = px.density_heatmap(sens, x="price", y="discount_multiplier", z="profit", nbinsx=14, nbinsy=14, template="plotly_dark", color_continuous_scale="RdYlGn")
-        fig_heat.update_layout(**_base_plotly_layout("Sensitivity: price x discount (profit heatmap)"))
+        fig_heat = px.density_heatmap(sens, x="price", y="demand_multiplier", z="profit_adjusted", nbinsx=14, nbinsy=14, template="plotly_dark", color_continuous_scale="RdYlGn")
+        fig_heat.update_layout(**_base_plotly_layout("Sensitivity: price × demand multiplier"))
         st.plotly_chart(fig_heat, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1876,10 +1956,15 @@ if st.session_state.results is not None:
         metric_df = r["holdout_metrics"].copy()
         st.dataframe(metric_df, use_container_width=True)
         st.caption("MAPE/WAPE/RMSE показывают среднюю ошибку модели на отложенной выборке.")
-        if "feature_usage_report" in r:
+        if "feature_report" in r:
             st.markdown("**Feature usage diagnostics**")
-            st.dataframe(r["feature_usage_report"], use_container_width=True, height=220)
-            st.caption("Поля `used_in_baseline/used_in_uplift/used_in_price_effect` показывают фактическое использование факторов.")
+            st.dataframe(r["feature_report"], use_container_width=True)
+            st.caption(
+                "found_in_raw — фактор был в нормализованном сыром источнике; "
+                "present_in_daily — дошёл до дневного ряда; "
+                "engineered_feature — создан внутри пайплайна; "
+                "used_in_* — фактическое использование в активной модели."
+            )
     with tabs[2]:
         scenario_table_src = scenario_forecast if scenario_forecast is not None else current_forecast.copy()
         full_table = current_forecast[["date", "actual_sales", "revenue", "profit"]].rename(

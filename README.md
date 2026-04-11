@@ -6,8 +6,9 @@
 - Universal CSV загрузка с auto-mapping и нормализацией.
 - Leak-safe daily pipeline (без backward fill из будущего).
 - Раздельные метрики прибыли: `profit_raw`, `profit_adjusted`, `uncertainty_penalty`.
-- Ручной what-if, мультисценарии, sensitivity heatmap (`price x discount_multiplier`).
-- Экспорт: history, neutral baseline, as-is, metrics, holdout predictions, scenario output, feature report.
+- Ручной what-if, мультисценарии, sensitivity heatmap (`price × demand_multiplier`).
+- **Excel export**: `history`, `neutral_baseline`, `as_is`, `metrics`.
+- **CSV export**: `holdout_predictions`, `scenario_output`, `feature_report`.
 
 ## Запуск
 ```bash
