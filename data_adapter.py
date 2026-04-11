@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from data_schema import canonical_alias_map, canonical_required_fields
+from data_schema import canonical_alias_map, canonical_field_registry, canonical_required_fields
 
 
 def _norm_col(c: str) -> str:
@@ -80,6 +80,7 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
     checks = run_data_quality_checks(out)
     quality["warnings"].extend(checks.get("warnings", []))
     quality["stats"] = checks.get("stats", {})
+    quality["feature_eligibility"] = build_feature_eligibility_report(out)
     return out, quality
 
 
@@ -114,29 +115,61 @@ def run_data_quality_checks(df: pd.DataFrame) -> Dict[str, Any]:
     return issues
 
 
-def build_daily_from_transactions(txn: pd.DataFrame, sku_id: str) -> pd.DataFrame:
+def _wavg(frame: pd.DataFrame, value_col: str, weight_col: str = "quantity") -> float:
+    vals = pd.to_numeric(frame[value_col], errors="coerce")
+    w = pd.to_numeric(frame[weight_col], errors="coerce").fillna(0.0)
+    valid = vals.notna() & w.notna() & (w > 0)
+    if valid.any():
+        return float(np.average(vals[valid], weights=w[valid]))
+    return float(vals.dropna().mean()) if vals.notna().any() else float("nan")
+
+
+def build_daily_from_transactions(
+    txn: pd.DataFrame,
+    sku_id: str,
+    region: Optional[str] = None,
+    channel: Optional[str] = None,
+    segment: Optional[str] = None,
+) -> pd.DataFrame:
     sku = txn[txn["product_id"].astype(str) == str(sku_id)].copy()
+    for col, val in [("region", region), ("channel", channel), ("segment", segment)]:
+        if val is not None and col in sku.columns:
+            sku = sku[sku[col].astype(str) == str(val)].copy()
     if len(sku) == 0:
         raise ValueError("Нет данных по выбранному SKU.")
 
-    agg_map = {
-        "sales": ("quantity", "sum"),
-        "revenue": ("revenue", "sum"),
-        "price": ("price", "mean"),
-        "price_median": ("price", "median"),
-    }
-    optional_aggs = {
-        "freight_value": ("freight_value", "mean"),
-        "discount": ("discount", "mean"),
-        "cost": ("cost", "mean"),
-        "stock": ("stock", "mean"),
-        "review_score": ("rating", "mean"),
-    }
-    for out_col, (in_col, func) in optional_aggs.items():
-        if in_col in sku.columns:
-            agg_map[out_col] = (in_col, func)
-
-    daily = sku.groupby(pd.Grouper(key="date", freq="D")).agg(**agg_map).reset_index().rename(columns={"date": "date"})
+    rows: List[Dict[str, Any]] = []
+    for day, g in sku.groupby(pd.Grouper(key="date", freq="D")):
+        if pd.isna(day):
+            continue
+        rec: Dict[str, Any] = {
+            "date": pd.Timestamp(day),
+            "sales": float(pd.to_numeric(g.get("quantity"), errors="coerce").fillna(0.0).sum()) if "quantity" in g.columns else float(len(g)),
+            "revenue": float(pd.to_numeric(g.get("revenue"), errors="coerce").fillna(0.0).sum()) if "revenue" in g.columns else 0.0,
+            "price": _wavg(g, "price"),
+            "price_median": float(pd.to_numeric(g.get("price"), errors="coerce").median()) if "price" in g.columns else float("nan"),
+        }
+        if "discount" in g.columns:
+            rec["discount"] = _wavg(g, "discount")
+        if "cost" in g.columns:
+            rec["cost"] = _wavg(g, "cost")
+        if "freight_value" in g.columns:
+            rec["freight_value"] = _wavg(g, "freight_value")
+        if "promotion" in g.columns:
+            rec["promotion"] = float(pd.to_numeric(g["promotion"], errors="coerce").fillna(0.0).max())
+        if "rating" in g.columns:
+            rec["review_score"] = float(pd.to_numeric(g["rating"], errors="coerce").dropna().iloc[-1]) if pd.to_numeric(g["rating"], errors="coerce").notna().any() else float("nan")
+        if "reviews_count" in g.columns:
+            rc = pd.to_numeric(g["reviews_count"], errors="coerce").dropna()
+            rec["reviews_count"] = float(rc.iloc[-1]) if len(rc) else float("nan")
+        if "stock" in g.columns:
+            stock_vals = pd.to_numeric(g["stock"], errors="coerce").dropna()
+            rec["stock"] = float(stock_vals.iloc[-1]) if len(stock_vals) else float("nan")
+        for ctx in ["category", "region", "channel", "segment"]:
+            if ctx in g.columns and g[ctx].notna().any():
+                rec[ctx] = str(g[ctx].dropna().iloc[-1])
+        rows.append(rec)
+    daily = pd.DataFrame(rows)
     if len(daily) == 0 or daily["date"].isna().all():
         raise ValueError("После агрегации не осталось валидных дат по SKU.")
     full_dates = pd.DataFrame({"date": pd.date_range(daily["date"].min(), daily["date"].max(), freq="D")})
@@ -144,7 +177,7 @@ def build_daily_from_transactions(txn: pd.DataFrame, sku_id: str) -> pd.DataFram
 
     for c in ["sales", "revenue"]:
         daily[c] = pd.to_numeric(daily[c], errors="coerce").fillna(0.0)
-    for c in ["price", "price_median", "freight_value", "discount", "cost", "stock", "review_score"]:
+    for c in ["price", "price_median", "freight_value", "discount", "cost", "stock", "review_score", "reviews_count", "promotion"]:
         if c not in daily.columns:
             daily[c] = np.nan
         daily[c] = pd.to_numeric(daily[c], errors="coerce").ffill().bfill()
@@ -153,9 +186,54 @@ def build_daily_from_transactions(txn: pd.DataFrame, sku_id: str) -> pd.DataFram
     daily["price_median"] = daily["price_median"].fillna(daily["price"]).clip(lower=0.01)
     daily["freight_value"] = daily["freight_value"].fillna(0.0).clip(lower=0.0)
     daily["review_score"] = daily["review_score"].fillna(4.5)
+    daily["promotion"] = daily["promotion"].fillna(0.0).clip(lower=0.0, upper=1.0)
+    daily["reviews_count"] = daily["reviews_count"].fillna(0.0).clip(lower=0.0)
+    daily["stock"] = daily["stock"].fillna(np.inf)
+    daily["cost"] = daily["cost"].fillna(daily["price"] * 0.65).clip(lower=0.0)
+    daily["discount"] = daily["discount"].fillna(0.0).clip(lower=0.0, upper=0.95)
+    daily["net_unit_price"] = np.where(
+        daily["sales"] > 0,
+        daily["revenue"] / daily["sales"].replace(0, np.nan),
+        daily["price"] * (1.0 - daily["discount"]),
+    )
+    daily["net_unit_price"] = pd.to_numeric(daily["net_unit_price"], errors="coerce").fillna(daily["price"] * (1.0 - daily["discount"])).clip(lower=0.01)
     daily["category"] = sku["category"].mode().iloc[0] if "category" in sku.columns and not sku["category"].dropna().empty else "unknown"
     daily["sku_id"] = str(sku_id)
+    for ctx in ["region", "channel", "segment"]:
+        if ctx in sku.columns:
+            daily[ctx] = str(sku[ctx].mode().iloc[0]) if not sku[ctx].dropna().empty else "unknown"
     return daily
+
+
+def build_feature_eligibility_report(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    registry = canonical_field_registry()
+    report: List[Dict[str, Any]] = []
+    for name, meta in registry.items():
+        found = name in df.columns
+        series = df[name] if found else pd.Series(dtype="float64")
+        missing_share = float(series.isna().mean()) if found and len(df) else 1.0
+        unique_count = int(series.nunique(dropna=True)) if found else 0
+        usable_in_model = bool(found and meta.model_eligible and missing_share <= 0.4 and unique_count >= meta.min_variability)
+        usable_in_scenario = bool(found and meta.scenario_allowed)
+        reason = ""
+        if not found:
+            reason = "not_found"
+        elif not usable_in_model:
+            reason = "excluded_by_policy"
+        report.append(
+            {
+                "factor": name,
+                "dtype": meta.dtype,
+                "role": meta.role,
+                "found": found,
+                "missing_share": missing_share,
+                "unique_count": unique_count,
+                "usable_in_model": usable_in_model,
+                "usable_in_scenario": usable_in_scenario,
+                "reason_if_excluded": reason,
+            }
+        )
+    return report
 
 
 def objective_to_weights(mode: str) -> Dict[str, float]:
