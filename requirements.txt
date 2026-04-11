@@ -1,8 +1,8 @@
-streamlit>=1.37
-pandas>=2.2
-numpy>=1.26
-plotly>=5.22
-scikit-learn>=1.5
-xgboost>=2.0
-statsmodels>=0.14
-openpyxl>=3.1
+streamlit==1.44.1
+pandas==2.2.3
+numpy==1.26.4
+plotly==5.24.1
+scikit-learn==1.5.2
+xgboost==1.7.6
+statsmodels==0.14.4
+openpyxl==3.1.5
