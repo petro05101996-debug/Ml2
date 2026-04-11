@@ -3,7 +3,7 @@ import json
 
 from data_adapter import build_auto_mapping, normalize_transactions, build_daily_from_transactions
 from what_if import build_sensitivity_grid, run_scenario_set
-from app import run_full_pricing_analysis_universal, run_what_if_projection
+from app import robust_clean_dirty_data, run_full_pricing_analysis_universal, run_what_if_projection
 
 
 def test_normalize_and_daily_build():
@@ -144,4 +144,70 @@ def test_run_summary_scenario_totals_are_real():
 def test_holdout_final_has_decomposition():
     res = _analyze()
     holdout = pd.read_csv(pd.io.common.BytesIO(res["holdout_predictions_csv"]))
-    assert {"pred_baseline", "pred_price_effect_component", "pred_uplift_component", "pred_final"}.issubset(set(holdout.columns))
+    assert {"baseline_pred_sales", "price_effect_multiplier", "uplift_multiplier", "final_pred_sales"}.issubset(set(holdout.columns))
+
+
+def test_no_backward_fill_leakage_in_daily_builder():
+    src = pd.DataFrame(
+        [
+            {"date": "2025-01-01", "product_id": "sku-1", "category": "cat-a", "price": 100, "quantity": 1, "revenue": 100, "discount": 0.0, "promotion": 0.0},
+            {"date": "2025-01-03", "product_id": "sku-1", "category": "cat-a", "price": 100, "quantity": 1, "revenue": 100, "discount": 0.2, "promotion": 1.0},
+        ]
+    )
+    src["date"] = pd.to_datetime(src["date"])
+    daily = build_daily_from_transactions(src, "sku-1", target_category="cat-a")
+    mid = daily[daily["date"] == pd.Timestamp("2025-01-02")].iloc[0]
+    assert float(mid["discount"]) == 0.0
+    assert float(mid["promotion"]) == 0.0
+
+
+def test_zero_sales_preserved_after_cleaning():
+    df = pd.DataFrame({"sales": [10.0, 0.0, 0.0, 2.0], "price": [10, 10, 10, 10], "freight_value": [1, 1, 1, 1]})
+    out = robust_clean_dirty_data(df)
+    assert (out["sales"] == 0.0).sum() >= 2
+
+
+def test_no_double_multiplier():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]), freight_multiplier=1.0)
+    high = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]), freight_multiplier=1.5)
+    base_f = float(base["daily"]["freight_value"].iloc[0])
+    high_f = float(high["daily"]["freight_value"].iloc[0])
+    assert abs((high_f / base_f) - 1.5) < 1e-6
+
+
+def test_uplift_uses_baseline_feature():
+    res = _analyze()
+    feats = res["_trained_bundle"]["uplift_bundle"]["features"]
+    assert "baseline_log_feature" in feats
+
+
+def test_refit_scope_is_full_history():
+    res = _analyze()
+    summary = json.loads(res["run_summary_json"].decode("utf-8"))
+    assert summary["config"]["fit_scope"] == "refit_full_history"
+
+
+def test_raw_adjusted_and_ood_fields_present():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    sc = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]) * 2.0)
+    assert "profit_total_raw" in sc and "profit_total_adjusted" in sc
+    assert "requested_price" in sc and "price_for_model" in sc and "ood_flag" in sc
+
+
+def test_adjusted_profit_not_above_raw_profit():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    scenario = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]))
+    assert scenario["profit_total_adjusted"] <= scenario["profit_total_raw"]
+
+
+def test_higher_cost_multiplier_not_improve_adjusted_profit():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    base = run_what_if_projection(bundle, manual_price=base_price, cost_multiplier=1.0)
+    high_cost = run_what_if_projection(bundle, manual_price=base_price, cost_multiplier=1.2)
+    assert high_cost["profit_total_adjusted"] <= base["profit_total_adjusted"]
