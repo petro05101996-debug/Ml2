@@ -1,7 +1,7 @@
 import pandas as pd
 
 from data_adapter import build_auto_mapping, normalize_transactions, build_daily_from_transactions
-from what_if import run_scenario_set
+from what_if import build_sensitivity_grid, run_scenario_set
 
 
 def test_normalize_and_daily_build():
@@ -35,3 +35,14 @@ def test_scenario_runner_baseline_fallback():
     out = run_scenario_set({}, scenarios, runner)
     assert len(out) == 2
     assert "delta_profit" in out.columns
+
+
+def test_sensitivity_uses_discount_axis():
+    def runner(_bundle, **kwargs):
+        p = kwargs["manual_price"]
+        discount_mult = kwargs.get("overrides", {}).get("discount_multiplier", 1.0)
+        return {"profit_total": p * (2 - discount_mult)}
+
+    out = build_sensitivity_grid({}, base_price=100.0, runner=runner, price_steps=3, discount_steps=3)
+    assert "discount_multiplier" in out.columns
+    assert "risk_zone" in out.columns

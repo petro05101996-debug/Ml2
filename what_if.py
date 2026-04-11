@@ -14,15 +14,17 @@ def run_scenario_set(
     records: List[Dict[str, Any]] = []
     baseline = None
     for row in scenario_rows:
+        overrides = row.get("overrides", {})
         result = runner(
             trained_bundle,
             manual_price=float(row["price"]),
             freight_multiplier=float(row["freight_multiplier"]),
-            demand_multiplier=float(row["demand_multiplier"]),
+            demand_multiplier=float(row.get("demand_multiplier", 1.0)),
             horizon_days=int(row["horizon_days"]),
             discount_multiplier=float(row.get("discount_multiplier", 1.0)),
             cost_multiplier=float(row.get("cost_multiplier", 1.0)),
             stock_cap=float(row.get("stock_cap", 0.0)),
+            overrides=overrides,
         )
         if baseline is None and row["name"] == "Baseline":
             baseline = result
@@ -61,15 +63,15 @@ def build_sensitivity_grid(
     base_price: float,
     runner: Callable[..., Dict[str, Any]],
     price_steps: int = 9,
-    demand_steps: int = 9,
+    discount_steps: int = 9,
 ) -> pd.DataFrame:
     price_grid = np.linspace(base_price * 0.85, base_price * 1.15, price_steps)
-    demand_grid = np.linspace(0.8, 1.2, demand_steps)
+    discount_grid = np.linspace(0.8, 1.2, discount_steps)
     rows: List[Dict[str, Any]] = []
     for p in price_grid:
-        for d in demand_grid:
-            r = runner(trained_bundle, manual_price=float(p), demand_multiplier=float(d), horizon_days=30)
-            rows.append({"price": p, "demand_multiplier": d, "profit": float(r.get("profit_total", 0.0))})
+        for d in discount_grid:
+            r = runner(trained_bundle, manual_price=float(p), horizon_days=30, overrides={"discount_multiplier": float(d)})
+            rows.append({"price": p, "discount_multiplier": d, "profit": float(r.get("profit_total", 0.0))})
     out = pd.DataFrame(rows)
     if len(out) > 0:
         out["risk_zone"] = np.where(out["profit"] < 0, "risk", "stable")
