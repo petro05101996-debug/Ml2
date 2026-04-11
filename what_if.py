@@ -65,16 +65,22 @@ def build_sensitivity_grid(
     base_price: float,
     runner: Callable[..., Dict[str, Any]],
     price_steps: int = 9,
-    discount_steps: int = 9,
+    demand_steps: int = 9,
 ) -> pd.DataFrame:
     price_grid = np.linspace(base_price * 0.85, base_price * 1.15, price_steps)
-    discount_grid = np.linspace(0.8, 1.2, discount_steps)
+    demand_grid = np.linspace(0.8, 1.2, demand_steps)
     rows: List[Dict[str, Any]] = []
     for p in price_grid:
-        for d in discount_grid:
-            r = runner(trained_bundle, manual_price=float(p), horizon_days=30, overrides={"discount_multiplier": float(d)})
-            rows.append({"price": p, "discount_multiplier": d, "profit_raw": float(r.get("profit_total_raw", r.get("profit_total", 0.0))), "profit": float(r.get("profit_total_adjusted", r.get("profit_total", 0.0)))})
+        for d in demand_grid:
+            r = runner(trained_bundle, manual_price=float(p), horizon_days=30, demand_multiplier=float(d))
+            rows.append({
+                "price": p,
+                "demand_multiplier": d,
+                "profit_raw": float(r.get("profit_total_raw", r.get("profit_total", 0.0))),
+                "profit_adjusted": float(r.get("profit_total_adjusted", r.get("profit_total", 0.0))),
+                "forecast_total": float(r.get("demand_total", 0.0)),
+            })
     out = pd.DataFrame(rows)
     if len(out) > 0:
-        out["risk_zone"] = np.where(out["profit"] < 0, "risk", "stable")
+        out["risk_zone"] = np.where(out["profit_adjusted"] < 0, "risk", "stable")
     return out

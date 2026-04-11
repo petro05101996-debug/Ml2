@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import json
 
 from data_adapter import build_auto_mapping, normalize_transactions, build_daily_from_transactions
@@ -39,14 +40,15 @@ def test_scenario_runner_baseline_fallback():
     assert "delta_profit" in out.columns
 
 
-def test_sensitivity_uses_discount_axis():
+def test_sensitivity_uses_demand_axis():
     def runner(_bundle, **kwargs):
         p = kwargs["manual_price"]
-        discount_mult = kwargs.get("overrides", {}).get("discount_multiplier", 1.0)
-        return {"profit_total": p * (2 - discount_mult)}
+        demand_mult = kwargs.get("demand_multiplier", 1.0)
+        return {"profit_total": p * (2 - demand_mult), "profit_total_adjusted": p * (2 - demand_mult), "demand_total": 10 * demand_mult}
 
-    out = build_sensitivity_grid({}, base_price=100.0, runner=runner, price_steps=3, discount_steps=3)
-    assert "discount_multiplier" in out.columns
+    out = build_sensitivity_grid({}, base_price=100.0, runner=runner, price_steps=3, demand_steps=3)
+    assert "demand_multiplier" in out.columns
+    assert "profit_adjusted" in out.columns
     assert "risk_zone" in out.columns
 
 
@@ -78,7 +80,6 @@ def _make_txn(n_days: int = 180) -> pd.DataFrame:
 
 
 def _analyze():
-    run_full_pricing_analysis_universal.clear()
     return run_full_pricing_analysis_universal(_make_txn(), "cat-a", "sku-1")
 
 
@@ -211,3 +212,49 @@ def test_higher_cost_multiplier_not_improve_adjusted_profit():
     base = run_what_if_projection(bundle, manual_price=base_price, cost_multiplier=1.0)
     high_cost = run_what_if_projection(bundle, manual_price=base_price, cost_multiplier=1.2)
     assert high_cost["profit_total_adjusted"] <= base["profit_total_adjusted"]
+
+
+def test_oof_small_mode_parameter_accepts_false():
+    from app import make_walk_forward_oof_baseline
+
+    df = _make_txn(60)
+    daily = build_daily_from_transactions(df, "sku-1", target_category="cat-a")
+    daily = robust_clean_dirty_data(daily)
+    daily = daily.assign(log_sales=np.log1p(pd.to_numeric(daily["sales"], errors="coerce").fillna(0.0)))
+    features = [c for c in ["price", "discount", "promotion", "is_weekend"] if c in daily.columns]
+    out = make_walk_forward_oof_baseline(daily.copy(), features, n_splits=3, small_mode=False)
+    assert len(out) == len(daily)
+
+
+def test_feature_report_truthfulness_for_engineered_features():
+    res = _analyze()
+    fr = res["feature_report"]
+    row = fr[fr["factor_name"] == "sales_lag1"].iloc[0]
+    assert bool(row["engineered_feature"]) is True
+    assert bool(row["found_in_raw"]) is False
+    assert bool(row["present_in_daily"]) is True
+
+
+def test_small_mode_warnings_present_on_short_history():
+    res = run_full_pricing_analysis_universal(_make_txn(60), "cat-a", "sku-1")
+    assert res["small_mode_info"]["small_mode"] is True
+    assert len(res["warnings"]) > 0
+
+
+def test_scenario_modeled_price_state_for_clipped_request():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    sc = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]) * 3.0)
+    assert "price_for_model" in sc
+    assert sc["price_clipped"] is True
+    res["scenario_price_requested"] = float(sc["requested_price"])
+    res["scenario_price_modeled"] = float(sc["price_for_model"])
+    res["scenario_price"] = res["scenario_price_modeled"]
+    assert res["scenario_price"] == res["scenario_price_modeled"]
+
+
+def test_stock_is_not_public_scenario_factor():
+    res = _analyze()
+    fr = res["feature_report"]
+    row = fr[fr["factor_name"] == "stock"].iloc[0]
+    assert bool(row["used_in_scenario"]) is False
