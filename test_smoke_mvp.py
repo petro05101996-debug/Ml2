@@ -4,7 +4,13 @@ import json
 
 from data_adapter import build_auto_mapping, normalize_transactions, build_daily_from_transactions
 from what_if import build_sensitivity_grid, run_scenario_set
-from app import robust_clean_dirty_data, run_full_pricing_analysis_universal, run_what_if_projection
+from app import (
+    apply_weekly_fallback_projection,
+    build_manual_scenario_artifacts,
+    robust_clean_dirty_data,
+    run_full_pricing_analysis_universal,
+    run_what_if_projection,
+)
 
 
 def test_normalize_and_daily_build():
@@ -119,10 +125,10 @@ def test_freight_increase_not_increase_demand():
     assert high["demand_total"] <= low["demand_total"]
 
 
-def test_run_summary_scenario_totals_are_real():
+def test_analysis_summary_does_not_fake_manual_scenario():
     res = _analyze()
-    summary_blob_before = res["run_summary_json"]
-    summary = json.loads(res["run_summary_json"].decode("utf-8"))
+    summary_blob_before = res["analysis_run_summary_json"]
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     out = summary["scenario_output_summary"]
     assert out["scenario_status"] == "not_run"
     assert pd.isna(out["scenario_demand_total"])
@@ -136,10 +142,68 @@ def test_run_summary_scenario_totals_are_real():
     assert scenario["demand_total"] != float(res["as_is_forecast"]["actual_sales"].sum())
     assert scenario["revenue_total"] != float(res["as_is_forecast"]["revenue"].sum())
     assert scenario["profit_total"] != float(res["as_is_forecast"]["profit"].sum())
-    # run_summary_json is analysis-level artifact and should not mutate after runtime what-if calls.
-    assert res["run_summary_json"] == summary_blob_before
+    # analysis summary is analysis-level artifact and should not mutate after runtime what-if calls.
+    assert res["analysis_run_summary_json"] == summary_blob_before
     summary_after = json.loads(summary_blob_before.decode("utf-8"))
     assert summary_after["scenario_output_summary"]["scenario_status"] == "not_run"
+
+
+def test_manual_scenario_artifacts_created_after_runtime_what_if():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(bundle, manual_price=base_price * 1.2)
+    summary_blob, daily_blob = build_manual_scenario_artifacts(res, wr)
+    summary = json.loads(summary_blob.decode("utf-8"))
+    daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
+    assert summary["scenario_status"] == "computed"
+    assert len(daily) > 0
+    assert "scenario_demand" in daily.columns
+
+
+def test_manual_scenario_totals_not_equal_as_is_when_price_changes():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(bundle, manual_price=base_price * 1.25)
+    summary_blob, _ = build_manual_scenario_artifacts(res, wr)
+    summary = json.loads(summary_blob.decode("utf-8"))
+    assert summary["requested_price"] != base_price
+    assert abs(summary["delta_vs_as_is"]["demand_total"]) > 0
+    assert "applied_overrides" in summary
+
+
+def test_analysis_summary_contains_schema_version_and_commit_signature():
+    res = _analyze()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    cfg = summary["config"]
+    assert "git_commit" in cfg and str(cfg["git_commit"]) != ""
+    assert "code_signature" in cfg and len(str(cfg["code_signature"])) >= 12
+    assert cfg["artifact_schema_version"] == "v39.1"
+
+
+def test_downloaded_holdout_schema_matches_current_version():
+    res = _analyze()
+    holdout = pd.read_csv(pd.io.common.BytesIO(res["holdout_predictions_csv"]))
+    cols = set(holdout.columns)
+    assert {"baseline_pred_sales", "price_effect_multiplier", "uplift_multiplier", "final_pred_sales"}.issubset(cols)
+    assert {"pred_baseline", "pred_direct", "pred_final", "w_direct", "direct_features"}.isdisjoint(cols)
+
+
+def test_weekly_fallback_projection_preserves_totals():
+    hist = _make_txn(120)
+    base = pd.DataFrame(
+        {
+            "date": pd.date_range("2025-06-01", periods=21, freq="D"),
+            "actual_sales": np.linspace(10, 20, 21),
+            "revenue": np.linspace(100, 200, 21),
+            "profit": np.linspace(30, 80, 21),
+            "lost_sales": np.linspace(0, 5, 21),
+        }
+    )
+    out = apply_weekly_fallback_projection(base, hist)
+    for col in ["actual_sales", "revenue", "profit", "lost_sales"]:
+        assert abs(float(out[col].sum()) - float(base[col].sum())) < 1e-6
 
 
 def test_holdout_final_has_decomposition():
@@ -186,7 +250,7 @@ def test_uplift_uses_baseline_feature():
 
 def test_refit_scope_is_full_history():
     res = _analyze()
-    summary = json.loads(res["run_summary_json"].decode("utf-8"))
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     assert summary["config"]["fit_scope"] == "refit_full_history"
 
 
