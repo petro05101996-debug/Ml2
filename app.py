@@ -292,11 +292,13 @@ def _build_dataset_passport(txn: pd.DataFrame) -> Dict[str, Any]:
     fields = ["date", "product_id", "category", "quantity", "price", "revenue", "cost", "discount", "promotion", "freight_value", "stock", "rating", "reviews_count", "region", "channel", "segment"]
     date_min = str(pd.to_datetime(txn["date"], errors="coerce").min()) if "date" in txn.columns else None
     date_max = str(pd.to_datetime(txn["date"], errors="coerce").max()) if "date" in txn.columns else None
-    history_by_sku = (
-        txn.groupby("product_id")["date"].agg(["min", "max"]).assign(history_days=lambda d: (pd.to_datetime(d["max"]) - pd.to_datetime(d["min"])).dt.days + 1).reset_index().to_dict("records")
-        if {"product_id", "date"}.issubset(txn.columns)
-        else []
-    )
+    history_by_sku = []
+    if {"product_id", "date"}.issubset(txn.columns):
+        history_df = txn.groupby("product_id")["date"].agg(["min", "max"]).reset_index()
+        history_df["history_days"] = (pd.to_datetime(history_df["max"]) - pd.to_datetime(history_df["min"])).dt.days + 1
+        history_df["min"] = pd.to_datetime(history_df["min"], errors="coerce").dt.strftime("%Y-%m-%d")
+        history_df["max"] = pd.to_datetime(history_df["max"], errors="coerce").dt.strftime("%Y-%m-%d")
+        history_by_sku = history_df.to_dict("records")
     field_stats = {}
     for f in fields:
         if f not in txn.columns:
