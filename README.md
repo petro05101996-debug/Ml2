@@ -8,7 +8,7 @@
 - Раздельные метрики прибыли: `profit_raw`, `profit_adjusted`, `uncertainty_penalty`.
 - Ручной what-if, мультисценарии, sensitivity heatmap (`price × demand_multiplier`).
 - **Excel export**: `history`, `neutral_baseline`, `as_is`, `metrics`.
-- **CSV export**: `holdout_predictions`, `scenario_output`, `feature_report`.
+- **CSV export**: `holdout_predictions`, `analysis_baseline_vs_as_is`, `manual_scenario_daily`, `feature_report`.
 
 ## Запуск
 ```bash
