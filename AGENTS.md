@@ -7,15 +7,15 @@
 
 ## Definition of done
 - No future leakage in feature/data preparation (no backward fill from future observations).
-- Objective mode changes optimization behavior.
+- One active contour only: Universal CSV what-if v1.
 - What-if multipliers materially affect output metrics.
 - Raw/adjusted/baseline metrics are explicitly separated in outputs.
+- Full-data refit is used for production bundle after diagnostics.
 - Tests pass locally.
 
 ## Parts that must not be broken
 - Universal CSV normalization (`data_adapter.py`).
 - Scenario runner/sensitivity outputs (`what_if.py`).
-- Recommendation narrative consistency (`recommendation.py`).
 
 ## Non-hidden assumptions
 - `cost` may be proxied as `0.65 * price` when absent.

@@ -127,11 +127,14 @@ def _wavg(frame: pd.DataFrame, value_col: str, weight_col: str = "quantity") -> 
 def build_daily_from_transactions(
     txn: pd.DataFrame,
     sku_id: str,
+    target_category: Optional[str] = None,
     region: Optional[str] = None,
     channel: Optional[str] = None,
     segment: Optional[str] = None,
 ) -> pd.DataFrame:
     sku = txn[txn["product_id"].astype(str) == str(sku_id)].copy()
+    if target_category is not None and "category" in sku.columns:
+        sku = sku[sku["category"].astype(str) == str(target_category)].copy()
     for col, val in [("region", region), ("channel", channel), ("segment", segment)]:
         if val is not None and col in sku.columns:
             sku = sku[sku[col].astype(str) == str(val)].copy()
@@ -180,17 +183,25 @@ def build_daily_from_transactions(
     for c in ["price", "price_median", "freight_value", "discount", "cost", "stock", "review_score", "reviews_count", "promotion"]:
         if c not in daily.columns:
             daily[c] = np.nan
-        daily[c] = pd.to_numeric(daily[c], errors="coerce").ffill().bfill()
+        daily[c] = pd.to_numeric(daily[c], errors="coerce")
+
+    daily["promotion"] = daily["promotion"].fillna(0.0).clip(lower=0.0, upper=1.0)
+    daily["discount"] = daily["discount"].fillna(0.0).clip(lower=0.0, upper=0.95)
+    daily["price"] = daily["price"].ffill()
+    daily["price_median"] = daily["price_median"].ffill()
+    daily["cost"] = daily["cost"].ffill()
+    daily["freight_value"] = daily["freight_value"].ffill()
+    daily["stock"] = daily["stock"].ffill()
+    daily["review_score"] = daily["review_score"].ffill()
+    daily["reviews_count"] = daily["reviews_count"].ffill()
 
     daily["price"] = daily["price"].fillna(1.0).clip(lower=0.01)
     daily["price_median"] = daily["price_median"].fillna(daily["price"]).clip(lower=0.01)
     daily["freight_value"] = daily["freight_value"].fillna(0.0).clip(lower=0.0)
     daily["review_score"] = daily["review_score"].fillna(4.5)
-    daily["promotion"] = daily["promotion"].fillna(0.0).clip(lower=0.0, upper=1.0)
     daily["reviews_count"] = daily["reviews_count"].fillna(0.0).clip(lower=0.0)
     daily["stock"] = daily["stock"].fillna(np.inf)
     daily["cost"] = daily["cost"].fillna(daily["price"] * 0.65).clip(lower=0.0)
-    daily["discount"] = daily["discount"].fillna(0.0).clip(lower=0.0, upper=0.95)
     daily["net_unit_price"] = np.where(
         daily["sales"] > 0,
         daily["revenue"] / daily["sales"].replace(0, np.nan),
@@ -235,12 +246,3 @@ def build_feature_eligibility_report(df: pd.DataFrame) -> List[Dict[str, Any]]:
         )
     return report
 
-
-def objective_to_weights(mode: str) -> Dict[str, float]:
-    presets = {
-        "maximize_profit": {"profit": 1.0, "revenue": 0.2, "volume": 0.1, "margin": 0.4},
-        "maximize_revenue": {"profit": 0.3, "revenue": 1.0, "volume": 0.4, "margin": 0.1},
-        "protect_volume": {"profit": 0.3, "revenue": 0.4, "volume": 1.0, "margin": 0.2},
-        "control_margin": {"profit": 0.6, "revenue": 0.2, "volume": 0.1, "margin": 1.0},
-    }
-    return presets.get(mode, presets["maximize_profit"])

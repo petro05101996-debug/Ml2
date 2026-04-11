@@ -31,8 +31,9 @@ def run_scenario_set(
 
         sales = float(result.get("demand_total", 0.0))
         revenue = float(result.get("revenue_total", 0.0))
-        profit = float(result.get("profit_total", 0.0))
-        margin = (profit / revenue) if revenue > 0 else 0.0
+        profit_raw = float(result.get("profit_total_raw", result.get("profit_total", 0.0)))
+        profit_adjusted = float(result.get("profit_total_adjusted", profit_raw))
+        margin = (profit_adjusted / revenue) if revenue > 0 else 0.0
         confidence = float(result.get("confidence", 0.0))
         uncertainty = float(result.get("uncertainty", 1.0 - confidence))
         records.append(
@@ -40,11 +41,12 @@ def run_scenario_set(
                 "scenario": row["name"],
                 "sales": sales,
                 "revenue": revenue,
-                "profit": profit,
+                "profit_raw": profit_raw,
+                "profit": profit_adjusted,
                 "margin": margin,
                 "confidence": confidence,
                 "uncertainty": uncertainty,
-                "score": profit * (0.7 + 0.3 * confidence),
+                "score": profit_adjusted * (0.7 + 0.3 * confidence),
             }
         )
 
@@ -71,7 +73,7 @@ def build_sensitivity_grid(
     for p in price_grid:
         for d in discount_grid:
             r = runner(trained_bundle, manual_price=float(p), horizon_days=30, overrides={"discount_multiplier": float(d)})
-            rows.append({"price": p, "discount_multiplier": d, "profit": float(r.get("profit_total", 0.0))})
+            rows.append({"price": p, "discount_multiplier": d, "profit_raw": float(r.get("profit_total_raw", r.get("profit_total", 0.0))), "profit": float(r.get("profit_total_adjusted", r.get("profit_total", 0.0)))})
     out = pd.DataFrame(rows)
     if len(out) > 0:
         out["risk_zone"] = np.where(out["profit"] < 0, "risk", "stable")

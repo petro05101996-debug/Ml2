@@ -111,86 +111,40 @@ FEATURE_STATS: Dict[str, float] = {}
 
 def robust_clean_dirty_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for col in ["sales", "price", "freight_value"]:
+    for col in ["price", "freight_value", "cost"]:
         if col in df.columns and len(df) > 0:
-            lower = df[col].quantile(0.01)
-            upper = df[col].quantile(0.99)
-            df[col] = df[col].clip(lower, upper)
-    if "sales" in df.columns and len(df) > 0 and (df["sales"] == 0).mean() > 0.7:
-        df = df[df["sales"] > 0].copy().reset_index(drop=True)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = np.where(df[col] < 0, np.nan, df[col])
+    if "price" in df.columns:
+        df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(safe_median(df["price"], 1.0)).clip(lower=0.01)
+    if "freight_value" in df.columns:
+        df["freight_value"] = pd.to_numeric(df["freight_value"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    if "cost" in df.columns:
+        df["cost"] = pd.to_numeric(df["cost"], errors="coerce").fillna(df.get("price", 0.0) * CONFIG["COST_PROXY_RATIO"]).clip(lower=0.0)
     return df
 
 
-def _recompute_augmented_derived_cols(df_aug: pd.DataFrame) -> pd.DataFrame:
-    out = df_aug.copy()
-    if "sales" in out.columns:
-        out["log_sales"] = np.log1p(out["sales"].clip(lower=0.0))
-    if "price" in out.columns:
-        out["price"] = out["price"].clip(lower=0.01)
-        out["log_price"] = np.log(out["price"])
-    if "freight_value" in out.columns:
-        out["log_freight"] = np.log1p(out["freight_value"].clip(lower=0.0))
-
-    if "price" in out.columns:
-        if "price_change_1d" in out.columns:
-            out["price_change_1d"] = out["price"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        if "price_ma7" in out.columns:
-            out["price_vs_ma7"] = out["price"] / out["price_ma7"].replace(0, np.nan)
-        if "price_ma28" in out.columns:
-            out["price_vs_ma28"] = out["price"] / out["price_ma28"].replace(0, np.nan)
-        if "price_ma90" in out.columns:
-            out["price_vs_ma90"] = out["price"] / out["price_ma90"].replace(0, np.nan)
-        if "price_median" in out.columns:
-            out["price_vs_cat_median"] = out["price"] / out["price_median"].replace(0, np.nan)
-        if "freight_value" in out.columns:
-            out["freight_to_price"] = out["freight_value"] / out["price"].replace(0, np.nan)
-
-    for c in [
-        "price_vs_ma7",
-        "price_vs_ma28",
-        "price_vs_ma90",
-        "price_vs_cat_median",
-        "freight_to_price",
-        "sales_momentum_7_28",
-        "sales_momentum_28_90",
-    ]:
-        if c in out.columns:
-            out[c] = out[c].replace([np.inf, -np.inf], np.nan)
-
-    can_rebuild_lags = all(col in out.columns for col in ["date", "sales", "price", "freight_value"])
-    if can_rebuild_lags:
-        lag_seed = out[["date", "sales", "price", "freight_value"]].copy()
-        lag_seed["date"] = pd.to_datetime(lag_seed["date"], errors="coerce")
-        if "review_score" in out.columns:
-            lag_seed["review_score"] = pd.to_numeric(out["review_score"], errors="coerce")
-        else:
-            lag_seed["review_score"] = 4.5
-        lag_seed["review_score"] = lag_seed["review_score"].fillna(safe_median(lag_seed["review_score"], 4.5))
-        lag_seed = lag_seed.sort_values("date").reset_index(drop=True)
-        lag_df = add_leak_free_lag_features(lag_seed)
-        lag_cols = [c for c in lag_df.columns if c in out.columns]
-        if lag_cols:
-            out.loc[lag_df.index, lag_cols] = lag_df[lag_cols].values
-
-    return out
-
-
-def augment_price_variations(df: pd.DataFrame, n_aug: int = CONFIG["AUGMENT_N"]) -> pd.DataFrame:
-    if len(df) == 0:
-        return df.copy()
-    aug_frames = [df.copy()]
-    orig_price = df["price"].copy()
-    for _ in range(n_aug):
-        df_aug = df.copy()
-        noise = np.random.normal(0, CONFIG["AUGMENT_PRICE_NOISE"], len(df_aug))
-        df_aug["price"] = orig_price * (1 + noise)
-        df_aug["price"] = df_aug["price"].clip(lower=0.01)
-        price_ratio = df_aug["price"] / orig_price.clip(lower=0.01)
-        if "sales" in df_aug.columns:
-            df_aug["sales"] = (df_aug["sales"] * (price_ratio ** CONFIG["PRIOR_ELASTICITY"])).clip(lower=0.1)
-        df_aug = _recompute_augmented_derived_cols(df_aug)
-        aug_frames.append(df_aug)
-    return pd.concat(aug_frames, ignore_index=True)
+def detect_small_mode(daily_df: pd.DataFrame) -> bool:
+    if len(daily_df) == 0:
+        return True
+    n_days = int(len(daily_df))
+    non_zero_days = int((pd.to_numeric(daily_df.get("sales", 0.0), errors="coerce").fillna(0.0) > 0).sum())
+    net_price = pd.to_numeric(daily_df.get("net_unit_price", daily_df.get("price", 0.0)), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    unique_prices = int(net_price.nunique()) if len(net_price) else 0
+    price_changes = int((net_price.diff().abs() > 1e-9).sum()) if len(net_price) else 0
+    if len(net_price):
+        pmin = float(net_price.min())
+        pmax = float(net_price.max())
+        rel_span = (pmax - pmin) / max(pmin, 1e-9)
+    else:
+        rel_span = 0.0
+    return bool(
+        n_days < 120
+        or non_zero_days < 60
+        or unique_prices < CONFIG["MIN_UNIQUE_PRICES"]
+        or price_changes < CONFIG["MIN_PRICE_CHANGES"]
+        or rel_span < CONFIG["MIN_REL_PRICE_SPAN"]
+    )
 
 
 def safe_median(series: pd.Series, default: float = 0.0) -> float:
@@ -249,27 +203,6 @@ def validate_schema(df: pd.DataFrame, required: Iterable[str], name: str = "data
 
 def _norm_col(c: str) -> str:
     return str(c).strip().lower().replace(" ", "_")
-
-
-def _suggest_column(columns: List[str], aliases: List[str]) -> Optional[str]:
-    if not columns:
-        return None
-    norm_to_orig = {_norm_col(c): c for c in columns}
-    for a in aliases:
-        if a in norm_to_orig:
-            return norm_to_orig[a]
-    for c in columns:
-        cn = _norm_col(c)
-        if any(a in cn for a in aliases):
-            return c
-    return None
-
-
-def _rename_with_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.DataFrame:
-    out = df.copy()
-    rename_map = {src: dst for dst, src in mapping.items() if src is not None and src in out.columns}
-    out = out.rename(columns=rename_map)
-    return out
 
 
 def fit_feature_stats(df: pd.DataFrame, features: List[str]) -> Dict[str, float]:
@@ -334,76 +267,6 @@ def _tail_std(arr: np.ndarray, k: int, default: float = 0.0) -> float:
     if len(arr) == 0:
         return default
     return float(np.std(arr[-min(k, len(arr)) :], ddof=0))
-
-
-def build_raw_frame(orders: pd.DataFrame, order_items: pd.DataFrame, products: pd.DataFrame, reviews: pd.DataFrame) -> pd.DataFrame:
-    orders = orders.copy()
-    order_items = order_items.copy()
-    products = products.copy()
-    reviews = reviews.copy()
-
-    validate_schema(orders, ["order_id", "order_purchase_timestamp"], "orders")
-    validate_schema(order_items, ["order_id", "product_id"], "order_items")
-    validate_schema(products, ["product_id", "product_category_name"], "products")
-
-    orders["order_purchase_timestamp"] = pd.to_datetime(orders["order_purchase_timestamp"], errors="coerce")
-    if not reviews.empty and "review_creation_date" in reviews.columns:
-        reviews["review_creation_date"] = pd.to_datetime(reviews["review_creation_date"], errors="coerce")
-
-    raw_df = order_items.merge(orders, on="order_id", how="inner")
-    raw_df = raw_df.merge(products, on="product_id", how="left")
-
-    if not reviews.empty and "order_id" in reviews.columns and "review_score" in reviews.columns:
-        raw_df = raw_df.merge(reviews[["order_id", "review_score"]], on="order_id", how="left")
-    else:
-        raw_df["review_score"] = np.nan
-
-    needed = ["order_purchase_timestamp", "product_category_name", "price"]
-    raw_df = raw_df.dropna(subset=[c for c in needed if c in raw_df.columns]).copy()
-    raw_df["date"] = pd.to_datetime(raw_df["order_purchase_timestamp"], errors="coerce").dt.normalize()
-    raw_df = raw_df.dropna(subset=["date"]).sort_values(["product_category_name", "date"]).reset_index(drop=True)
-    return raw_df
-
-
-def build_daily_sku_frame(sku_df: pd.DataFrame, sku_id: str) -> pd.DataFrame:
-    validate_schema(sku_df, ["date", "order_item_id", "order_id", "product_id", "price"], "sku_df")
-    if len(sku_df) == 0:
-        raise ValueError("Нет данных по выбранному SKU.")
-    daily_agg = {
-        "sales": ("order_item_id", "count"),
-        "revenue": ("price", "sum"),
-        "price": ("price", "mean"),
-        "price_median": ("price", "median"),
-        "orders": ("order_id", "nunique"),
-        "products_sold": ("product_id", "nunique"),
-    }
-    if "freight_value" in sku_df.columns:
-        daily_agg["freight_value"] = ("freight_value", "mean")
-    else:
-        daily_agg["freight_value"] = ("price", "mean")
-    if "review_score" in sku_df.columns:
-        daily_agg["review_score"] = ("review_score", "mean")
-
-    daily = sku_df.groupby("date").agg(**daily_agg).reset_index()
-    full_dates = pd.DataFrame({"date": pd.date_range(daily["date"].min(), daily["date"].max(), freq="D")})
-    daily = full_dates.merge(daily, on="date", how="left").sort_values("date").reset_index(drop=True)
-
-    for col in ["sales", "revenue", "orders", "products_sold"]:
-        if col in daily.columns:
-            daily[col] = daily[col].fillna(0).astype(float)
-
-    for col in ["price", "price_median", "freight_value", "review_score"]:
-        if col not in daily.columns:
-            daily[col] = np.nan
-        daily[col] = daily[col].ffill().bfill()
-
-    daily["price"] = daily["price"].fillna(safe_median(daily["price"], 1.0)).clip(lower=0.01)
-    daily["price_median"] = daily["price_median"].fillna(daily["price"]).clip(lower=0.01)
-    daily["freight_value"] = daily["freight_value"].fillna(safe_median(daily["freight_value"], 0.0)).clip(lower=0.0)
-    daily["review_score"] = 4.5 if daily["review_score"].isna().all() else daily["review_score"].fillna(safe_median(daily["review_score"], 4.5))
-    daily["sku_id"] = str(sku_id)
-    daily["category"] = str(sku_df["product_category_name"].mode().iloc[0]) if "product_category_name" in sku_df.columns else "unknown"
-    return daily
 
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -523,18 +386,6 @@ UPLIFT_FEATURES: List[str] = [
     "time_index_norm",
     "baseline_log_feature",
     "promo_x_weekend",
-]
-
-DIRECT_FEATURES: List[str] = [
-    "log_price", "price", "net_unit_price", "price_change_1d", "price_lag1", "price_lag7", "price_lag28",
-    "price_ma7", "price_ma28", "price_ma90", "price_vs_ma7", "price_vs_ma28",
-    "price_vs_ma90", "price_vs_cat_median", "sales_lag1", "sales_lag7", "sales_lag14",
-    "sales_lag28", "sales_ma7", "sales_ma28", "sales_ma90", "sales_std28",
-    "sales_momentum_7_28", "sales_momentum_28_90", "freight_value", "discount", "promotion",
-    "reviews_count", "log_freight",
-    "freight_lag1", "freight_lag7", "freight_lag28", "freight_ma7", "freight_ma28",
-    "freight_ma90", "freight_to_price", "review_score", "dow", "month", "weekofyear",
-    "is_weekend", "sin_doy", "cos_doy", "month_sin", "month_cos", "time_index", "time_index_norm"
 ]
 
 
@@ -677,18 +528,6 @@ def compute_monthly_group_elasticities(df_all: pd.DataFrame, pooled_prior: float
     return shrunk, diag_df
 
 
-def _make_direct_monotone_constraints(feature_names: List[str]) -> List[int]:
-    monotone = [0] * len(feature_names)
-    negative = {"log_price", "price", "price_change_1d", "price_vs_ma7", "price_vs_ma28", "price_vs_ma90", "price_vs_cat_median"}
-    positive = {"sales_lag1", "sales_lag7", "sales_lag14", "sales_lag28", "sales_ma7", "sales_ma28", "sales_ma90"}
-    for idx, fname in enumerate(feature_names):
-        if fname in negative:
-            monotone[idx] = -1
-        elif fname in positive:
-            monotone[idx] = 1
-    return monotone
-
-
 def _make_uplift_monotone_constraints(feature_names: List[str]) -> List[int]:
     monotone = [0] * len(feature_names)
     for idx, fname in enumerate(feature_names):
@@ -765,10 +604,6 @@ def ensemble_predict(models_local: List[Any], X_local: pd.DataFrame) -> Tuple[np
     return preds.mean(axis=0), preds.std(axis=0, ddof=0)
 
 
-def predict_direct_log(frame: pd.DataFrame, models_local: List[Any]) -> Tuple[np.ndarray, np.ndarray]:
-    return ensemble_predict(models_local, frame[DIRECT_FEATURES].astype(float))
-
-
 def predict_baseline_log(frame: pd.DataFrame, models_local: List[Any]) -> Tuple[np.ndarray, np.ndarray]:
     return ensemble_predict(models_local, frame[BASELINE_FEATURES].astype(float))
 
@@ -801,34 +636,6 @@ def calc_scenario_price_effect_log(current_net_price: float, scenario_net_price:
     elasticity = np.clip(elasticity, CONFIG["ELASTICITY_FLOOR"], CONFIG["ELASTICITY_CEILING"])
     effect = elasticity * np.log(ratio)
     return np.clip(effect, -1.2, 1.2)
-
-
-def structural_predict_log(frame: pd.DataFrame, baseline_models: List[Any], elasticity_map: Dict[str, float], pooled_prior: float, price_ref_col: str = "price_ma28") -> Tuple[np.ndarray, np.ndarray]:
-    base_log, base_std = predict_baseline_log(frame, baseline_models)
-    price_col = "net_unit_price" if "net_unit_price" in frame.columns else "price"
-    price = frame[price_col].astype(float).values
-    ref = frame[price_ref_col].astype(float).values if price_ref_col in frame.columns else frame[price_col].astype(float).values
-    ref = np.where(np.isfinite(ref) & (ref > 0), ref, np.nanmedian(price) if np.isfinite(np.nanmedian(price)) else 1.0)
-    ref = np.where(ref <= 0, 1.0, ref)
-
-    if "elasticity_group" in frame.columns:
-        elasticity = frame["elasticity_group"].astype(float).values
-    elif "date" in frame.columns:
-        elasticity = np.array([elasticity_map.get(str(pd.Timestamp(d).to_period("M")), pooled_prior) for d in frame["date"]], dtype=float)
-    else:
-        elasticity = np.full(len(frame), pooled_prior, dtype=float)
-
-    elasticity = np.clip(elasticity, CONFIG["ELASTICITY_FLOOR"], CONFIG["ELASTICITY_CEILING"])
-    price_ratio = np.maximum(price, 1e-9) / np.maximum(ref, 1e-9)
-    price_ratio = np.clip(price_ratio, 0.20, 5.0)
-    struct_log = base_log + elasticity * np.log(price_ratio)
-    return struct_log, base_std
-
-
-def blended_predict_log(frame: pd.DataFrame, direct_models: List[Any], baseline_models: List[Any], elasticity_map: Dict[str, float], pooled_elasticity: float, w_direct: float) -> np.ndarray:
-    direct_log, _ = predict_direct_log(frame, direct_models)
-    struct_log, _ = structural_predict_log(frame, baseline_models, elasticity_map, pooled_elasticity)
-    return w_direct * direct_log + (1.0 - w_direct) * struct_log
 
 
 def forecast_future_dates(last_date: pd.Timestamp, n_days: int = CONFIG["HORIZON_DAYS_DEFAULT"]) -> pd.DataFrame:
@@ -885,89 +692,6 @@ def build_one_step_baseline_features(history_df: pd.DataFrame, current_date: pd.
         "month_cos": float(np.cos(2 * np.pi * month / 12.0)),
         "time_index": time_index, "time_index_norm": time_index_norm,
         "sales": float(last_sales), "category": base_ctx.get("category", "unknown"),
-        "elasticity_bucket": str(dt.to_period("M")),
-    }
-    return pd.DataFrame([row])
-
-
-def build_one_step_direct_features(history_df: pd.DataFrame, current_date: pd.Timestamp, base_ctx: Dict[str, Any], history_span_days: int, price_value: float) -> pd.DataFrame:
-    h = history_df.sort_values("date").reset_index(drop=True)
-    sales_series = h["sales"].astype(float).values if "sales" in h.columns else np.zeros(len(h), dtype=float)
-    price_series = h["price"].astype(float).values if "price" in h.columns else np.full(len(h), float(price_value), dtype=float)
-    net_price_series = h["net_unit_price"].astype(float).values if "net_unit_price" in h.columns else price_series.copy()
-    freight_series = h["freight_value"].astype(float).values if "freight_value" in h.columns else np.zeros(len(h), dtype=float)
-    discount_series = h["discount"].astype(float).values if "discount" in h.columns else np.zeros(len(h), dtype=float)
-    promo_series = h["promotion"].astype(float).values if "promotion" in h.columns else np.zeros(len(h), dtype=float)
-    reviews_series = h["reviews_count"].astype(float).values if "reviews_count" in h.columns else np.zeros(len(h), dtype=float)
-    review_series = h["review_score"].astype(float).values if "review_score" in h.columns else np.full(len(h), 4.5)
-
-    dt = pd.Timestamp(current_date)
-    dow = int(dt.dayofweek)
-    month = int(dt.month)
-    doy = int(dt.dayofyear)
-    weekofyear = int(dt.isocalendar().week)
-    is_weekend = int(dow >= 5)
-
-    current_price = float(price_value)
-    if not np.isfinite(current_price) or current_price <= 0:
-        current_price = float(price_series[-1]) if len(price_series) else float(base_ctx.get("price", 1.0))
-    current_price = max(current_price, 0.01)
-    current_discount = float(discount_series[-1]) if len(discount_series) else float(base_ctx.get("discount", 0.0))
-    current_net_price = max(0.01, current_price * (1.0 - current_discount))
-    last_price = float(net_price_series[-1]) if len(net_price_series) else current_net_price
-    last_sales = float(sales_series[-1]) if len(sales_series) else 0.0
-    last_freight = float(freight_series[-1]) if len(freight_series) else float(base_ctx.get("freight_value", 0.0))
-    last_review = float(review_series[-1]) if len(review_series) else float(base_ctx.get("review_score", 4.5))
-    history_norm_den = max(1.0, float(history_span_days - 1))
-    time_index = float(len(history_df))
-    time_index_norm = min(1.5, time_index / history_norm_den)
-
-    row = {
-        "date": dt,
-        "log_price": float(np.log(current_net_price)),
-        "price": float(current_price),
-        "net_unit_price": float(current_net_price),
-        "price_change_1d": float(current_net_price / max(last_price, 1e-9) - 1.0) if len(net_price_series) >= 1 else 0.0,
-        "price_lag1": float(net_price_series[-1]) if len(net_price_series) >= 1 else current_net_price,
-        "price_lag7": float(net_price_series[-7]) if len(net_price_series) >= 7 else current_net_price,
-        "price_lag28": float(net_price_series[-28]) if len(net_price_series) >= 28 else current_net_price,
-        "sales_lag1": float(sales_series[-1]) if len(sales_series) >= 1 else 0.0,
-        "sales_lag7": float(sales_series[-7]) if len(sales_series) >= 7 else last_sales,
-        "sales_lag14": float(sales_series[-14]) if len(sales_series) >= 14 else last_sales,
-        "sales_lag28": float(sales_series[-28]) if len(sales_series) >= 28 else last_sales,
-        "sales_ma7": _tail_mean(sales_series, 7, 0.0),
-        "sales_ma28": _tail_mean(sales_series, 28, 0.0),
-        "sales_ma90": _tail_mean(sales_series, 90, 0.0),
-        "sales_std28": _tail_std(sales_series, 28, 0.0),
-        "sales_momentum_7_28": _tail_mean(sales_series, 7, 0.0) / max(_tail_mean(sales_series, 28, 0.0), 1e-9),
-        "sales_momentum_28_90": _tail_mean(sales_series, 28, 0.0) / max(_tail_mean(sales_series, 90, 0.0), 1e-9),
-        "freight_value": float(last_freight),
-        "log_freight": float(np.log1p(max(last_freight, 0.0))),
-        "freight_lag1": float(freight_series[-1]) if len(freight_series) >= 1 else last_freight,
-        "freight_lag7": float(freight_series[-7]) if len(freight_series) >= 7 else last_freight,
-        "freight_lag28": float(freight_series[-28]) if len(freight_series) >= 28 else last_freight,
-        "freight_ma7": _tail_mean(freight_series, 7, last_freight),
-        "freight_ma28": _tail_mean(freight_series, 28, last_freight),
-        "freight_ma90": _tail_mean(freight_series, 90, last_freight),
-        "discount": float(current_discount),
-        "promotion": float(promo_series[-1]) if len(promo_series) else float(base_ctx.get("promotion", 0.0)),
-        "reviews_count": float(reviews_series[-1]) if len(reviews_series) else float(base_ctx.get("reviews_count", 0.0)),
-        "freight_to_price": float(last_freight / max(current_net_price, 1e-9)),
-        "price_ma7": _tail_mean(net_price_series, 7, current_net_price),
-        "price_ma28": _tail_mean(net_price_series, 28, current_net_price),
-        "price_ma90": _tail_mean(net_price_series, 90, current_net_price),
-        "price_vs_ma7": float(current_net_price / max(_tail_mean(net_price_series, 7, current_net_price), 1e-9)),
-        "price_vs_ma28": float(current_net_price / max(_tail_mean(net_price_series, 28, current_net_price), 1e-9)),
-        "price_vs_ma90": float(current_net_price / max(_tail_mean(net_price_series, 90, current_net_price), 1e-9)),
-        "price_vs_cat_median": float(current_net_price / max(safe_median(pd.Series(net_price_series), current_net_price), 1e-9)),
-        "review_score": float(last_review),
-        "dow": dow, "month": month, "weekofyear": weekofyear, "is_weekend": is_weekend,
-        "sin_doy": float(np.sin(2 * np.pi * doy / 365.25)),
-        "cos_doy": float(np.cos(2 * np.pi * doy / 365.25)),
-        "month_sin": float(np.sin(2 * np.pi * month / 12.0)),
-        "month_cos": float(np.cos(2 * np.pi * month / 12.0)),
-        "time_index": time_index, "time_index_norm": time_index_norm,
-        "category": base_ctx.get("category", "unknown"),
         "elasticity_bucket": str(dt.to_period("M")),
     }
     return pd.DataFrame([row])
@@ -1039,30 +763,6 @@ def recursive_baseline_forecast(base_history: pd.DataFrame, horizon_df: pd.DataF
     return pd.concat(outputs, ignore_index=True)
 
 
-def recursive_direct_forecast(base_history: pd.DataFrame, horizon_df: pd.DataFrame, direct_models: List[Any], base_ctx: Dict[str, Any], price_value: float) -> pd.DataFrame:
-    keep_cols = [c for c in ["date", "sales", "price", "freight_value", "review_score", "discount", "promotion", "reviews_count", "net_unit_price"] if c in base_history.columns]
-    history = base_history[keep_cols].copy()
-    if "price" not in history.columns:
-        history["price"] = float(price_value)
-    if "freight_value" not in history.columns:
-        history["freight_value"] = float(base_ctx.get("freight_value", 0.0))
-    if "review_score" not in history.columns:
-        history["review_score"] = float(base_ctx.get("review_score", 4.5))
-    history_span_days = max(len(base_history), 2)
-    outputs = []
-    for _, fr in horizon_df.iterrows():
-        current_date = pd.Timestamp(fr["date"])
-        feat = build_one_step_direct_features(history, current_date, base_ctx, history_span_days, price_value)
-        feat = clean_feature_frame(feat, DIRECT_FEATURES)
-        X = feat[DIRECT_FEATURES].astype(float)
-        pred_log_mean, pred_log_std = ensemble_predict(direct_models, X)
-        pred_log_mean = float(pred_log_mean[0]); pred_log_std = float(pred_log_std[0])
-        pred_sales = max(0.0, float(np.expm1(pred_log_mean)))
-        outputs.append(pd.DataFrame({"date": [current_date], "direct_pred_log_sales": [pred_log_mean], "direct_pred_sales": [pred_sales], "direct_pred_std_log": [pred_log_std], "year_month": [str(current_date.to_period("M"))], "price": [price_value]}))
-        history = pd.concat([history, pd.DataFrame({"date": [current_date], "sales": [pred_sales], "price": [price_value], "net_unit_price": [float(price_value) * (1.0 - float(base_ctx.get("discount", 0.0)))], "freight_value": [float(base_ctx.get("freight_value", 0.0))], "review_score": [float(base_ctx.get("review_score", 4.5))], "discount": [float(base_ctx.get("discount", 0.0))], "promotion": [float(base_ctx.get("promotion", 0.0))], "reviews_count": [float(base_ctx.get("reviews_count", 0.0))]})], ignore_index=True)
-    return pd.concat(outputs, ignore_index=True)
-
-
 def eval_prediction_frame(frame: pd.DataFrame, y_log_pred: np.ndarray, label: str = "test") -> Dict[str, float]:
     if len(frame) == 0:
         return {"rmse": float("nan"), "mae": float("nan"), "mape": float("nan"), "smape": float("nan"), "wape": float("nan"), "sigma_log": float("nan")}
@@ -1081,26 +781,6 @@ def eval_prediction_frame(frame: pd.DataFrame, y_log_pred: np.ndarray, label: st
     }
 
 
-def choose_blend_weight(val_df: pd.DataFrame, direct_models: List[Any], baseline_models: List[Any], elasticity_map: Dict[str, float], pooled_elasticity: float) -> Tuple[float, pd.DataFrame]:
-    if len(val_df) == 0:
-        return 0.5, pd.DataFrame(columns=["w_direct", "rmse", "smape", "wape"])
-    direct_log, _ = predict_direct_log(val_df, direct_models)
-    struct_log, _ = structural_predict_log(val_df, baseline_models, elasticity_map, pooled_elasticity)
-    rows = []
-    best_w = 1.0
-    best_wape = float("inf")
-    for w in np.linspace(0.0, 1.0, 41):
-        blend_log = w * direct_log + (1.0 - w) * struct_log
-        pred_sales = np.expm1(blend_log).clip(min=0.0)
-        y_true = val_df["sales"].astype(float).values
-        wape = calculate_wape(y_true, pred_sales)
-        rows.append({"w_direct": float(w), "rmse": float(np.sqrt(mean_squared_error(y_true, pred_sales))), "smape": calculate_smape(y_true, pred_sales), "wape": wape})
-        if np.isfinite(wape) and wape < best_wape:
-            best_wape = wape
-            best_w = float(w)
-    return best_w, pd.DataFrame(rows)
-
-
 def _monotone_price_multiplier(price_candidate: float, current_price: float, elasticity: float) -> float:
     elasticity = float(np.clip(elasticity, CONFIG["ELASTICITY_FLOOR"], CONFIG["ELASTICITY_CEILING"]))
     ratio = max(float(price_candidate), 1e-9) / max(float(current_price), 1e-9)
@@ -1109,7 +789,7 @@ def _monotone_price_multiplier(price_candidate: float, current_price: float, ela
     return float(np.clip(mult, 0.15, 3.0))
 
 
-def simulate_horizon_profit(base_row: Dict[str, Any], price_candidate: float, future_dates_df: pd.DataFrame, baseline_bundle: Dict[str, Any], uplift_bundle: Dict[str, Any], base_history: pd.DataFrame, base_ctx: Dict[str, Any], elasticity_map: Dict[str, float], pooled_elasticity: float, w_direct: Optional[float] = None, allow_extrapolate: bool = False, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def simulate_horizon_profit(base_row: Dict[str, Any], price_candidate: float, future_dates_df: pd.DataFrame, baseline_bundle: Dict[str, Any], uplift_bundle: Dict[str, Any], base_history: pd.DataFrame, base_ctx: Dict[str, Any], elasticity_map: Dict[str, float], pooled_elasticity: float, allow_extrapolate: bool = False, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     overrides = overrides or {}
     baseline_models = baseline_bundle["models"] if isinstance(baseline_bundle, dict) and "models" in baseline_bundle else baseline_bundle
     uplift_is_bundle = isinstance(uplift_bundle, dict) and "models" in uplift_bundle
@@ -1228,204 +908,6 @@ def simulate_horizon_profit(base_row: Dict[str, Any], price_candidate: float, fu
     }
 
 
-def recommend_price_horizon(base_row: Dict[str, Any], direct_models: List[Any], baseline_models: List[Any], base_history: pd.DataFrame, base_ctx: Dict[str, Any], elasticity_map: Dict[str, float], pooled_elasticity: float, w_direct: float, min_rel: float = CONFIG["MIN_REL_STEP"], max_rel: float = CONFIG["MAX_REL_STEP"], n_grid: int = 120, n_days: int = None, risk_lambda: float = 0.7, price_change_penalty: float = None, search_margin: float = None, allow_extrapolate: bool = False) -> Dict[str, Any]:
-    if n_days is None:
-        n_days = CONFIG["HORIZON_DAYS_DEFAULT"]
-    if price_change_penalty is None:
-        price_change_penalty = CONFIG["PRICE_CHANGE_PENALTY_SCALE"]
-    if search_margin is None:
-        search_margin = CONFIG["SEARCH_MARGIN"]
-    future_dates_df = forecast_future_dates(pd.Timestamp(base_history["date"].max()), n_days=n_days)
-    train_min = float(base_history["price"].min())
-    train_max = float(base_history["price"].max())
-    train_span = max(1e-9, train_max - train_min)
-    current_price_raw = float(base_row.get("price", base_history["price"].median()))
-    if not np.isfinite(current_price_raw) or current_price_raw <= 0:
-        current_price_raw = float(base_history["price"].median())
-    current_price_model = current_price_raw if allow_extrapolate else float(np.clip(current_price_raw, train_min, train_max))
-    cost = max(0.01, float(current_price_raw) * CONFIG["COST_PROXY_RATIO"])
-
-    window_min = max(cost * 1.01, current_price_model * (1.0 + min_rel), train_min - search_margin * train_span)
-    window_max = min(current_price_model * (1.0 + max_rel), train_max + search_margin * train_span)
-    if not allow_extrapolate:
-        window_min = max(window_min, train_min)
-        window_max = min(window_max, train_max)
-    if not np.isfinite(window_min) or not np.isfinite(window_max) or window_min >= window_max:
-        window_min = max(cost * 1.01, train_min)
-        window_max = max(window_min + 1e-6, train_max)
-
-    prices = np.linspace(window_min, window_max, max(2, int(n_grid)))
-    results = []
-
-    current_sim = simulate_horizon_profit(base_row, current_price_raw, future_dates_df, direct_models, baseline_models, base_history, base_ctx, elasticity_map, pooled_elasticity, w_direct, allow_extrapolate=allow_extrapolate)
-    current_profit = float(np.nansum(current_sim["daily_profits"]))
-    current_adjusted = float(current_sim["adjusted_profit"])
-    current_demand = float(np.nansum(current_sim["daily_demands"]))
-
-    for p in prices:
-        sim = simulate_horizon_profit(base_row, float(p), future_dates_df, direct_models, baseline_models, base_history, base_ctx, elasticity_map, pooled_elasticity, w_direct, allow_extrapolate=allow_extrapolate)
-        demand_sum = float(np.nansum(sim["daily_demands"]))
-        demand_drop_rel = (demand_sum - current_demand) / max(current_demand, 1e-9)
-        mean_std = float(np.nanmean(sim["std_log"])) if len(sim["std_log"]) else 0.0
-        margin = max(float(sim["price_for_model"]) - cost, 0.0)
-        scale = max(margin * max(current_demand, 1.0), 1.0)
-        demand_penalty = risk_lambda * max(0.0, -demand_drop_rel) * scale
-        jump_penalty = price_change_penalty * abs((float(p) - current_price_model) / max(current_price_model, 1e-9)) * scale
-        quad_penalty = CONFIG["QUAD_PENALTY_COEF"] * ((float(p) - current_price_model) ** 2) * scale
-        adjusted = float(sim["adjusted_profit"] - demand_penalty - jump_penalty - quad_penalty)
-        results.append({"price": float(p), "raw_profit": float(sim["total_profit"]), "adjusted_profit": float(adjusted), "demand_sum": demand_sum, "mean_std": mean_std, "daily": sim["daily"], "ood_flag": bool(sim["ood_flag"]), "uncertainty_penalty": float(sim["uncertainty_penalty"]), "disagreement_penalty": float(sim["disagreement_penalty"]), "demand_penalty": float(demand_penalty), "jump_penalty": float(jump_penalty), "quad_penalty": float(quad_penalty)})
-
-    if len(results) == 0:
-        return {"prices": np.array([]), "results": [], "best_idx": None, "best_price": None, "best_profit_adjusted": None, "best_profit_raw": None, "best_daily": None, "ml_best_price": None, "ml_best_profit_raw": None, "ml_best_daily": None, "current_profit_raw": current_profit, "current_profit_adjusted": current_adjusted, "explain": "No valid candidate prices found within search window."}
-
-    best_idx = int(np.nanargmax([r["adjusted_profit"] for r in results]))
-    ml_best_idx = int(np.nanargmax([r["raw_profit"] for r in results]))
-    best = results[best_idx]
-    ml_best = results[ml_best_idx]
-    return {
-        "prices": np.array([r["price"] for r in results]),
-        "results": results,
-        "best_idx": best_idx,
-        "best_price": float(best["price"]),
-        "best_profit_adjusted": float(best["adjusted_profit"]),
-        "best_profit_raw": float(best["raw_profit"]),
-        "best_daily": best["daily"],
-        "ml_best_price": float(ml_best["price"]),
-        "ml_best_profit_raw": float(ml_best["raw_profit"]),
-        "ml_best_daily": ml_best["daily"],
-        "current_profit_raw": float(current_profit),
-        "current_profit_adjusted": float(current_adjusted),
-        "explain": {"search_min": float(window_min), "search_max": float(window_max), "n_candidates": len(results), "train_range": (float(train_min), float(train_max)), "current_price": float(current_price_raw), "pricing_w_direct": float(w_direct if w_direct is not None else 0.0)},
-    }
-
-
-def decision_flag(base_row: Dict[str, Any], rec: Dict[str, Any]) -> Dict[str, Any]:
-    current_price = float(base_row.get("price", 1.0))
-    best_price = float(rec["best_price"]) if rec.get("best_price") is not None else current_price
-    current_adjusted = float(rec.get("current_profit_adjusted", rec.get("current_profit_raw", 0.0)))
-    best_adjusted = float(rec.get("best_profit_adjusted", 0.0))
-    improvement = best_adjusted - current_adjusted
-    rel_imp = improvement / max(1e-3, abs(current_adjusted))
-    ood = bool(base_row.get("_ood_flag", False))
-    best_step = abs(best_price - current_price) / max(current_price, 1e-9)
-    big_step = bool(best_step > CONFIG["MAX_REL_STEP"])
-    profit_ok = bool((rel_imp >= CONFIG["MIN_PROFIT_REL_IMPROV"]) or (improvement >= CONFIG["ABSOLUTE_MIN_PROFIT_IMPROV"]))
-    auto_apply = (not ood) and (not big_step) and profit_ok
-    return {"auto_apply": bool(auto_apply), "reasons": {"ood": bool(ood), "big_step": bool(big_step), "profit_ok": bool(profit_ok), "rel_imp": float(rel_imp), "improvement": float(improvement), "current_adjusted": float(current_adjusted), "best_adjusted": float(best_adjusted)}}
-
-
-@st.cache_resource
-def run_full_pricing_analysis(orders: pd.DataFrame, order_items: pd.DataFrame, products: pd.DataFrame, reviews: pd.DataFrame, target_category: str, target_sku: str):
-    raw_df = build_raw_frame(orders, order_items, products, reviews)
-    if len(raw_df) == 0:
-        raise ValueError("После объединения данных не осталось строк.")
-    sku_df = raw_df[(raw_df["product_category_name"] == target_category) & (raw_df["product_id"].astype(str) == str(target_sku))].copy()
-    if len(sku_df) == 0:
-        raise ValueError("Для выбранной категории и SKU нет данных.")
-
-    total_sales = len(sku_df)
-    small_data_mode = total_sales < CONFIG["MIN_ML_SALES"] or CONFIG.get("FORCE_ENHANCED_MODE", False)
-
-    daily_base = build_daily_sku_frame(sku_df, target_sku)
-    if small_data_mode:
-        daily_base = robust_clean_dirty_data(daily_base)
-    daily_base = build_feature_matrix(daily_base).dropna(subset=["sales", "price", "log_sales", "log_price"]).reset_index(drop=True)
-    if len(daily_base) < 5:
-        raise ValueError("Слишком мало дневных наблюдений после агрегации для обучения модели.")
-
-    all_feats = list(dict.fromkeys(DIRECT_FEATURES + BASELINE_FEATURES))
-    n = len(daily_base)
-    train_end, val_end = _safe_split_sizes(n)
-    train_raw = daily_base.iloc[:train_end].copy().reset_index(drop=True)
-    val_raw = daily_base.iloc[train_end:val_end].copy().reset_index(drop=True)
-    test_raw = daily_base.iloc[val_end:].copy().reset_index(drop=True)
-
-    global FEATURE_STATS
-    FEATURE_STATS = fit_feature_stats(train_raw, all_feats)
-
-    train_df = clean_feature_frame(train_raw, all_feats, FEATURE_STATS)
-    val_df = clean_feature_frame(val_raw, all_feats, FEATURE_STATS)
-    test_df = clean_feature_frame(test_raw, all_feats, FEATURE_STATS)
-
-    if small_data_mode and len(train_df) < 300:
-        train_df = clean_feature_frame(augment_price_variations(train_df), all_feats, FEATURE_STATS)
-
-    X_train_direct = train_df[DIRECT_FEATURES].astype(float).copy()
-    y_train = train_df["log_sales"].astype(float).copy()
-    X_train_base = train_df[BASELINE_FEATURES].astype(float).copy()
-
-    base_ctx = current_price_context(daily_base)
-    base_ctx["category"] = target_category
-    base_ctx["product_id"] = target_sku
-
-    fixed_log_price_coef = estimate_pooled_elasticity(train_df, small_mode=small_data_mode)
-    shrunk_random_effects, _ = compute_monthly_group_elasticities(train_df, fixed_log_price_coef, small_mode=small_data_mode)
-
-    daily_base["elasticity_group"] = daily_base["date"].dt.to_period("M").astype(str).map(shrunk_random_effects).fillna(fixed_log_price_coef)
-    train_df = clean_feature_frame(train_df, all_feats, FEATURE_STATS)
-    val_df = clean_feature_frame(val_df, all_feats, FEATURE_STATS)
-    test_df = clean_feature_frame(test_df, all_feats, FEATURE_STATS)
-
-    direct_models = build_models(X_train_direct, y_train, DIRECT_FEATURES, n_models=CONFIG["ENSEMBLE_SIZE"], kind="direct", small_mode=small_data_mode)
-    baseline_models = build_models(X_train_base, y_train, BASELINE_FEATURES, n_models=CONFIG["ENSEMBLE_SIZE"], kind="baseline", small_mode=small_data_mode)
-
-    w_direct, _ = choose_blend_weight(val_df, direct_models, baseline_models, shrunk_random_effects, fixed_log_price_coef)
-
-    holdout_metrics = eval_prediction_frame(test_df, blended_predict_log(test_df, direct_models, baseline_models, shrunk_random_effects, fixed_log_price_coef, w_direct), label="holdout") if len(test_df) > 0 else {"rmse": float("nan"), "mae": float("nan"), "mape": float("nan"), "smape": float("nan"), "wape": float("nan"), "sigma_log": float("nan")}
-
-    latest_row = dict(base_ctx)
-    latest_row["requested_price"] = float(base_ctx.get("price", train_df["price"].median()))
-    latest_row["_ood_flag"] = bool(not is_price_plausible(float(latest_row["requested_price"]), float(train_df["price"].min()), float(train_df["price"].max()), margin=0.25))
-
-    rec = recommend_price_horizon(latest_row, direct_models, baseline_models, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef, w_direct)
-    future_dates = forecast_future_dates(pd.Timestamp(daily_base["date"].max()))
-
-    current_sim = simulate_horizon_profit(latest_row, float(base_ctx.get("price")), future_dates, direct_models, baseline_models, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef, w_direct)
-    optimal_sim = simulate_horizon_profit(latest_row, float(rec["best_price"]), future_dates, direct_models, baseline_models, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef, w_direct)
-
-    profit_curve_df = pd.DataFrame([{"price": p, "adjusted_profit": simulate_horizon_profit(latest_row, p, future_dates, direct_models, baseline_models, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef, w_direct)["adjusted_profit"]} for p in np.linspace(float(base_ctx.get("price")) * 0.8, float(base_ctx.get("price")) * 1.2, 50)])
-
-    excel_buffer = BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        daily_base.to_excel(writer, sheet_name="История", index=False)
-        current_sim["daily"].to_excel(writer, sheet_name="Прогноз_текущая", index=False)
-        optimal_sim["daily"].to_excel(writer, sheet_name="Прогноз_оптимальная", index=False)
-        profit_curve_df.to_excel(writer, sheet_name="Кривая_прибыли", index=False)
-        pd.DataFrame([holdout_metrics]).to_excel(writer, sheet_name="Метрики", index=False)
-        pd.DataFrame(list(shrunk_random_effects.items()), columns=["Месяц", "Эластичность"]).to_excel(writer, sheet_name="Эластичность", index=False)
-    excel_buffer.seek(0)
-
-    profit_lift_pct = ((optimal_sim["adjusted_profit"] - current_sim["adjusted_profit"]) / max(current_sim["adjusted_profit"], 1) * 100) if current_sim["adjusted_profit"] > 0 else 0
-
-    return {
-        "daily": daily_base,
-        "recommendation": rec,
-        "forecast_current": current_sim["daily"],
-        "forecast_optimal": optimal_sim["daily"],
-        "profit_curve": profit_curve_df,
-        "holdout_metrics": pd.DataFrame([holdout_metrics]),
-        "elasticity_map": shrunk_random_effects,
-        "current_price": float(base_ctx.get("price")),
-        "best_price": float(rec.get("best_price")),
-        "current_profit": float(current_sim.get("adjusted_profit", current_sim.get("total_profit", 0.0))),
-        "best_profit": float(optimal_sim.get("adjusted_profit", optimal_sim.get("total_profit", 0.0))),
-        "profit_lift_pct": profit_lift_pct,
-        "excel_buffer": excel_buffer,
-        "flag": decision_flag(latest_row, rec),
-        "_trained_bundle": {
-            "direct_models": direct_models,
-            "baseline_models": baseline_models,
-            "daily_base": daily_base,
-            "base_ctx": base_ctx,
-            "latest_row": latest_row,
-            "future_dates": future_dates,
-            "elasticity_map": shrunk_random_effects,
-            "pooled_elasticity": fixed_log_price_coef,
-            "w_direct": w_direct,
-        },
-    }
-
-
 @st.cache_resource
 def run_full_pricing_analysis_universal(
     normalized_txn: pd.DataFrame,
@@ -1438,52 +920,60 @@ def run_full_pricing_analysis_universal(
     txn = normalized_txn.copy()
     if len(txn) == 0:
         raise ValueError("Пустой датасет после нормализации.")
-    daily_base = build_daily_from_transactions(txn, target_sku, region=region, channel=channel, segment=segment)
+    daily_base = build_daily_from_transactions(
+        txn,
+        target_sku,
+        target_category=target_category,
+        region=region,
+        channel=channel,
+        segment=segment,
+    )
     daily_base = robust_clean_dirty_data(daily_base)
     daily_base = build_feature_matrix(daily_base).dropna(subset=["sales", "price", "log_sales", "log_price"]).reset_index(drop=True)
     if len(daily_base) < 5:
         raise ValueError("Слишком мало дневных наблюдений после агрегации.")
 
     n = len(daily_base)
-    train_end, val_end = _safe_split_sizes(n)
+    train_end = max(3, int(n * 0.8))
+    train_end = min(train_end, n - 1)
     train_raw = daily_base.iloc[:train_end].copy().reset_index(drop=True)
-    val_raw = daily_base.iloc[train_end:val_end].copy().reset_index(drop=True)
-    test_raw = daily_base.iloc[val_end:].copy().reset_index(drop=True)
+    test_raw = daily_base.iloc[train_end:].copy().reset_index(drop=True)
     if "promotion" not in train_raw.columns:
         train_raw["promotion"] = 0.0
     if "freight_value" not in train_raw.columns:
         train_raw["freight_value"] = 0.0
     train_raw["promo_x_weekend"] = train_raw["promotion"].astype(float) * train_raw["is_weekend"].astype(float)
 
+    small_mode = detect_small_mode(daily_base)
     baseline_features_used = select_eligible_features(train_raw, BASELINE_FEATURES)
     uplift_candidates = UPLIFT_FEATURES.copy()
     if "review_score" in train_raw.columns and train_raw["review_score"].nunique(dropna=True) > 3:
         uplift_candidates.append("review_score")
-    uplift_features_used = select_eligible_features(train_raw, uplift_candidates)
+    pre_uplift_features = [f for f in uplift_candidates if f not in {"baseline_log_feature", "promo_x_weekend"}]
 
-    all_feats = list(dict.fromkeys(baseline_features_used + uplift_features_used + ["promotion", "freight_value", "net_unit_price", "price", "date", "log_sales"]))
+    all_feats = list(dict.fromkeys(baseline_features_used + pre_uplift_features + ["promotion", "freight_value", "net_unit_price", "price", "date", "log_sales"]))
     global FEATURE_STATS
     FEATURE_STATS = fit_feature_stats(train_raw, [f for f in all_feats if f not in {"date"}])
     train_df = clean_feature_frame(train_raw.copy(), [f for f in all_feats if f not in {"date"}], FEATURE_STATS)
-    val_df = clean_feature_frame(val_raw.copy(), [f for f in all_feats if f not in {"date"}], FEATURE_STATS)
     test_df = clean_feature_frame(test_raw.copy(), [f for f in all_feats if f not in {"date"}], FEATURE_STATS)
 
     y_train = train_df["log_sales"].astype(float).copy()
     X_train_base = train_df[baseline_features_used].astype(float).copy()
-    baseline_models = build_models(X_train_base, y_train, baseline_features_used, kind="baseline", small_mode=True)
+    baseline_models = build_models(X_train_base, y_train, baseline_features_used, kind="baseline", small_mode=small_mode)
     baseline_bundle = {"models": baseline_models, "features": baseline_features_used, "feature_stats": FEATURE_STATS}
 
     base_log_oof = make_walk_forward_oof_baseline(train_df.copy(), baseline_features_used, n_splits=4)
-    fixed_log_price_coef = estimate_pooled_elasticity(train_df, small_mode=True)
-    shrunk_random_effects, _ = compute_monthly_group_elasticities(train_df, fixed_log_price_coef, small_mode=True)
+    fixed_log_price_coef = estimate_pooled_elasticity(train_df, small_mode=small_mode)
+    shrunk_random_effects, _ = compute_monthly_group_elasticities(train_df, fixed_log_price_coef, small_mode=small_mode)
     ref_net_price = safe_median(train_df.get("net_unit_price", train_df["price"]), safe_median(train_df["price"], 1.0))
     train_df["price_effect_log_obs"] = calc_observed_price_effect_log(train_df, shrunk_random_effects, fixed_log_price_coef, ref_net_price=ref_net_price)
     train_df["uplift_target_log"] = (train_df["log_sales"] - base_log_oof - train_df["price_effect_log_obs"]).clip(-0.7, 0.7)
     train_df["baseline_log_feature"] = base_log_oof
     train_df["promo_x_weekend"] = train_df.get("promotion", pd.Series(np.zeros(len(train_df)))).astype(float) * train_df.get("is_weekend", pd.Series(np.zeros(len(train_df)))).astype(float)
+    uplift_features_used = select_eligible_features(train_df, uplift_candidates)
 
     X_train_uplift = train_df[uplift_features_used].astype(float).copy()
-    uplift_models = build_models(X_train_uplift, train_df["uplift_target_log"].astype(float), uplift_features_used, kind="uplift", small_mode=True)
+    uplift_models = build_models(X_train_uplift, train_df["uplift_target_log"].astype(float), uplift_features_used, kind="uplift", small_mode=small_mode)
     uplift_bundle = {"models": uplift_models, "features": uplift_features_used, "feature_stats": FEATURE_STATS}
 
     if len(test_df) > 0:
@@ -1500,16 +990,36 @@ def run_full_pricing_analysis_universal(
             "date": pd.to_datetime(test_df["date"]).dt.strftime("%Y-%m-%d"),
             "series_id": str(target_sku),
             "actual_sales": test_df["sales"].astype(float).values,
-            "pred_baseline": np.expm1(base_log).clip(min=0.0),
-            "pred_price_effect_component": np.expm1(price_effect_log).clip(min=0.0),
-            "pred_uplift_component": np.expm1(uplift_log).clip(min=0.0),
-            "pred_final": np.expm1(final_log).clip(min=0.0),
+            "baseline_pred_sales": np.expm1(base_log).clip(min=0.0),
+            "price_effect_multiplier": np.exp(price_effect_log),
+            "uplift_multiplier": np.exp(uplift_log),
+            "final_pred_sales": np.expm1(final_log).clip(min=0.0),
         })
-        holdout_predictions["abs_error"] = np.abs(holdout_predictions["actual_sales"] - holdout_predictions["pred_final"])
-        holdout_predictions["signed_error"] = holdout_predictions["pred_final"] - holdout_predictions["actual_sales"]
+        holdout_predictions["abs_error"] = np.abs(holdout_predictions["actual_sales"] - holdout_predictions["final_pred_sales"])
+        holdout_predictions["signed_error"] = holdout_predictions["final_pred_sales"] - holdout_predictions["actual_sales"]
     else:
         holdout_metrics = {"rmse": float("nan"), "mae": float("nan"), "mape": float("nan"), "smape": float("nan"), "wape": float("nan"), "sigma_log": float("nan")}
-        holdout_predictions = pd.DataFrame(columns=["date", "series_id", "actual_sales", "pred_baseline", "pred_price_effect_component", "pred_uplift_component", "pred_final", "abs_error", "signed_error"])
+        holdout_predictions = pd.DataFrame(columns=["date", "series_id", "actual_sales", "baseline_pred_sales", "price_effect_multiplier", "uplift_multiplier", "final_pred_sales", "abs_error", "signed_error"])
+
+    full_raw = daily_base.copy()
+    full_raw["promo_x_weekend"] = full_raw.get("promotion", pd.Series(np.zeros(len(full_raw)))).astype(float) * full_raw.get("is_weekend", pd.Series(np.zeros(len(full_raw)))).astype(float)
+    full_feats = list(dict.fromkeys(baseline_features_used + uplift_features_used + ["promotion", "freight_value", "net_unit_price", "price", "log_sales"]))
+    FEATURE_STATS = fit_feature_stats(full_raw, full_feats)
+    full_df = clean_feature_frame(full_raw.copy(), full_feats, FEATURE_STATS)
+    y_full = full_df["log_sales"].astype(float).copy()
+    full_baseline_models = build_models(full_df[baseline_features_used].astype(float), y_full, baseline_features_used, kind="baseline", small_mode=small_mode)
+    baseline_bundle = {"models": full_baseline_models, "features": baseline_features_used, "feature_stats": FEATURE_STATS}
+    full_base_log_oof = make_walk_forward_oof_baseline(full_df.copy(), baseline_features_used, n_splits=4)
+    fixed_log_price_coef = estimate_pooled_elasticity(full_df, small_mode=small_mode)
+    shrunk_random_effects, _ = compute_monthly_group_elasticities(full_df, fixed_log_price_coef, small_mode=small_mode)
+    ref_net_price = safe_median(full_df.get("net_unit_price", full_df["price"]), safe_median(full_df["price"], 1.0))
+    full_df["price_effect_log_obs"] = calc_observed_price_effect_log(full_df, shrunk_random_effects, fixed_log_price_coef, ref_net_price=ref_net_price)
+    full_df["uplift_target_log"] = (full_df["log_sales"] - full_base_log_oof - full_df["price_effect_log_obs"]).clip(-0.7, 0.7)
+    full_df["baseline_log_feature"] = full_base_log_oof
+    full_df["promo_x_weekend"] = full_df.get("promotion", pd.Series(np.zeros(len(full_df)))).astype(float) * full_df.get("is_weekend", pd.Series(np.zeros(len(full_df)))).astype(float)
+    uplift_features_used = select_eligible_features(full_df, uplift_candidates)
+    full_uplift_models = build_models(full_df[uplift_features_used].astype(float), full_df["uplift_target_log"].astype(float), uplift_features_used, kind="uplift", small_mode=small_mode)
+    uplift_bundle = {"models": full_uplift_models, "features": uplift_features_used, "feature_stats": FEATURE_STATS}
 
     base_ctx = current_price_context(daily_base)
     base_ctx["category"] = target_category
@@ -1544,9 +1054,11 @@ def run_full_pricing_analysis_universal(
                 "source_found": bool(source_found),
                 "source_missing_share": source_missing,
                 "source_unique_count": source_unique,
-                "eligible_for_model": bool(source_found and source_unique > 1),
-                "listed_in_feature_set": bool((f in UPLIFT_FEATURES or f in BASELINE_FEATURES)),
-                "fallback_only": bool((not source_found) and (f in train_df.columns)),
+                "present_in_daily": bool(source_found),
+                "used_in_baseline": bool(f in baseline_features_used),
+                "used_in_uplift": bool(f in uplift_features_used),
+                "used_in_price_effect": bool(f in {"price", "discount", "net_unit_price"}),
+                "used_only_in_economics": bool(f in {"cost", "stock"}),
             }
         )
     feature_usage_report = pd.DataFrame(feature_usage_rows)
@@ -1589,11 +1101,11 @@ def run_full_pricing_analysis_universal(
         columns={
             "feature": "factor_name",
             "source_found": "found_raw",
-            "eligible_for_model": "used_in_model",
         }
     ).copy()
     feature_report["aggregated_daily"] = feature_report["found_raw"]
     feature_report["used_in_scenario"] = feature_report["factor_name"].isin(["price", "discount", "promotion", "freight_value", "cost", "stock"])
+    feature_report["used_in_model"] = feature_report["used_in_baseline"] | feature_report["used_in_uplift"] | feature_report["used_in_price_effect"]
     feature_report["role"] = feature_report["factor_name"].map({f.name: f.role for f in CANONICAL_FIELDS}).fillna("unknown")
     feature_report["dtype"] = feature_report["factor_name"].map({f.name: f.dtype for f in CANONICAL_FIELDS}).fillna("unknown")
     feature_report["missing_share"] = feature_report["source_missing_share"]
@@ -1609,9 +1121,9 @@ def run_full_pricing_analysis_universal(
             "series_id": str(target_sku),
             "category": str(target_category),
             "train_period": [str(train_df["date"].min()) if "date" in train_df.columns else None, str(train_df["date"].max()) if "date" in train_df.columns else None],
-            "validation_period": [str(val_raw["date"].min()) if "date" in val_raw.columns else None, str(val_raw["date"].max()) if "date" in val_raw.columns else None],
+            "validation_period": [None, None],
             "holdout_period": [str(test_df["date"].min()) if "date" in test_df.columns else None, str(test_df["date"].max()) if "date" in test_df.columns else None],
-            "fit_scope": "train_only",
+            "fit_scope": "refit_full_history",
             "horizon_days": int(len(future_dates)),
             "baseline_features": baseline_features_used,
             "uplift_features": uplift_features_used,
@@ -1632,14 +1144,16 @@ def run_full_pricing_analysis_universal(
             "baseline_profit_total": float(baseline_sim["daily"]["profit"].sum()),
             "as_is_profit_total": float(as_is_sim["daily"]["profit"].sum()),
             "scenario_profit_total": float(scenario_sim["daily"]["profit"].sum()) if scenario_sim else float("nan"),
-            "corr_final": float(np.corrcoef(holdout_predictions["actual_sales"], holdout_predictions["pred_final"])[0, 1]) if len(holdout_predictions) > 1 else float("nan"),
-            "std_ratio_final": float(np.std(holdout_predictions["pred_final"], ddof=0) / max(np.std(holdout_predictions["actual_sales"], ddof=0), 1e-9)) if len(holdout_predictions) > 1 else float("nan"),
+            "corr_final": float(np.corrcoef(holdout_predictions["actual_sales"], holdout_predictions["final_pred_sales"])[0, 1]) if len(holdout_predictions) > 1 else float("nan"),
+            "std_ratio_final": float(np.std(holdout_predictions["final_pred_sales"], ddof=0) / max(np.std(holdout_predictions["actual_sales"], ddof=0), 1e-9)) if len(holdout_predictions) > 1 else float("nan"),
             "bias_mean": float(holdout_predictions["signed_error"].mean()) if len(holdout_predictions) else float("nan"),
             "bias_median": float(holdout_predictions["signed_error"].median()) if len(holdout_predictions) else float("nan"),
-            "wape_baseline": float(calculate_wape(holdout_predictions["actual_sales"], holdout_predictions["pred_baseline"])) if len(holdout_predictions) else float("nan"),
-            "wape_final": float(calculate_wape(holdout_predictions["actual_sales"], holdout_predictions["pred_final"])) if len(holdout_predictions) else float("nan"),
-            "wape_promo_days": float(calculate_wape(test_df[test_df.get("promotion", 0.0) > 0]["sales"], holdout_predictions.loc[test_df.get("promotion", 0.0) > 0, "pred_final"])) if len(test_df) and (test_df.get("promotion", pd.Series([0.0] * len(test_df))) > 0).any() else float("nan"),
-            "wape_non_promo_days": float(calculate_wape(test_df[test_df.get("promotion", 0.0) <= 0]["sales"], holdout_predictions.loc[test_df.get("promotion", 0.0) <= 0, "pred_final"])) if len(test_df) else float("nan"),
+            "wape_baseline": float(calculate_wape(holdout_predictions["actual_sales"], holdout_predictions["baseline_pred_sales"])) if len(holdout_predictions) else float("nan"),
+            "wape_final": float(calculate_wape(holdout_predictions["actual_sales"], holdout_predictions["final_pred_sales"])) if len(holdout_predictions) else float("nan"),
+            "wape_zero_demand": float(calculate_wape(holdout_predictions.loc[holdout_predictions["actual_sales"] <= 0, "actual_sales"], holdout_predictions.loc[holdout_predictions["actual_sales"] <= 0, "final_pred_sales"])) if len(holdout_predictions) else float("nan"),
+            "wape_positive_demand": float(calculate_wape(holdout_predictions.loc[holdout_predictions["actual_sales"] > 0, "actual_sales"], holdout_predictions.loc[holdout_predictions["actual_sales"] > 0, "final_pred_sales"])) if len(holdout_predictions) else float("nan"),
+            "wape_promo_days": float(calculate_wape(test_df[test_df.get("promotion", 0.0) > 0]["sales"], holdout_predictions.loc[test_df.get("promotion", 0.0) > 0, "final_pred_sales"])) if len(test_df) and (test_df.get("promotion", pd.Series([0.0] * len(test_df))) > 0).any() else float("nan"),
+            "wape_non_promo_days": float(calculate_wape(test_df[test_df.get("promotion", 0.0) <= 0]["sales"], holdout_predictions.loc[test_df.get("promotion", 0.0) <= 0, "final_pred_sales"])) if len(test_df) else float("nan"),
         },
     }
     current_price = float(base_ctx.get("price"))
@@ -1727,13 +1241,6 @@ def run_what_if_projection(
     if float(demand_multiplier) != 1.0:
         scenario_overrides["manual_shock_multiplier"] = float(demand_multiplier)
 
-    if "freight_value" in current_ctx and "freight_value" not in scenario_overrides:
-        scenario_overrides["freight_value"] = float(current_ctx["freight_value"]) * float(freight_multiplier)
-    if "discount" in current_ctx and "discount" not in scenario_overrides:
-        scenario_overrides["discount"] = float(current_ctx["discount"]) * float(scenario_overrides.get("discount_multiplier", 1.0))
-    if "cost" in current_ctx and "cost" not in scenario_overrides:
-        scenario_overrides["cost"] = float(current_ctx["cost"]) * float(scenario_overrides.get("cost_multiplier", 1.0))
-
     future_dates = trained_bundle["future_dates"]
     if horizon_days is not None:
         future_dates = forecast_future_dates(pd.Timestamp(base_history["date"].max()), n_days=int(horizon_days))
@@ -1752,11 +1259,33 @@ def run_what_if_projection(
     )
     daily = sim["daily"].copy()
     demand_total = float(daily["actual_sales"].sum()) if "actual_sales" in daily.columns else 0.0
-    profit_total = float(daily["profit"].sum()) if "profit" in daily.columns else 0.0
+    profit_total_raw = float(daily["profit"].sum()) if "profit" in daily.columns else 0.0
     revenue_total = float(daily["revenue"].sum()) if "revenue" in daily.columns else 0.0
     lost_sales_total = float(daily["lost_sales"].sum()) if "lost_sales" in daily.columns else 0.0
-    confidence = float(trained_bundle.get("confidence", 0.6))
-    return {"daily": daily, "demand_total": demand_total, "profit_total": profit_total, "revenue_total": revenue_total, "lost_sales_total": lost_sales_total, "confidence": confidence, "uncertainty": 1.0 - confidence}
+    base_confidence = float(trained_bundle.get("confidence", 0.6))
+    ood_penalty = 0.20 if bool(sim.get("ood_flag")) else 0.0
+    horizon_penalty = max(0.0, (len(future_dates) - 30) / 120.0)
+    extreme_penalty = max(0.0, abs(float(freight_multiplier) - 1.0) + abs(float(discount_multiplier) - 1.0) + abs(float(cost_multiplier) - 1.0) - 0.25) * 0.08
+    confidence_scenario = float(np.clip(base_confidence - ood_penalty - horizon_penalty - extreme_penalty, 0.05, 0.99))
+    return {
+        "daily": daily,
+        "demand_total": demand_total,
+        "profit_total": profit_total_raw,
+        "profit_total_raw": profit_total_raw,
+        "profit_total_adjusted": float(sim.get("adjusted_profit", profit_total_raw)),
+        "uncertainty_penalty": float(sim.get("uncertainty_penalty", 0.0)),
+        "disagreement_penalty": float(sim.get("disagreement_penalty", 0.0)),
+        "revenue_total": revenue_total,
+        "lost_sales_total": lost_sales_total,
+        "confidence": confidence_scenario,
+        "confidence_base": base_confidence,
+        "confidence_scenario": confidence_scenario,
+        "uncertainty": 1.0 - confidence_scenario,
+        "ood_flag": bool(sim.get("ood_flag")),
+        "requested_price": float(sim.get("requested_price", manual_price)),
+        "price_for_model": float(sim.get("price_for_model", manual_price)),
+        "price_clipped": bool(abs(float(sim.get("requested_price", manual_price)) - float(sim.get("price_for_model", manual_price))) > 1e-9),
+    }
 
 
 st.set_page_config(page_title="💰 AI What-if Engine", layout="wide", page_icon="💰")
@@ -1943,22 +1472,14 @@ def _metric_card(title: str, value: str, delta_text: str, delta_positive: bool, 
 def render_upload_block() -> Dict[str, Any]:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">Загрузка данных</div>', unsafe_allow_html=True)
-    st.caption("Поддерживаются универсальный формат (1 CSV) и legacy-формат Olist (3 CSV).")
-    load_mode = st.radio("Режим загрузки", ["Universal CSV", "Legacy Olist (3 CSV)"], horizontal=True)
+    st.caption("Поддерживается только Universal CSV (единый контур what-if v1).")
+    load_mode = "Universal CSV"
 
     orders_file = items_file = products_file = reviews_file = None
     universal_file = None
 
-    if load_mode == "Universal CSV":
-        universal_file = st.file_uploader("Universal transactions CSV", type=["csv"], key="universal_file")
-        st.progress(1.0 if universal_file else 0.0, text=f"Обязательные файлы: {1 if universal_file else 0}/1")
-    else:
-        orders_file = st.file_uploader("Orders CSV", type=["csv"], key="orders_file")
-        items_file = st.file_uploader("Items CSV", type=["csv"], key="items_file")
-        products_file = st.file_uploader("Products CSV", type=["csv"], key="products_file")
-        reviews_file = st.file_uploader("Reviews CSV (опционально)", type=["csv"], key="reviews_file")
-        required_files = [orders_file, items_file, products_file]
-        st.progress(sum(x is not None for x in required_files) / 3.0, text=f"Обязательные файлы: {sum(x is not None for x in required_files)}/3")
+    universal_file = st.file_uploader("Universal transactions CSV", type=["csv"], key="universal_file")
+    st.progress(1.0 if universal_file else 0.0, text=f"Обязательные файлы: {1 if universal_file else 0}/1")
 
     raw_for_select = None
     universal_txn = None
@@ -1995,58 +1516,6 @@ def render_upload_block() -> Dict[str, Any]:
                 raw_for_select = universal_txn.copy().rename(columns={"category": "product_category_name", "product_id": "product_id"})
         except Exception as e:
             st.error(f"Ошибка предобработки universal CSV: {e}")
-    elif load_mode != "Universal CSV" and all([orders_file, items_file, products_file]):
-        try:
-            orders_preview = pd.read_csv(orders_file)
-            items_preview = pd.read_csv(items_file)
-            products_preview = pd.read_csv(products_file)
-            reviews_preview = pd.read_csv(reviews_file) if reviews_file else pd.DataFrame()
-
-            with st.expander("⚙️ Сопоставление колонок", expanded=False):
-                orders_cols, items_cols, products_cols = list(orders_preview.columns), list(items_preview.columns), list(products_preview.columns)
-                reviews_cols = list(reviews_preview.columns) if len(reviews_preview) else []
-
-                def pick(label: str, cols: List[str], aliases: List[str], key: str, required: bool = True) -> Optional[str]:
-                    guessed = _suggest_column(cols, aliases)
-                    choices = cols if required else ["<не использовать>"] + cols
-                    idx = choices.index(guessed) if guessed in choices else 0
-                    val = st.selectbox(label, choices, index=idx, key=key)
-                    return None if (not required and val == "<не использовать>") else val
-
-                orders_col_map = {
-                    "order_id": pick("Orders → ID заказа", orders_cols, ["order_id", "orderid", "id_order", "invoice_id"], "map_orders_order_id"),
-                    "order_purchase_timestamp": pick("Orders → Дата", orders_cols, ["order_purchase_timestamp", "purchase_timestamp", "order_date", "date"], "map_orders_ts"),
-                }
-                items_col_map = {
-                    "order_id": pick("Items → ID заказа", items_cols, ["order_id", "orderid", "id_order", "invoice_id"], "map_items_order_id"),
-                    "product_id": pick("Items → SKU", items_cols, ["product_id", "sku", "item_id", "product_sku"], "map_items_product_id"),
-                    "price": pick("Items → Цена", items_cols, ["price", "unit_price", "sale_price"], "map_items_price"),
-                    "freight_value": pick("Items → Freight", items_cols, ["freight_value", "shipping_cost", "delivery_cost"], "map_items_freight", required=False),
-                    "order_item_id": pick("Items → ID позиции", items_cols, ["order_item_id", "item_line_id", "line_id"], "map_items_line", required=False),
-                }
-                products_col_map = {
-                    "product_id": pick("Products → SKU", products_cols, ["product_id", "sku", "item_id", "product_sku"], "map_products_product_id"),
-                    "product_category_name": pick("Products → Категория", products_cols, ["product_category_name", "category", "category_name"], "map_products_category"),
-                }
-                reviews_col_map = {
-                    "order_id": pick("Reviews → ID", reviews_cols, ["order_id", "orderid", "id_order"], "map_reviews_order_id", required=False),
-                    "review_score": pick("Reviews → Score", reviews_cols, ["review_score", "rating", "score"], "map_reviews_score", required=False),
-                    "review_creation_date": pick("Reviews → Date", reviews_cols, ["review_creation_date", "review_date", "date"], "map_reviews_date", required=False),
-                } if len(reviews_preview) else {}
-
-            orders_norm = _rename_with_mapping(orders_preview, orders_col_map)
-            items_norm = _rename_with_mapping(items_preview, items_col_map)
-            products_norm = _rename_with_mapping(products_preview, products_col_map)
-            reviews_norm = _rename_with_mapping(reviews_preview, reviews_col_map) if len(reviews_preview) else pd.DataFrame()
-            if "order_item_id" not in items_norm.columns:
-                items_norm["order_item_id"] = np.arange(1, len(items_norm) + 1)
-            if "freight_value" not in items_norm.columns:
-                items_norm["freight_value"] = 0.0
-
-            raw_for_select = build_raw_frame(orders_norm, items_norm, products_norm, reviews_norm)
-            st.success(f"Предпросмотр готов: {len(raw_for_select):,} строк")
-        except Exception as e:
-            st.error(f"Ошибка предобработки: {e}")
 
     target_category, target_sku = None, None
     if raw_for_select is not None and len(raw_for_select) > 0:
@@ -2162,8 +1631,8 @@ if st.session_state.app_stage == "landing" and st.session_state.results is None:
 </div>
 <div class="guide-box">
   <ol>
-    <li>Загрузите 3 обязательных CSV (Orders, Items, Products).</li>
-    <li>Проверьте маппинг колонок в блоке «Сопоставление колонок».</li>
+    <li>Загрузите Universal CSV c транзакциями.</li>
+    <li>Проверьте маппинг колонок в блоке «Сопоставление колонок (каноническая схема)».</li>
     <li>Выберите категорию и SKU, затем нажмите «🚀 Запустить анализ».</li>
   </ol>
 </div>
@@ -2196,7 +1665,7 @@ else:
         ctx = render_upload_block()
 
 if ctx and ctx.get("run_requested"):
-    load_mode = ctx.get("load_mode", "Legacy Olist (3 CSV)")
+    load_mode = ctx.get("load_mode", "Universal CSV")
     orders_file = ctx.get("orders_file")
     items_file = ctx.get("items_file")
     products_file = ctx.get("products_file")
@@ -2205,33 +1674,16 @@ if ctx and ctx.get("run_requested"):
     target_sku = ctx["target_sku"]
     if load_mode == "Universal CSV" and ctx.get("universal_txn") is None:
         st.error("Загрузите и сопоставьте universal CSV.")
-    elif load_mode != "Universal CSV" and not (orders_file and items_file and products_file):
-        st.error("Загрузите минимум 3 обязательных файла.")
     elif target_category is None or target_sku is None:
         st.error("Выберите категорию и SKU для анализа.")
     else:
         with st.spinner("Модель обучается…"):
             try:
-                if load_mode == "Universal CSV":
-                    results = run_full_pricing_analysis_universal(
-                        ctx["universal_txn"],
-                        target_category,
-                        target_sku,
-                    )
-                else:
-                    orders_file.seek(0); items_file.seek(0); products_file.seek(0)
-                    if reviews_file: reviews_file.seek(0)
-                    orders = pd.read_csv(orders_file)
-                    items = pd.read_csv(items_file)
-                    products = pd.read_csv(products_file)
-                    reviews = pd.read_csv(reviews_file) if reviews_file else pd.DataFrame()
-                    orders = _rename_with_mapping(orders, ctx["orders_col_map"]) if ctx["orders_col_map"] else orders
-                    items = _rename_with_mapping(items, ctx["items_col_map"]) if ctx["items_col_map"] else items
-                    products = _rename_with_mapping(products, ctx["products_col_map"]) if ctx["products_col_map"] else products
-                    reviews = _rename_with_mapping(reviews, ctx["reviews_col_map"]) if ctx["reviews_col_map"] and len(reviews) else reviews
-                    if "order_item_id" not in items.columns: items["order_item_id"] = np.arange(1, len(items) + 1)
-                    if "freight_value" not in items.columns: items["freight_value"] = 0.0
-                    results = run_full_pricing_analysis(orders, items, products, reviews, target_category, target_sku)
+                results = run_full_pricing_analysis_universal(
+                    ctx["universal_txn"],
+                    target_category,
+                    target_sku,
+                )
                 st.session_state.results = results
                 st.session_state.selected_category_for_results = target_category
                 st.session_state.selected_sku_for_results = target_sku
@@ -2340,6 +1792,12 @@ if st.session_state.results is not None:
 
         if st.button("Пересчитать сценарий", use_container_width=True):
             st.session_state.what_if_result = run_what_if_projection(r["_trained_bundle"], manual_price=float(manual_price), freight_multiplier=float(freight_mult), demand_multiplier=float(demand_mult), horizon_days=int(horizon_days))
+            if st.session_state.what_if_result is not None:
+                wr = st.session_state.what_if_result
+                r["scenario_forecast"] = wr["daily"]
+                r["scenario_price"] = float(wr.get("requested_price", manual_price))
+                r["best_profit"] = float(wr.get("profit_total_adjusted", wr.get("profit_total", 0.0)))
+                r["profit_lift_pct"] = ((r["best_profit"] - r["current_profit"]) / max(abs(r["current_profit"]), 1e-9)) * 100.0
 
         if st.session_state.what_if_result is not None:
             w = st.session_state.what_if_result
@@ -2358,12 +1816,19 @@ if st.session_state.results is not None:
             st.plotly_chart(fig_wp, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
 
             delta_d = float(w["demand_total"] - base["base"].sum())
-            delta_p = float(w["profit_total"] - r["current_profit"])
+            delta_p = float(w["profit_total_adjusted"] - r["current_profit"])
             delta_r = float(w["revenue_total"] - current_forecast["revenue"].sum())
             m1, m2, m3 = st.columns(3)
             m1.metric("Δ Спрос", f"{delta_d:+.1f}")
             m2.metric("Δ Прибыль", f"₽ {delta_p:+,.0f}")
             m3.metric("Δ Выручка", f"₽ {delta_r:+,.0f}")
+            st.caption(
+                f"Requested price: {w['requested_price']:.2f} | Modeled price: {w['price_for_model']:.2f} | "
+                f"Profit raw: {w['profit_total_raw']:.0f} | Profit adjusted: {w['profit_total_adjusted']:.0f} | "
+                f"Penalty: {w['uncertainty_penalty']:.0f}"
+            )
+            if w.get("ood_flag") or w.get("price_clipped"):
+                st.warning("Цена вне обученного диапазона: модель использовала clipped price.")
             st.markdown('<div class="micro-note">Положительные дельты показывают улучшение относительно базового сценария.</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -2414,12 +1879,13 @@ if st.session_state.results is not None:
         if "feature_usage_report" in r:
             st.markdown("**Feature usage diagnostics**")
             st.dataframe(r["feature_usage_report"], use_container_width=True, height=220)
-            st.caption("`eligible_for_model` — кандидатность (наличие+вариативность), `listed_in_feature_set` — только включение в шаблон признаков, не причинная важность.")
+            st.caption("Поля `used_in_baseline/used_in_uplift/used_in_price_effect` показывают фактическое использование факторов.")
     with tabs[2]:
+        scenario_table_src = scenario_forecast if scenario_forecast is not None else current_forecast.copy()
         full_table = current_forecast[["date", "actual_sales", "revenue", "profit"]].rename(
             columns={"actual_sales": "sales_current", "revenue": "revenue_current", "profit": "profit_current"}
         ).merge(
-            scenario_forecast[["date", "actual_sales", "revenue", "profit"]].rename(
+            scenario_table_src[["date", "actual_sales", "revenue", "profit"]].rename(
                 columns={"actual_sales": "sales_scenario", "revenue": "revenue_scenario", "profit": "profit_scenario"}
             ),
             on="date",
