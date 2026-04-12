@@ -436,6 +436,27 @@ UPLIFT_FEATURES: List[str] = [
     "promo_x_weekend",
 ]
 
+WEEKLY_MODEL_FEATURES: List[str] = [
+    "sales_lag1w",
+    "sales_lag2w",
+    "sales_lag4w",
+    "sales_lag8w",
+    "sales_ma4w",
+    "sales_ma8w",
+    "sales_ma12w",
+    "sales_std4w",
+    "sales_std8w",
+    "week_sin",
+    "week_cos",
+    "trend_idx",
+    "net_price_mean",
+    "discount_mean",
+    "promotion_share",
+    "freight_mean",
+    "stock_mean",
+    "stockout_share",
+]
+
 
 def select_eligible_features(df: pd.DataFrame, candidates: List[str], min_unique: int = 2) -> List[str]:
     keep: List[str] = []
@@ -705,6 +726,205 @@ def current_price_context(base_df: pd.DataFrame) -> Dict[str, Any]:
     return base_df.iloc[-1].to_dict()
 
 
+def build_weekly_model_frame(daily_df: pd.DataFrame) -> pd.DataFrame:
+    frame = daily_df.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame["week_start"] = frame["date"] - pd.to_timedelta(frame["date"].dt.dayofweek, unit="D")
+    frame["net_unit_price"] = pd.to_numeric(frame.get("net_unit_price", frame.get("price", 0.0)), errors="coerce")
+    frame["stock"] = pd.to_numeric(frame.get("stock", pd.Series(np.zeros(len(frame)))), errors="coerce").fillna(0.0)
+    frame["promotion"] = pd.to_numeric(frame.get("promotion", pd.Series(np.zeros(len(frame)))), errors="coerce").fillna(0.0)
+    agg = (
+        frame.groupby("week_start", as_index=False)
+        .agg(
+            sales=("sales", "sum"),
+            revenue=("revenue", "sum"),
+            price_mean=("price", "mean"),
+            discount_mean=("discount", "mean"),
+            net_price_mean=("net_unit_price", "mean"),
+            promotion_share=("promotion", "mean"),
+            freight_mean=("freight_value", "mean"),
+            stock_mean=("stock", "mean"),
+            stock_min=("stock", "min"),
+            stockout_share=("stock", lambda s: float((pd.to_numeric(s, errors="coerce").fillna(0.0) <= 0).mean())),
+        )
+        .sort_values("week_start")
+        .reset_index(drop=True)
+    )
+    agg["weekofyear"] = agg["week_start"].dt.isocalendar().week.astype(int)
+    agg["month"] = agg["week_start"].dt.month.astype(int)
+    agg["week_sin"] = np.sin(2 * np.pi * agg["weekofyear"] / 52.0)
+    agg["week_cos"] = np.cos(2 * np.pi * agg["weekofyear"] / 52.0)
+    agg["month_sin"] = np.sin(2 * np.pi * agg["month"] / 12.0)
+    agg["month_cos"] = np.cos(2 * np.pi * agg["month"] / 12.0)
+    agg["trend_idx"] = np.arange(len(agg), dtype=float)
+    return agg
+
+
+def add_weekly_features(weekly_df: pd.DataFrame) -> pd.DataFrame:
+    out = weekly_df.copy().sort_values("week_start").reset_index(drop=True)
+    out["sales"] = pd.to_numeric(out["sales"], errors="coerce").fillna(0.0)
+    out["sales_lag1w"] = out["sales"].shift(1)
+    out["sales_lag2w"] = out["sales"].shift(2)
+    out["sales_lag4w"] = out["sales"].shift(4)
+    out["sales_lag8w"] = out["sales"].shift(8)
+    out["sales_ma4w"] = out["sales"].shift(1).rolling(4, min_periods=2).mean()
+    out["sales_ma8w"] = out["sales"].shift(1).rolling(8, min_periods=4).mean()
+    out["sales_ma12w"] = out["sales"].shift(1).rolling(12, min_periods=6).mean()
+    out["sales_std4w"] = out["sales"].shift(1).rolling(4, min_periods=2).std()
+    out["sales_std8w"] = out["sales"].shift(1).rolling(8, min_periods=4).std()
+    fill_cols = [c for c in ["net_price_mean", "discount_mean", "promotion_share", "freight_mean", "stock_mean", "stockout_share", "week_sin", "week_cos", "trend_idx"] if c in out.columns]
+    for c in fill_cols:
+        med = safe_median(out[c], 0.0)
+        out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(med)
+    return out
+
+
+def train_weekly_core_model(weekly_train: pd.DataFrame, feature_names: List[str]) -> Any:
+    X = weekly_train[feature_names].astype(float)
+    y = weekly_train["sales"].astype(float)
+    monotone_map = {"net_price_mean": -1, "discount_mean": 1, "promotion_share": 1, "freight_mean": -1, "stock_mean": 1, "stockout_share": -1}
+    monotone = [int(monotone_map.get(f, 0)) for f in feature_names]
+    if USE_CATBOOST and CatBoostRegressor is not None:
+        model = CatBoostRegressor(
+            iterations=600,
+            learning_rate=0.03,
+            depth=5,
+            l2_leaf_reg=5.0,
+            loss_function="MAE",
+            random_seed=42,
+            verbose=0,
+            allow_writing_files=False,
+            monotone_constraints=monotone,
+            thread_count=1,
+        )
+        model.fit(X, y)
+        return model
+    class DeterministicWeeklyModel:
+        def predict(self, X_local):
+            xdf = pd.DataFrame(X_local).copy()
+            if "sales_ma4w" in xdf.columns:
+                return pd.to_numeric(xdf["sales_ma4w"], errors="coerce").fillna(0.0).values
+            if "sales_lag1w" in xdf.columns:
+                return pd.to_numeric(xdf["sales_lag1w"], errors="coerce").fillna(0.0).values
+            return np.zeros(len(xdf), dtype=float)
+
+    return DeterministicWeeklyModel()
+
+
+def _predict_weekly_from_history(model: Any, history_weekly: pd.DataFrame, feature_names: List[str], scenario_overrides: Dict[str, float], n_steps: int) -> pd.DataFrame:
+    hist = history_weekly.copy().sort_values("week_start").reset_index(drop=True)
+    rows: List[Dict[str, Any]] = []
+    for step in range(n_steps):
+        next_week = pd.Timestamp(hist["week_start"].iloc[-1]) + pd.Timedelta(days=7)
+        row = {
+            "week_start": next_week,
+            "sales": np.nan,
+            "revenue": np.nan,
+            "price_mean": float(scenario_overrides["price_mean"]),
+            "discount_mean": float(scenario_overrides["discount_mean"]),
+            "net_price_mean": float(scenario_overrides["net_price_mean"]),
+            "promotion_share": float(scenario_overrides["promotion_share"]),
+            "freight_mean": float(scenario_overrides["freight_mean"]),
+            "stock_mean": float(scenario_overrides["stock_mean"]),
+            "stock_min": float(scenario_overrides["stock_mean"]),
+            "stockout_share": float(1.0 if scenario_overrides["stock_mean"] <= 0 else 0.0),
+        }
+        row["weekofyear"] = int(next_week.isocalendar().week)
+        row["month"] = int(next_week.month)
+        row["week_sin"] = float(np.sin(2 * np.pi * row["weekofyear"] / 52.0))
+        row["week_cos"] = float(np.cos(2 * np.pi * row["weekofyear"] / 52.0))
+        row["month_sin"] = float(np.sin(2 * np.pi * row["month"] / 12.0))
+        row["month_cos"] = float(np.cos(2 * np.pi * row["month"] / 12.0))
+        row["trend_idx"] = float(len(hist))
+        hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+        hist = add_weekly_features(hist)
+        pred = float(model.predict(hist.iloc[[-1]][feature_names].astype(float))[0])
+        hist.loc[hist.index[-1], "sales"] = max(0.0, pred)
+        rows.append({"week_start": next_week, "pred_weekly_sales": max(0.0, pred)})
+    return pd.DataFrame(rows)
+
+
+def predict_weekly_holdout_with_actual_exog(model: Any, train_weekly: pd.DataFrame, test_weekly: pd.DataFrame, feature_names: List[str]) -> pd.DataFrame:
+    hist = train_weekly.copy().sort_values("week_start").reset_index(drop=True)
+    preds: List[Dict[str, Any]] = []
+    for _, test_row in test_weekly.sort_values("week_start").iterrows():
+        next_row = test_row.to_dict()
+        next_row["sales"] = np.nan
+        next_row["revenue"] = np.nan
+        next_row["trend_idx"] = float(len(hist))
+        hist = pd.concat([hist, pd.DataFrame([next_row])], ignore_index=True)
+        hist = add_weekly_features(hist)
+        pred = float(model.predict(hist.iloc[[-1]][feature_names].astype(float))[0])
+        pred = max(0.0, pred)
+        hist.loc[hist.index[-1], "sales"] = pred
+        preds.append({"week_start": pd.Timestamp(test_row["week_start"]), "pred_weekly_sales": pred})
+    return pd.DataFrame(preds)
+
+
+def predict_naive_ma4w_recursive(history_weekly: pd.DataFrame, n_steps: int) -> np.ndarray:
+    history_sales = history_weekly["sales"].astype(float).tolist()
+    preds: List[float] = []
+    for _ in range(n_steps):
+        pred = float(np.mean(history_sales[-4:])) if len(history_sales) >= 4 else (float(np.mean(history_sales)) if history_sales else 0.0)
+        pred = max(0.0, pred)
+        preds.append(pred)
+        history_sales.append(pred)
+    return np.array(preds, dtype=float)
+
+
+def allocate_weekly_to_daily(weekly_forecast: pd.DataFrame, daily_history: pd.DataFrame, future_daily_context: pd.DataFrame) -> pd.DataFrame:
+    hist = daily_history.sort_values("date").copy().tail(84)
+    hist["dow"] = pd.to_datetime(hist["date"]).dt.dayofweek
+    dow_sum = hist.groupby("dow")["sales"].sum()
+    total = float(dow_sum.sum())
+    if total <= 0:
+        dow_share = {d: 1.0 / 7.0 for d in range(7)}
+    else:
+        dow_share = {d: float(dow_sum.get(d, 0.0) / total) for d in range(7)}
+        share_total = sum(dow_share.values())
+        dow_share = {d: (v / share_total if share_total > 0 else 1.0 / 7.0) for d, v in dow_share.items()}
+
+    out = future_daily_context.copy()
+    out["date"] = pd.to_datetime(out["date"])
+    out["week_start"] = out["date"] - pd.to_timedelta(out["date"].dt.dayofweek, unit="D")
+    out["dow"] = out["date"].dt.dayofweek
+    weekly_map = dict(zip(pd.to_datetime(weekly_forecast["week_start"]), weekly_forecast["pred_weekly_sales"]))
+    out["weekly_pred_sales"] = out["week_start"].map(weekly_map).fillna(0.0)
+    out["share"] = out["dow"].map(dow_share).fillna(1.0 / 7.0)
+    if "promotion" in out.columns:
+        promo_factor = 1.20
+        out["share"] = np.where(pd.to_numeric(out["promotion"], errors="coerce").fillna(0.0) > 0, out["share"] * promo_factor, out["share"])
+        week_share_sum = out.groupby("week_start")["share"].transform("sum").replace(0.0, 1.0)
+        out["share"] = out["share"] / week_share_sum
+    out["pred_sales"] = out["weekly_pred_sales"] * out["share"]
+    return out
+
+
+def evaluate_weekly_backtest(weekly_full: pd.DataFrame, feature_names: List[str], n_folds: int = 5, horizon_weeks: int = 4) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    rows: List[Dict[str, Any]] = []
+    n = len(weekly_full)
+    min_train = max(16, int(n * 0.5))
+    for i in range(n_folds):
+        train_end = min_train + i * horizon_weeks
+        test_end = train_end + horizon_weeks
+        if test_end > n:
+            break
+        train = weekly_full.iloc[:train_end].copy()
+        test = weekly_full.iloc[train_end:test_end].copy()
+        model = train_weekly_core_model(train, feature_names)
+        pred = predict_weekly_holdout_with_actual_exog(model, train, test, feature_names)
+        rows.append(
+            {
+                "fold": i + 1,
+                "weekly_wape": calculate_wape(test["sales"].values, pred["pred_weekly_sales"].values),
+                "weekly_mae": mean_absolute_error(test["sales"].values, pred["pred_weekly_sales"].values),
+            }
+        )
+    df = pd.DataFrame(rows)
+    summary = {"weekly_wape": float(df["weekly_wape"].mean()) if len(df) else float("nan"), "weekly_mae": float(df["weekly_mae"].mean()) if len(df) else float("nan")}
+    return df, summary
+
+
 def build_one_step_baseline_features(history_df: pd.DataFrame, current_date: pd.Timestamp, base_ctx: Dict[str, Any], history_span_days: int) -> pd.DataFrame:
     h = history_df.sort_values("date").reset_index(drop=True)
     sales_series = h["sales"].astype(float).values
@@ -855,8 +1075,9 @@ def _monotone_price_multiplier(price_candidate: float, current_price: float, ela
 
 def simulate_horizon_profit(base_row: Dict[str, Any], price_candidate: float, future_dates_df: pd.DataFrame, baseline_bundle: Dict[str, Any], uplift_bundle: Dict[str, Any], base_history: pd.DataFrame, base_ctx: Dict[str, Any], elasticity_map: Dict[str, float], pooled_elasticity: float, allow_extrapolate: bool = False, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     overrides = overrides or {}
-    baseline_models = baseline_bundle["models"] if isinstance(baseline_bundle, dict) and "models" in baseline_bundle else baseline_bundle
-    uplift_is_bundle = isinstance(uplift_bundle, dict) and "models" in uplift_bundle
+    weekly_model = baseline_bundle["model"] if isinstance(baseline_bundle, dict) and "model" in baseline_bundle else None
+    feature_names = baseline_bundle.get("features", WEEKLY_MODEL_FEATURES) if isinstance(baseline_bundle, dict) else WEEKLY_MODEL_FEATURES
+    selected_forecaster = baseline_bundle.get("selected_forecaster", "weekly_model") if isinstance(baseline_bundle, dict) else "weekly_model"
     train_min = float(base_history["price"].min())
     train_max = float(base_history["price"].max())
     requested_price = float(price_candidate)
@@ -881,49 +1102,80 @@ def simulate_horizon_profit(base_row: Dict[str, Any], price_candidate: float, fu
     manual_shock = float(overrides.get("manual_shock_multiplier", 1.0))
     current_net_price_model = max(0.01, current_price_model * (1.0 - current_discount))
     scenario_net_price_model = max(0.01, price_for_model * (1.0 - discount_base))
-
-    baseline_feature_names = baseline_bundle.get("features") if isinstance(baseline_bundle, dict) else None
-    baseline_feature_stats = baseline_bundle.get("feature_stats") if isinstance(baseline_bundle, dict) else None
-    baseline_daily = recursive_baseline_forecast(base_history, future_dates_df, baseline_models, base_ctx, feature_names=baseline_feature_names, feature_stats=baseline_feature_stats)
-    future_months = [str(pd.Timestamp(d).to_period("M")) for d in future_dates_df["date"]]
-    price_effect_log = calc_scenario_price_effect_log(current_net_price_model, scenario_net_price_model, future_months, elasticity_map, pooled_elasticity)
-
-    uplift_frame = pd.DataFrame(
-        {
-            "date": pd.to_datetime(future_dates_df["date"]),
-            "promotion": float(promo_val),
-            "freight_value": float(freight_val),
-            "dow": pd.to_datetime(future_dates_df["date"]).dt.dayofweek.astype(float),
-            "is_weekend": (pd.to_datetime(future_dates_df["date"]).dt.dayofweek >= 5).astype(float),
-            "month_sin": np.sin(2 * np.pi * pd.to_datetime(future_dates_df["date"]).dt.month.astype(float) / 12.0),
-            "month_cos": np.cos(2 * np.pi * pd.to_datetime(future_dates_df["date"]).dt.month.astype(float) / 12.0),
-            "time_index_norm": np.clip((len(base_history) + np.arange(1, len(future_dates_df) + 1)) / max(len(base_history), 1), 0.0, 1.5),
-            "baseline_log_feature": np.log1p(baseline_daily["base_pred_sales"].values.clip(min=0.0)),
-        }
-    )
-    uplift_frame["promo_x_weekend"] = uplift_frame["promotion"] * uplift_frame["is_weekend"]
-    if uplift_is_bundle:
-        uplift_log, uplift_std = predict_uplift_log_bundle(uplift_frame, uplift_bundle)
-        uplift_log = np.clip(uplift_log, -0.7, 0.7)
+    weekly_history = add_weekly_features(build_weekly_model_frame(base_history))
+    weekly_history = weekly_history.dropna(subset=["sales"]).reset_index(drop=True)
+    future_dates_local = future_dates_df.copy()
+    future_dates_local["date"] = pd.to_datetime(future_dates_local["date"])
+    future_dates_local["week_start"] = future_dates_local["date"] - pd.to_timedelta(future_dates_local["date"].dt.dayofweek, unit="D")
+    n_weeks = int(max(1, future_dates_local["week_start"].nunique()))
+    last_history_week = pd.Timestamp(weekly_history["week_start"].max()) if len(weekly_history) else pd.Timestamp(base_history["date"].max()).floor("D")
+    if selected_forecaster == "naive_lag1w":
+        naive_val = float(weekly_history["sales"].iloc[-1]) if len(weekly_history) else 0.0
+        weekly_pred = pd.DataFrame({"week_start": [last_history_week + pd.Timedelta(days=7 * (i + 1)) for i in range(n_weeks)], "pred_weekly_sales": [naive_val] * n_weeks})
+    elif selected_forecaster == "naive_ma4w":
+        naive_preds = predict_naive_ma4w_recursive(weekly_history, n_weeks)
+        weekly_pred = pd.DataFrame({"week_start": [last_history_week + pd.Timedelta(days=7 * (i + 1)) for i in range(n_weeks)], "pred_weekly_sales": naive_preds})
+    elif weekly_model is None:
+        naive_val = float(weekly_history["sales"].tail(4).mean()) if len(weekly_history) else 0.0
+        weekly_pred = pd.DataFrame({"week_start": [last_history_week + pd.Timedelta(days=7 * (i + 1)) for i in range(n_weeks)], "pred_weekly_sales": [naive_val] * n_weeks})
     else:
-        uplift_log = np.zeros(len(uplift_frame), dtype=float)
-        uplift_std = np.zeros(len(uplift_frame), dtype=float)
+        weekly_pred = _predict_weekly_from_history(
+            weekly_model,
+            weekly_history,
+            feature_names,
+            {
+                "price_mean": float(price_for_model),
+                "discount_mean": float(discount_base),
+                "net_price_mean": float(scenario_net_price_model),
+                "promotion_share": float(promo_val),
+                "freight_mean": float(freight_val),
+                "stock_mean": float(stock_cap if stock_cap > 0 else safe_median(base_history.get("stock", pd.Series([0.0])), 0.0)),
+            },
+            n_weeks,
+        )
+    if len(future_dates_local) and pd.Timestamp(future_dates_local["week_start"].min()) == last_history_week:
+        if len(weekly_pred) and pd.Timestamp(weekly_pred["week_start"].min()) > last_history_week:
+            hist_tail = base_history.sort_values("date").tail(84).copy()
+            hist_tail["dow"] = pd.to_datetime(hist_tail["date"]).dt.dayofweek
+            dow_sum = hist_tail.groupby("dow")["sales"].sum()
+            dow_total = float(dow_sum.sum())
+            dow_share = {d: (float(dow_sum.get(d, 0.0) / dow_total) if dow_total > 0 else 1.0 / 7.0) for d in range(7)}
+            remaining_days = future_dates_local[future_dates_local["week_start"] == last_history_week]["date"]
+            remaining_share = float(sum(dow_share.get(int(pd.Timestamp(d).dayofweek), 0.0) for d in remaining_days))
+            if remaining_share <= 0:
+                remaining_share = float(len(remaining_days) / 7.0) if len(remaining_days) else 1.0
+            weekly_reference = float(weekly_history["sales"].iloc[-1]) if len(weekly_history) else float(weekly_pred["pred_weekly_sales"].iloc[0])
+            promo_current = float(base_ctx.get("promotion", 0.0))
+            bridge_mult_price = _monotone_price_multiplier(scenario_net_price_model, current_net_price_model, pooled_elasticity)
+            bridge_mult_promo = float(np.clip(1.0 + 0.15 * (float(promo_val) - promo_current), 0.7, 1.3))
+            bridge_scenario_mult = float(np.clip(bridge_mult_price * bridge_mult_promo, 0.5, 1.8))
+            bridge_val = max(0.0, weekly_reference * remaining_share * bridge_scenario_mult)
+            weekly_pred = pd.concat(
+                [pd.DataFrame({"week_start": [last_history_week], "pred_weekly_sales": [max(0.0, bridge_val)]}), weekly_pred],
+                ignore_index=True,
+            )
 
-    baseline_log = np.log1p(baseline_daily["base_pred_sales"].values.clip(min=0.0))
-    scenario_log = baseline_log + uplift_log + price_effect_log + np.log(max(manual_shock, 1e-9))
-    pred_sales = np.expm1(scenario_log).clip(min=0.0)
-    pred_log_sales = scenario_log
-    pred_std_log = np.sqrt(np.maximum(0.0, baseline_daily["base_pred_std_log"].values**2 + uplift_std**2))
+    future_ctx = future_dates_df[["date"]].copy()
+    future_ctx["promotion"] = float(promo_val)
+    future_ctx["stock"] = float(stock_cap if stock_cap > 0 else safe_median(base_history.get("stock", pd.Series([np.inf])), np.inf))
+    baseline_daily = allocate_weekly_to_daily(weekly_pred, base_history, future_ctx)
+    pred_sales = baseline_daily["pred_sales"].astype(float).values * max(manual_shock, 1e-9)
+    pred_log_sales = np.log1p(pred_sales.clip(min=0.0))
+    pred_std_log = np.full(len(pred_sales), 0.15, dtype=float)
+    uplift_log = np.zeros(len(pred_sales), dtype=float)
+    uplift_std = np.zeros(len(pred_sales), dtype=float)
+    price_effect_log = np.zeros(len(pred_sales), dtype=float)
+    future_months = [str(pd.Timestamp(d).to_period("M")) for d in future_dates_df["date"]]
 
     daily = pd.DataFrame({
         "date": future_dates_df["date"].values,
         "price": float(price_for_model),
-        "base_pred_sales": baseline_daily["base_pred_sales"].values,
+        "base_pred_sales": baseline_daily["pred_sales"].values,
         "uplift_log": uplift_log,
         "pred_sales": pred_sales,
         "pred_log_sales": pred_log_sales,
         "pred_std_log": pred_std_log,
-        "elasticity": np.array([elasticity_map.get(m, pooled_elasticity) for m in future_months], dtype=float),
+        "elasticity": np.array([pooled_elasticity for _ in future_months], dtype=float),
         "price_effect_log": price_effect_log,
         "discount": discount_base,
         "promotion": promo_val,
@@ -932,10 +1184,11 @@ def simulate_horizon_profit(base_row: Dict[str, Any], price_candidate: float, fu
     })
     daily["net_unit_price"] = (daily["price"] * (1.0 - daily["discount"])).clip(lower=0.01)
     daily["unconstrained_demand"] = daily["pred_sales"].clip(lower=0.0)
+    stock_series = pd.to_numeric(base_history.set_index("date").get("stock", pd.Series(dtype=float)), errors="coerce")
+    stock_lookup = stock_series.reindex(pd.to_datetime(daily["date"])).fillna(future_ctx.set_index("date").reindex(pd.to_datetime(daily["date"]))["stock"]).values
     if stock_cap > 0:
-        daily["actual_sales"] = np.minimum(daily["unconstrained_demand"], stock_cap)
-    else:
-        daily["actual_sales"] = daily["unconstrained_demand"]
+        stock_lookup = np.minimum(stock_lookup, stock_cap)
+    daily["actual_sales"] = np.where(stock_lookup <= 0, 0.0, np.minimum(daily["unconstrained_demand"], stock_lookup))
     daily["lost_sales"] = (daily["unconstrained_demand"] - daily["actual_sales"]).clip(lower=0.0)
     daily["revenue"] = daily["net_unit_price"] * daily["actual_sales"]
     daily["profit"] = (daily["net_unit_price"] - daily["cost"] - daily["freight_value"]) * daily["actual_sales"]
@@ -965,7 +1218,7 @@ def simulate_horizon_profit(base_row: Dict[str, Any], price_candidate: float, fu
         "ood_flag": ood,
         "uncertainty_penalty": float(uncertainty_penalty),
         "disagreement_penalty": float(disagreement_penalty),
-        "price_multiplier": np.exp(price_effect_log),
+        "price_multiplier": np.ones(len(daily), dtype=float),
         "elasticity_used": daily["elasticity"].values if len(daily) else np.array([]),
         "direct_current_daily": None,
         "baseline_daily": baseline_daily,
@@ -984,89 +1237,72 @@ def run_full_pricing_analysis_universal(
     raw_columns = set(normalized_txn.columns.tolist())
     if len(txn) == 0:
         raise ValueError("Пустой датасет после нормализации.")
-    daily_base = build_daily_from_transactions(
-        txn,
-        target_sku,
-        target_category=target_category,
-        region=region,
-        channel=channel,
-        segment=segment,
-    )
+    daily_base = build_daily_from_transactions(txn, target_sku, target_category=target_category, region=region, channel=channel, segment=segment)
     daily_base = robust_clean_dirty_data(daily_base)
-    daily_base = build_feature_matrix(daily_base).dropna(subset=["sales", "price", "log_sales", "log_price"]).reset_index(drop=True)
-    if len(daily_base) < 5:
-        raise ValueError("Слишком мало дневных наблюдений после агрегации.")
+    daily_base = build_feature_matrix(daily_base).dropna(subset=["sales", "price"]).reset_index(drop=True)
+    if len(daily_base) < 56:
+        raise ValueError("Недостаточно данных для weekly модели (нужно минимум 56 дней).")
     daily_columns = set(daily_base.columns.tolist())
-
-    n = len(daily_base)
-    train_end = max(3, int(n * 0.8))
-    train_end = min(train_end, n - 1)
-    train_raw = daily_base.iloc[:train_end].copy().reset_index(drop=True)
-    test_raw = daily_base.iloc[train_end:].copy().reset_index(drop=True)
-    if "promotion" not in train_raw.columns:
-        train_raw["promotion"] = 0.0
-    if "freight_value" not in train_raw.columns:
-        train_raw["freight_value"] = 0.0
-    train_raw["promo_x_weekend"] = train_raw["promotion"].astype(float) * train_raw["is_weekend"].astype(float)
-
     small_mode_info = detect_small_mode_info(daily_base)
     small_mode = bool(small_mode_info["small_mode"])
-    baseline_features_used = select_eligible_features(train_raw, BASELINE_FEATURES)
-    uplift_candidates = UPLIFT_FEATURES.copy()
-    if "review_score" in train_raw.columns and train_raw["review_score"].nunique(dropna=True) > 3:
-        uplift_candidates.append("review_score")
-    pre_uplift_features = [f for f in uplift_candidates if f not in {"baseline_log_feature", "promo_x_weekend"}]
 
-    all_feats = list(dict.fromkeys(baseline_features_used + pre_uplift_features + ["promotion", "freight_value", "net_unit_price", "price", "date", "log_sales"]))
-    global FEATURE_STATS
-    FEATURE_STATS = fit_feature_stats(train_raw, [f for f in all_feats if f not in {"date"}])
-    train_df = clean_feature_frame(train_raw.copy(), [f for f in all_feats if f not in {"date"}], FEATURE_STATS)
-    test_df = clean_feature_frame(test_raw.copy(), [f for f in all_feats if f not in {"date"}], FEATURE_STATS)
-
-    y_train = train_df["log_sales"].astype(float).copy()
-    X_train_base = train_df[baseline_features_used].astype(float).copy()
-    baseline_models = build_models(X_train_base, y_train, baseline_features_used, kind="baseline", small_mode=small_mode)
-    baseline_bundle = {"models": baseline_models, "features": baseline_features_used, "feature_stats": FEATURE_STATS}
-
-    base_log_oof = make_walk_forward_oof_baseline(train_df.copy(), baseline_features_used, n_splits=4, small_mode=small_mode)
-    elasticity_fit_df = build_weekly_weak_signal_view(train_df) if small_mode else train_df
-    fixed_log_price_coef = estimate_pooled_elasticity(elasticity_fit_df, small_mode=small_mode)
-    shrunk_random_effects, _ = compute_monthly_group_elasticities(elasticity_fit_df, fixed_log_price_coef, small_mode=small_mode)
-    ref_net_price = safe_median(train_df.get("net_unit_price", train_df["price"]), safe_median(train_df["price"], 1.0))
-    train_df["price_effect_log_obs"] = calc_observed_price_effect_log(train_df, shrunk_random_effects, fixed_log_price_coef, ref_net_price=ref_net_price)
-    train_df["uplift_target_log"] = (train_df["log_sales"] - base_log_oof - train_df["price_effect_log_obs"]).clip(-0.7, 0.7)
-    train_df["baseline_log_feature"] = base_log_oof
-    train_df["promo_x_weekend"] = train_df.get("promotion", pd.Series(np.zeros(len(train_df)))).astype(float) * train_df.get("is_weekend", pd.Series(np.zeros(len(train_df)))).astype(float)
-    uplift_features_used, uplift_signal_info = choose_uplift_features(train_df, small_mode=small_mode, candidates=uplift_candidates)
-
-    X_train_uplift = train_df[uplift_features_used].astype(float).copy()
-    uplift_models = build_models(X_train_uplift, train_df["uplift_target_log"].astype(float), uplift_features_used, kind="uplift", small_mode=small_mode)
-    uplift_bundle = {"models": uplift_models, "features": uplift_features_used, "feature_stats": FEATURE_STATS}
-
-    if len(test_df) > 0:
-        price_effect_log = calc_observed_price_effect_log(test_df, shrunk_random_effects, fixed_log_price_coef, ref_net_price=ref_net_price)
-        base_log, _ = predict_baseline_log_bundle(test_df, baseline_bundle)
-        test_uplift = test_df.copy()
-        test_uplift["baseline_log_feature"] = base_log
-        test_uplift["promo_x_weekend"] = test_uplift.get("promotion", pd.Series(np.zeros(len(test_uplift)))).astype(float) * test_uplift.get("is_weekend", pd.Series(np.zeros(len(test_uplift)))).astype(float)
-        uplift_log, _ = predict_uplift_log_bundle(test_uplift, uplift_bundle)
-        uplift_log = np.clip(uplift_log, -0.7, 0.7)
-        final_log = base_log + price_effect_log + uplift_log
-        holdout_metrics = eval_prediction_frame(test_df, final_log, label="holdout")
-        holdout_predictions = pd.DataFrame({
-            "date": pd.to_datetime(test_df["date"]).dt.strftime("%Y-%m-%d"),
-            "series_id": str(target_sku),
-            "actual_sales": test_df["sales"].astype(float).values,
-            "baseline_pred_sales": np.expm1(base_log).clip(min=0.0),
-            "price_effect_multiplier": np.exp(price_effect_log),
-            "uplift_multiplier": np.exp(uplift_log),
-            "final_pred_sales": np.expm1(final_log).clip(min=0.0),
-        })
-        holdout_predictions["abs_error"] = np.abs(holdout_predictions["actual_sales"] - holdout_predictions["final_pred_sales"])
-        holdout_predictions["signed_error"] = holdout_predictions["final_pred_sales"] - holdout_predictions["actual_sales"]
+    weekly_raw = build_weekly_model_frame(daily_base)
+    weekly_full = add_weekly_features(weekly_raw)
+    weekly_full = weekly_full.dropna(subset=["sales"]).reset_index(drop=True)
+    usable = weekly_full.dropna(subset=["sales_lag1w", "sales_lag2w", "sales_lag4w", "sales_lag8w"]).reset_index(drop=True)
+    use_weekly_ml = len(usable) >= 16
+    if use_weekly_ml:
+        model_frame = usable.copy()
     else:
-        holdout_metrics = {"rmse": float("nan"), "mae": float("nan"), "mape": float("nan"), "smape": float("nan"), "wape": float("nan"), "sigma_log": float("nan")}
-        holdout_predictions = pd.DataFrame(columns=["date", "series_id", "actual_sales", "baseline_pred_sales", "price_effect_multiplier", "uplift_multiplier", "final_pred_sales", "abs_error", "signed_error"])
+        model_frame = weekly_full.copy()
+
+    feature_names = [f for f in WEEKLY_MODEL_FEATURES if f in model_frame.columns]
+    split = max(4, int(len(model_frame) * 0.8))
+    split = min(split, len(model_frame) - 1)
+    train_weekly = model_frame.iloc[:split].copy()
+    test_weekly = model_frame.iloc[split:].copy()
+    weekly_model = train_weekly_core_model(train_weekly, feature_names) if use_weekly_ml else None
+
+    if use_weekly_ml:
+        test_pred_weekly = predict_weekly_holdout_with_actual_exog(weekly_model, train_weekly, test_weekly, feature_names)
+    else:
+        naive_fallback = predict_naive_ma4w_recursive(train_weekly, len(test_weekly))
+        test_pred_weekly = pd.DataFrame({"week_start": test_weekly["week_start"].values, "pred_weekly_sales": naive_fallback})
+    holdout_metrics = {
+        "rmse": float(np.sqrt(mean_squared_error(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values))),
+        "mae": float(mean_absolute_error(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)),
+        "mape": float(calculate_mape(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)),
+        "smape": float(calculate_smape(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)),
+        "wape": float(calculate_wape(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)),
+        "sigma_log": float("nan"),
+    }
+    holdout_predictions = pd.DataFrame({
+        "date": pd.to_datetime(test_weekly["week_start"]).dt.strftime("%Y-%m-%d"),
+        "series_id": str(target_sku),
+        "actual_sales": test_weekly["sales"].values,
+        "baseline_pred_sales": test_pred_weekly["pred_weekly_sales"].values,
+        "price_effect_multiplier": 1.0,
+        "uplift_multiplier": 1.0,
+        "final_pred_sales": test_pred_weekly["pred_weekly_sales"].values,
+    })
+    holdout_predictions["abs_error"] = np.abs(holdout_predictions["actual_sales"] - holdout_predictions["final_pred_sales"])
+    holdout_predictions["signed_error"] = holdout_predictions["final_pred_sales"] - holdout_predictions["actual_sales"]
+    _, backtest_summary = evaluate_weekly_backtest(usable, feature_names, n_folds=5, horizon_weeks=4) if use_weekly_ml else (pd.DataFrame(), {"weekly_wape": float("nan"), "weekly_mae": float("nan")})
+
+    naive_lag_val = float(train_weekly["sales"].iloc[-1]) if len(train_weekly) else 0.0
+    naive_lag = np.full(len(test_weekly), naive_lag_val, dtype=float)
+    naive_ma4 = predict_naive_ma4w_recursive(train_weekly, len(test_weekly))
+    best_naive_wape = float(min(calculate_wape(test_weekly["sales"].values, naive_lag), calculate_wape(test_weekly["sales"].values, naive_ma4)))
+    model_enabled = bool(holdout_metrics["wape"] <= best_naive_wape * 0.95) if np.isfinite(best_naive_wape) else True
+    if not use_weekly_ml:
+        model_enabled = False
+    lag1_wape = float(calculate_wape(test_weekly["sales"].values, naive_lag))
+    ma4_wape = float(calculate_wape(test_weekly["sales"].values, naive_ma4))
+    if model_enabled:
+        selected_forecaster = "weekly_model"
+    else:
+        selected_forecaster = "naive_lag1w" if lag1_wape <= ma4_wape else "naive_ma4w"
+        weekly_model = None
 
     zero_mask = holdout_predictions["actual_sales"] <= 0
     pos_mask = holdout_predictions["actual_sales"] > 0
@@ -1099,41 +1335,29 @@ def run_full_pricing_analysis_universal(
     wape_val = holdout_metrics.get("wape", float("nan"))
     if pd.notna(wape_val) and float(wape_val) > 40:
         warnings.append(f"Высокий holdout WAPE: {float(wape_val):.1f}%")
-
-    full_raw = daily_base.copy()
-    full_raw["promo_x_weekend"] = full_raw.get("promotion", pd.Series(np.zeros(len(full_raw)))).astype(float) * full_raw.get("is_weekend", pd.Series(np.zeros(len(full_raw)))).astype(float)
-    full_feats = list(dict.fromkeys(baseline_features_used + uplift_features_used + ["promotion", "freight_value", "net_unit_price", "price", "log_sales"]))
-    FEATURE_STATS = fit_feature_stats(full_raw, full_feats)
-    full_df = clean_feature_frame(full_raw.copy(), full_feats, FEATURE_STATS)
-    y_full = full_df["log_sales"].astype(float).copy()
-    full_baseline_models = build_models(full_df[baseline_features_used].astype(float), y_full, baseline_features_used, kind="baseline", small_mode=small_mode)
-    baseline_bundle = {"models": full_baseline_models, "features": baseline_features_used, "feature_stats": FEATURE_STATS}
-    full_base_log_oof = make_walk_forward_oof_baseline(full_df.copy(), baseline_features_used, n_splits=4, small_mode=small_mode)
-    elasticity_full_df = build_weekly_weak_signal_view(full_df) if small_mode else full_df
-    fixed_log_price_coef = estimate_pooled_elasticity(elasticity_full_df, small_mode=small_mode)
-    shrunk_random_effects, _ = compute_monthly_group_elasticities(elasticity_full_df, fixed_log_price_coef, small_mode=small_mode)
-    ref_net_price = safe_median(full_df.get("net_unit_price", full_df["price"]), safe_median(full_df["price"], 1.0))
-    full_df["price_effect_log_obs"] = calc_observed_price_effect_log(full_df, shrunk_random_effects, fixed_log_price_coef, ref_net_price=ref_net_price)
-    full_df["uplift_target_log"] = (full_df["log_sales"] - full_base_log_oof - full_df["price_effect_log_obs"]).clip(-0.7, 0.7)
-    full_df["baseline_log_feature"] = full_base_log_oof
-    full_df["promo_x_weekend"] = full_df.get("promotion", pd.Series(np.zeros(len(full_df)))).astype(float) * full_df.get("is_weekend", pd.Series(np.zeros(len(full_df)))).astype(float)
-    uplift_features_used, _ = choose_uplift_features(full_df, small_mode=small_mode, candidates=uplift_candidates)
-    full_uplift_models = build_models(full_df[uplift_features_used].astype(float), full_df["uplift_target_log"].astype(float), uplift_features_used, kind="uplift", small_mode=small_mode)
-    uplift_bundle = {"models": full_uplift_models, "features": uplift_features_used, "feature_stats": FEATURE_STATS}
+    if not model_enabled:
+        warnings.append(f"Weekly ML не прошла benchmark gate, используем {selected_forecaster}.")
+    if not use_weekly_ml:
+        warnings.append("Недостаточно weekly history для ML: используем deterministic naive forecaster.")
+    full_weekly = usable.copy()
+    if model_enabled and use_weekly_ml:
+        weekly_model = train_weekly_core_model(full_weekly, feature_names)
+    baseline_bundle = {"model": weekly_model, "features": feature_names, "mode": "weekly_core", "selected_forecaster": selected_forecaster}
+    uplift_bundle = {"models": [], "features": ["baseline_log_feature"], "feature_stats": {}}
+    fixed_log_price_coef = CONFIG["PRIOR_ELASTICITY"]
+    shrunk_random_effects = {}
+    ref_net_price = safe_median(daily_base.get("net_unit_price", daily_base["price"]), safe_median(daily_base["price"], 1.0))
 
     base_ctx = current_price_context(daily_base)
     base_ctx["category"] = target_category
     base_ctx["product_id"] = target_sku
     latest_row = dict(base_ctx)
-    latest_row["requested_price"] = float(base_ctx.get("price", safe_median(train_df["price"], 1.0)))
+    latest_row["requested_price"] = float(base_ctx.get("price", safe_median(daily_base["price"], 1.0)))
     future_dates = forecast_future_dates(pd.Timestamp(daily_base["date"].max()))
     baseline_price = float(safe_median(daily_base["price"], float(base_ctx.get("price", 1.0))))
     as_is_sim = simulate_horizon_profit(latest_row, float(base_ctx.get("price")), future_dates, baseline_bundle, uplift_bundle, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef)
     neutral_overrides = {"discount": 0.0, "promotion": 0.0, "freight_value": float(safe_median(daily_base.get("freight_value", pd.Series([0.0])), 0.0))}
     baseline_sim = simulate_horizon_profit(latest_row, baseline_price, future_dates, baseline_bundle, uplift_bundle, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef, overrides=neutral_overrides)
-    if small_mode:
-        as_is_sim["daily"] = apply_weekly_fallback_projection(as_is_sim["daily"], daily_base)
-        baseline_sim["daily"] = apply_weekly_fallback_projection(baseline_sim["daily"], daily_base)
     scenario_sim = None
     scenario_forecast = scenario_sim["daily"] if scenario_sim else None
     confidence = float(1.0 / (1.0 + max(0.0, holdout_metrics.get("wape", 100.0) / 100.0)))
@@ -1166,7 +1390,7 @@ def run_full_pricing_analysis_universal(
         "as_is_profit": as_is_sim["daily"]["profit"].values,
     })
     feature_usage_rows = []
-    report_features = list(dict.fromkeys(BASELINE_FEATURES + UPLIFT_FEATURES + ["price", "discount", "cost", "stock", "freight_value", "promotion"]))
+    report_features = list(dict.fromkeys(BASELINE_FEATURES + WEEKLY_MODEL_FEATURES + ["price", "discount", "cost", "stock", "freight_value", "promotion", "baseline_log_feature"]))
     engineered_features = {
         "sales_lag1", "sales_lag7", "sales_lag14",
         "sales_ma7", "sales_ma14", "sales_ma28",
@@ -1183,9 +1407,9 @@ def run_full_pricing_analysis_universal(
         daily_missing_share = float(daily_base[f].isna().mean()) if present_in_daily else 1.0
         daily_unique_count = int(daily_base[f].nunique(dropna=True)) if present_in_daily else 0
         engineered_feature = f in engineered_features
-        used_in_baseline = f in baseline_features_used
-        used_in_uplift = f in uplift_features_used
-        used_in_price_effect = f in {"price", "discount", "net_unit_price"}
+        used_in_baseline = f in feature_names
+        used_in_uplift = f in {"baseline_log_feature"}
+        used_in_price_effect = False
         used_only_in_economics = f in {"cost"}
         used_in_model = used_in_baseline or used_in_uplift or used_in_price_effect
         used_in_scenario = f in {"price", "discount", "promotion", "freight_value", "cost"}
@@ -1219,7 +1443,7 @@ def run_full_pricing_analysis_universal(
 
     feature_report = pd.DataFrame(feature_usage_rows)
     run_summary = {
-        "config": {
+            "config": {
             "git_commit": _safe_git_commit(),
             "code_signature": code_signature(),
             "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -1227,17 +1451,18 @@ def run_full_pricing_analysis_universal(
             "date_utc": str(pd.Timestamp.utcnow()),
             "series_id": str(target_sku),
             "category": str(target_category),
-            "train_period": [str(train_df["date"].min()) if "date" in train_df.columns else None, str(train_df["date"].max()) if "date" in train_df.columns else None],
+            "train_period": [str(train_weekly["week_start"].min()), str(train_weekly["week_start"].max())],
             "validation_period": [None, None],
-            "holdout_period": [str(test_df["date"].min()) if "date" in test_df.columns else None, str(test_df["date"].max()) if "date" in test_df.columns else None],
+            "holdout_period": [str(test_weekly["week_start"].min()), str(test_weekly["week_start"].max())],
             "fit_scope": "refit_full_history",
             "horizon_days": int(len(future_dates)),
-            "baseline_features": baseline_features_used,
-            "uplift_features": uplift_features_used,
-            "uplift_signal_info": uplift_signal_info,
+            "baseline_features": feature_names,
+            "uplift_features": [],
+            "uplift_signal_info": {"disabled": True, "reason": "weekly_core_only"},
+            "benchmark_gate_passed": bool(model_enabled),
         },
         "dataset_passport": _build_dataset_passport(txn),
-        "metrics_summary": {"holdout": holdout_metrics},
+        "metrics_summary": {"holdout": holdout_metrics, "rolling_weekly_backtest": backtest_summary},
         "warnings": warnings,
         "small_mode_info": small_mode_info,
         "feature_usage_report": feature_report.to_dict("records"),
@@ -1272,8 +1497,10 @@ def run_full_pricing_analysis_universal(
             "mean_pred_on_zero_days": mean_pred_on_zero_days,
             "false_positive_rate_on_zero_days": false_positive_rate_on_zero_days,
             "wape_positive_days": wape_positive_days,
-            "wape_promo_days": float(calculate_wape(test_df[test_df.get("promotion", 0.0) > 0]["sales"], holdout_predictions.loc[test_df.get("promotion", 0.0) > 0, "final_pred_sales"])) if len(test_df) and (test_df.get("promotion", pd.Series([0.0] * len(test_df))) > 0).any() else float("nan"),
-            "wape_non_promo_days": float(calculate_wape(test_df[test_df.get("promotion", 0.0) <= 0]["sales"], holdout_predictions.loc[test_df.get("promotion", 0.0) <= 0, "final_pred_sales"])) if len(test_df) else float("nan"),
+            "weekly_wape_backtest": backtest_summary.get("weekly_wape", float("nan")),
+            "weekly_positive_periods_wape": wape_positive_days,
+            "weekly_zero_actual_mean_pred": mean_pred_on_zero_days,
+            "weekly_false_positive_rate_on_zero": false_positive_rate_on_zero_days,
         },
     }
     current_price = float(base_ctx.get("price"))
