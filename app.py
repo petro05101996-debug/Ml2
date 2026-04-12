@@ -187,6 +187,32 @@ def safe_median(series: pd.Series, default: float = 0.0) -> float:
         return default
 
 
+def read_uploaded_csv_safely(uploaded_file: Any) -> pd.DataFrame:
+    if uploaded_file is None:
+        raise ValueError("Файл не загружен.")
+    raw_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    if not raw_bytes:
+        raise ValueError("Загруженный CSV пустой.")
+    parse_errors: List[str] = []
+    for enc in ["utf-8-sig", "cp1251", "latin1"]:
+        for sep in [None, ",", ";", "\t", "|"]:
+            try:
+                buf = BytesIO(raw_bytes)
+                kwargs: Dict[str, Any] = {"encoding": enc}
+                if sep is None:
+                    kwargs.update({"sep": None, "engine": "python"})
+                else:
+                    kwargs.update({"sep": sep})
+                df = pd.read_csv(buf, **kwargs)
+                if len(df.columns) <= 1 and sep in (",", ";", "\t", "|"):
+                    continue
+                return df
+            except Exception as e:
+                parse_errors.append(f"{enc}/{repr(sep)}: {e}")
+    msg = " ; ".join(parse_errors[-4:]) if parse_errors else "не удалось определить разделитель/кодировку"
+    raise ValueError(f"Не удалось прочитать CSV ({msg})")
+
+
 def calculate_mape(y_true, y_pred, eps: float = 1e-9) -> float:
     yt = np.asarray(y_true, dtype=float)
     yp = np.asarray(y_pred, dtype=float)
@@ -2006,7 +2032,7 @@ def render_upload_block() -> Dict[str, Any]:
 
     if load_mode == "Universal CSV" and universal_file is not None:
         try:
-            preview = pd.read_csv(universal_file)
+            preview = read_uploaded_csv_safely(universal_file)
             auto_map = build_auto_mapping(list(preview.columns))
             with st.expander("⚙️ Сопоставление колонок (каноническая схема)", expanded=True):
                 for f in CANONICAL_FIELDS:

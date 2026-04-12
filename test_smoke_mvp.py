@@ -7,6 +7,7 @@ from what_if import build_sensitivity_grid, run_scenario_set
 from app import (
     apply_weekly_fallback_projection,
     build_manual_scenario_artifacts,
+    read_uploaded_csv_safely,
     robust_clean_dirty_data,
     run_full_pricing_analysis_universal,
     run_what_if_projection,
@@ -29,6 +30,20 @@ def test_normalize_and_daily_build():
     daily = build_daily_from_transactions(norm, "A")
     assert len(daily) >= 2
     assert (daily["price"] > 0).all()
+
+
+def test_read_uploaded_csv_safely_supports_semicolon_delimiter():
+    class DummyUpload:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def getvalue(self):
+            return self._payload
+
+    payload = "date;product_id;price\n2025-01-01;sku-1;100\n".encode("utf-8")
+    df = read_uploaded_csv_safely(DummyUpload(payload))
+    assert set(df.columns) == {"date", "product_id", "price"}
+    assert len(df) == 1
 
 
 def test_scenario_runner_baseline_fallback():
