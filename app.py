@@ -462,28 +462,7 @@ UPLIFT_FEATURES: List[str] = [
     "promo_x_weekend",
 ]
 
-WEEKLY_BASELINE_FEATURES: List[str] = [
-    "sales_lag1w",
-    "sales_lag2w",
-    "sales_lag4w",
-    "sales_lag8w",
-    "sales_ma4w",
-    "sales_ma8w",
-    "sales_ma12w",
-    "sales_std4w",
-    "sales_std8w",
-    "week_sin",
-    "week_cos",
-    "trend_idx",
-    "price_idx",
-    "discount_mean",
-    "promotion_share",
-    "promo_any",
-    "freight_mean",
-    "stock_mean",
-    "stockout_share",
-]
-WEEKLY_BASELINE_FEATURES_LEGACY: List[str] = [
+LEGACY_WEEKLY_BASELINE_FEATURES: List[str] = [
     "sales_lag1w",
     "sales_lag2w",
     "sales_lag4w",
@@ -499,6 +478,17 @@ WEEKLY_BASELINE_FEATURES_LEGACY: List[str] = [
     "stock_mean",
     "stockout_share",
 ]
+WEEKLY_BASELINE_BUNDLES: Dict[str, List[str]] = {
+    "legacy_baseline": LEGACY_WEEKLY_BASELINE_FEATURES,
+    "price_only_baseline": LEGACY_WEEKLY_BASELINE_FEATURES + ["price_idx"],
+    "price_promo_baseline": LEGACY_WEEKLY_BASELINE_FEATURES + ["price_idx", "promotion_share"],
+    "price_promo_freight_baseline": LEGACY_WEEKLY_BASELINE_FEATURES + ["price_idx", "promotion_share", "freight_mean"],
+}
+WEEKLY_BASELINE_FEATURES: List[str] = list(dict.fromkeys(
+    feature
+    for bundle_features in WEEKLY_BASELINE_BUNDLES.values()
+    for feature in bundle_features
+))
 
 WEEKLY_UPLIFT_FEATURES: List[str] = [
     "baseline_log_feature",
@@ -507,12 +497,10 @@ WEEKLY_UPLIFT_FEATURES: List[str] = [
 ]
 
 WEEKLY_MODEL_FEATURES: List[str] = list(dict.fromkeys(WEEKLY_BASELINE_FEATURES + WEEKLY_UPLIFT_FEATURES + ["net_price_mean", "price_ref_8w"]))
-WEEKLY_EXOGENOUS_FEATURES: List[str] = ["price_idx", "discount_mean", "promotion_share", "promo_any", "freight_mean"]
+WEEKLY_EXOGENOUS_FEATURES: List[str] = ["price_idx", "promotion_share", "freight_mean"]
 MONOTONE_MAP: Dict[str, int] = {
     "price_idx": -1,
-    "discount_mean": 1,
     "promotion_share": 1,
-    "promo_any": 1,
     "freight_mean": -1,
     "stock_mean": 1,
     "stockout_share": -1,
@@ -1508,118 +1496,140 @@ def run_full_pricing_analysis_universal(
     else:
         model_frame = weekly_eval.copy()
 
-    baseline_feature_names = [f for f in WEEKLY_BASELINE_FEATURES if f in model_frame.columns]
-    legacy_baseline_feature_names = [f for f in WEEKLY_BASELINE_FEATURES_LEGACY if f in model_frame.columns]
     split = max(4, int(len(model_frame) * 0.8))
     split = min(split, len(model_frame) - 1)
     train_weekly = model_frame.iloc[:split].copy()
     test_weekly = model_frame.iloc[split:].copy()
+    baseline_feature_names = select_eligible_features(train_weekly, WEEKLY_BASELINE_BUNDLES["legacy_baseline"])
+    if not baseline_feature_names:
+        baseline_feature_names = [f for f in WEEKLY_BASELINE_BUNDLES["legacy_baseline"] if f in train_weekly.columns]
+    legacy_baseline_feature_names = list(baseline_feature_names)
     seasonal_anchor_weight_train = compute_seasonal_anchor_weight(train_weekly) if use_weekly_ml else 0.0
-    weekly_model = train_weekly_core_model(train_weekly, baseline_feature_names) if use_weekly_ml else None
+    weekly_model = None
     uplift_bundle = {"models": [], "features": ["baseline_log_feature"], "feature_stats": {}, "disabled": True, "reason": "weekly_core_only", "signal_info": {}}
 
     weekly_baseline_candidate_comparison = {
         "selected_candidate": "legacy_baseline",
         "selection_reason": "weekly_ml_not_used",
-        "legacy": {},
-        "expanded": {},
-        "gate_rules": {
-            "expanded_wape_must_be_leq_legacy": True,
-            "expanded_corr_min": 0.45,
-            "expanded_std_ratio_min": 0.40,
+        "selection_rule": {
+            "wape_tolerance_pp": 0.5,
+            "corr_tolerance_down": 0.05,
+            "std_ratio_min_improvement": 0.02,
+            "primary_rank_metric": "std_ratio",
+            "secondary_rank_metric": "holdout_wape",
+            "tertiary_rank_metric": "corr",
         },
+        "legacy_reference": {},
+        "candidates": [],
     }
     selected_candidate_name = "legacy_baseline"
     legacy_candidate_pred = np.array([], dtype=float)
-    expanded_candidate_pred = np.array([], dtype=float)
+    price_only_candidate_pred = np.array([], dtype=float)
+    price_promo_candidate_pred = np.array([], dtype=float)
+    price_promo_freight_candidate_pred = np.array([], dtype=float)
+    candidate_predictions: Dict[str, np.ndarray] = {}
 
     if use_weekly_ml:
-        test_pred_weekly_expanded = predict_weekly_holdout_with_actual_exog(
-            weekly_model,
-            train_weekly,
-            test_weekly,
-            baseline_feature_names,
-            seasonal_anchor_weight=seasonal_anchor_weight_train,
-        )
-        expanded_candidate_pred = test_pred_weekly_expanded["pred_weekly_sales"].astype(float).values
-        legacy_candidate_pred = expanded_candidate_pred.copy()
-        weekly_baseline_candidate_comparison["expanded"] = {
-            "features": list(baseline_feature_names),
-            "holdout_wape": float(calculate_wape(test_weekly["sales"].values, expanded_candidate_pred)),
-            "holdout_mape": float(calculate_mape(test_weekly["sales"].values, expanded_candidate_pred)),
-            "corr": float(np.corrcoef(test_weekly["sales"].values, expanded_candidate_pred)[0, 1]) if len(test_weekly) > 1 else float("nan"),
-            "std_ratio": float(np.std(expanded_candidate_pred, ddof=0) / max(np.std(test_weekly["sales"].values, ddof=0), 1e-9)) if len(test_weekly) > 1 else float("nan"),
-            "mean_bias": float((expanded_candidate_pred - test_weekly["sales"].values).mean()) if len(test_weekly) else float("nan"),
-            "mae": float(mean_absolute_error(test_weekly["sales"].values, expanded_candidate_pred)) if len(test_weekly) else float("nan"),
-            "rmse": float(np.sqrt(mean_squared_error(test_weekly["sales"].values, expanded_candidate_pred))) if len(test_weekly) else float("nan"),
-        }
-        if legacy_baseline_feature_names and set(legacy_baseline_feature_names) != set(baseline_feature_names):
-            legacy_weekly_model = train_weekly_core_model(train_weekly, legacy_baseline_feature_names)
-            test_pred_weekly_legacy = predict_weekly_holdout_with_actual_exog(
-                legacy_weekly_model,
+        def _bundle_metrics(actual: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
+            return {
+                "holdout_wape": float(calculate_wape(actual, pred)),
+                "holdout_mape": float(calculate_mape(actual, pred)),
+                "corr": float(np.corrcoef(actual, pred)[0, 1]) if len(actual) > 1 else float("nan"),
+                "std_ratio": float(np.std(pred, ddof=0) / max(np.std(actual, ddof=0), 1e-9)) if len(actual) > 1 else float("nan"),
+                "mean_bias": float((pred - actual).mean()) if len(actual) else float("nan"),
+                "mae": float(mean_absolute_error(actual, pred)) if len(actual) else float("nan"),
+                "rmse": float(np.sqrt(mean_squared_error(actual, pred))) if len(actual) else float("nan"),
+            }
+
+        actual_holdout = test_weekly["sales"].astype(float).values
+        bundle_results: List[Dict[str, Any]] = []
+        bundle_models: Dict[str, Any] = {}
+        bundle_features_selected: Dict[str, List[str]] = {}
+        bundle_pred_frames: Dict[str, pd.DataFrame] = {}
+        for bundle_name, bundle_candidates in WEEKLY_BASELINE_BUNDLES.items():
+            eligible_features = select_eligible_features(train_weekly, bundle_candidates)
+            if not eligible_features:
+                continue
+            bundle_model = train_weekly_core_model(train_weekly, eligible_features)
+            bundle_pred = predict_weekly_holdout_with_actual_exog(
+                bundle_model,
                 train_weekly,
                 test_weekly,
-                legacy_baseline_feature_names,
+                eligible_features,
                 seasonal_anchor_weight=seasonal_anchor_weight_train,
             )
-            legacy_candidate_pred = test_pred_weekly_legacy["pred_weekly_sales"].astype(float).values
-            wape_expanded = float(calculate_wape(test_weekly["sales"].values, expanded_candidate_pred))
-            wape_legacy = float(calculate_wape(test_weekly["sales"].values, legacy_candidate_pred))
-            corr_expanded = (
-                float(np.corrcoef(test_weekly["sales"].values, expanded_candidate_pred)[0, 1])
-                if len(test_weekly) > 1 else float("nan")
-            )
-            std_ratio_expanded = (
-                float(np.std(expanded_candidate_pred, ddof=0) / max(np.std(test_weekly["sales"].values, ddof=0), 1e-9))
-                if len(test_weekly) > 1 else float("nan")
-            )
-            weekly_baseline_candidate_comparison["legacy"] = {
-                "features": list(legacy_baseline_feature_names),
-                "holdout_wape": wape_legacy,
-                "holdout_mape": float(calculate_mape(test_weekly["sales"].values, legacy_candidate_pred)),
-                "corr": float(np.corrcoef(test_weekly["sales"].values, legacy_candidate_pred)[0, 1]) if len(test_weekly) > 1 else float("nan"),
-                "std_ratio": float(np.std(legacy_candidate_pred, ddof=0) / max(np.std(test_weekly["sales"].values, ddof=0), 1e-9)) if len(test_weekly) > 1 else float("nan"),
-                "mean_bias": float((legacy_candidate_pred - test_weekly["sales"].values).mean()) if len(test_weekly) else float("nan"),
-                "mae": float(mean_absolute_error(test_weekly["sales"].values, legacy_candidate_pred)) if len(test_weekly) else float("nan"),
-                "rmse": float(np.sqrt(mean_squared_error(test_weekly["sales"].values, legacy_candidate_pred))) if len(test_weekly) else float("nan"),
-            }
-            use_expanded_baseline = bool(
-                wape_expanded <= wape_legacy
-                and (not np.isfinite(corr_expanded) or corr_expanded >= 0.45)
-                and (not np.isfinite(std_ratio_expanded) or std_ratio_expanded >= 0.40)
-            )
-            if not use_expanded_baseline:
-                weekly_model = legacy_weekly_model
-                baseline_feature_names = legacy_baseline_feature_names
-                test_pred_weekly = test_pred_weekly_legacy
-                selected_candidate_name = "legacy_baseline"
-                gate_reasons = []
-                if wape_expanded > wape_legacy:
-                    gate_reasons.append("expanded_worse_wape")
-                if np.isfinite(corr_expanded) and corr_expanded < 0.45:
-                    gate_reasons.append("expanded_failed_corr_gate")
-                if np.isfinite(std_ratio_expanded) and std_ratio_expanded < 0.40:
-                    gate_reasons.append("expanded_failed_std_ratio_gate")
-                weekly_baseline_candidate_comparison["selection_reason"] = gate_reasons[0] if gate_reasons else "expanded_failed_holdout_gate"
+            bundle_pred_arr = bundle_pred["pred_weekly_sales"].astype(float).values
+            candidate_predictions[bundle_name] = bundle_pred_arr
+            candidate_record = {"name": bundle_name, "features": list(eligible_features)}
+            candidate_record.update(_bundle_metrics(actual_holdout, bundle_pred_arr))
+            bundle_results.append(candidate_record)
+            bundle_models[bundle_name] = bundle_model
+            bundle_features_selected[bundle_name] = list(eligible_features)
+            bundle_pred_frames[bundle_name] = bundle_pred
+
+        legacy_reference = next((row for row in bundle_results if row["name"] == "legacy_baseline"), None)
+        if legacy_reference is None and bundle_results:
+            legacy_reference = bundle_results[0]
+        weekly_baseline_candidate_comparison["legacy_reference"] = dict(legacy_reference) if legacy_reference else {}
+
+        selected_bundle = legacy_reference
+        passed_alternatives: List[Dict[str, Any]] = []
+        if legacy_reference is not None:
+            for candidate in bundle_results:
+                if candidate["name"] == "legacy_baseline":
+                    candidate["eligible_under_selection_rule"] = True
+                    candidate["rejection_reason"] = None
+                    continue
+                checks: List[str] = []
+                if not (candidate["holdout_wape"] <= legacy_reference["holdout_wape"] + 0.5):
+                    checks.append("wape_tolerance_failed")
+                if not np.isfinite(candidate["corr"]):
+                    checks.append("corr_non_finite")
+                elif np.isfinite(legacy_reference["corr"]) and candidate["corr"] < legacy_reference["corr"] - 0.05:
+                    checks.append("corr_tolerance_failed")
+                if not np.isfinite(candidate["std_ratio"]):
+                    checks.append("std_ratio_non_finite")
+                elif np.isfinite(legacy_reference["std_ratio"]) and candidate["std_ratio"] < legacy_reference["std_ratio"] + 0.02:
+                    checks.append("std_ratio_improvement_failed")
+                candidate["eligible_under_selection_rule"] = len(checks) == 0
+                candidate["rejection_reason"] = None if len(checks) == 0 else checks[0]
+                if len(checks) == 0:
+                    passed_alternatives.append(candidate)
+
+            if passed_alternatives:
+                passed_alternatives = sorted(
+                    passed_alternatives,
+                    key=lambda row: (
+                        -row["std_ratio"] if np.isfinite(row["std_ratio"]) else float("inf"),
+                        row["holdout_wape"],
+                        -(row["corr"] if np.isfinite(row["corr"]) else -1e9),
+                    ),
+                )
+                selected_bundle = passed_alternatives[0]
+                weekly_baseline_candidate_comparison["selection_reason"] = "non_legacy_passed_selection_rule"
             else:
-                test_pred_weekly = test_pred_weekly_expanded
-                selected_candidate_name = "expanded_baseline"
-                weekly_baseline_candidate_comparison["selection_reason"] = "expanded_passed_holdout_gate"
+                weekly_baseline_candidate_comparison["selection_reason"] = "legacy_retained_no_nonlegacy_passed_rule"
+
+        weekly_baseline_candidate_comparison["candidates"] = bundle_results
+        if selected_bundle is not None:
+            selected_candidate_name = str(selected_bundle["name"])
+            weekly_model = bundle_models[selected_candidate_name]
+            baseline_feature_names = bundle_features_selected[selected_candidate_name]
+            test_pred_weekly = bundle_pred_frames[selected_candidate_name]
         else:
-            test_pred_weekly = test_pred_weekly_expanded
-            selected_candidate_name = "expanded_baseline"
-            legacy_candidate_pred = expanded_candidate_pred.copy()
-            weekly_baseline_candidate_comparison["legacy"] = {
-                "features": list(baseline_feature_names),
-                "holdout_wape": float(calculate_wape(test_weekly["sales"].values, legacy_candidate_pred)),
-                "holdout_mape": float(calculate_mape(test_weekly["sales"].values, legacy_candidate_pred)),
-                "corr": float(np.corrcoef(test_weekly["sales"].values, legacy_candidate_pred)[0, 1]) if len(test_weekly) > 1 else float("nan"),
-                "std_ratio": float(np.std(legacy_candidate_pred, ddof=0) / max(np.std(test_weekly["sales"].values, ddof=0), 1e-9)) if len(test_weekly) > 1 else float("nan"),
-                "mean_bias": float((legacy_candidate_pred - test_weekly["sales"].values).mean()) if len(test_weekly) else float("nan"),
-                "mae": float(mean_absolute_error(test_weekly["sales"].values, legacy_candidate_pred)) if len(test_weekly) else float("nan"),
-                "rmse": float(np.sqrt(mean_squared_error(test_weekly["sales"].values, legacy_candidate_pred))) if len(test_weekly) else float("nan"),
-            }
-            weekly_baseline_candidate_comparison["selection_reason"] = "legacy_not_distinct_from_expanded"
+            weekly_model = train_weekly_core_model(train_weekly, baseline_feature_names)
+            test_pred_weekly = predict_weekly_holdout_with_actual_exog(
+                weekly_model,
+                train_weekly,
+                test_weekly,
+                baseline_feature_names,
+                seasonal_anchor_weight=seasonal_anchor_weight_train,
+            )
+
+        legacy_candidate_pred = candidate_predictions.get("legacy_baseline", test_pred_weekly["pred_weekly_sales"].astype(float).values.copy())
+        price_only_candidate_pred = candidate_predictions.get("price_only_baseline", legacy_candidate_pred.copy())
+        price_promo_candidate_pred = candidate_predictions.get("price_promo_baseline", legacy_candidate_pred.copy())
+        price_promo_freight_candidate_pred = candidate_predictions.get("price_promo_freight_baseline", legacy_candidate_pred.copy())
         baseline_pred_train = np.expm1(weekly_model.predict(train_weekly[baseline_feature_names].astype(float))).clip(min=0.0)
         uplift_bundle = fit_weekly_uplift_model(train_weekly, baseline_pred_train, small_mode)
         final_pred_test = test_pred_weekly["pred_weekly_sales"].astype(float).values.copy()
@@ -1636,11 +1646,12 @@ def run_full_pricing_analysis_universal(
         test_pred_weekly = pd.DataFrame({"week_start": test_weekly["week_start"].values, "pred_weekly_sales": naive_fallback})
         final_pred_test = naive_fallback.copy()
         legacy_candidate_pred = final_pred_test.copy()
-        expanded_candidate_pred = final_pred_test.copy()
+        price_only_candidate_pred = final_pred_test.copy()
+        price_promo_candidate_pred = final_pred_test.copy()
+        price_promo_freight_candidate_pred = final_pred_test.copy()
         uplift_multiplier = np.ones(len(final_pred_test), dtype=float)
         uplift_log_pred = np.zeros(len(final_pred_test), dtype=float)
-        weekly_baseline_candidate_comparison["legacy"] = {
-            "features": list(legacy_baseline_feature_names),
+        fallback_metrics = {
             "holdout_wape": float(calculate_wape(test_weekly["sales"].values, legacy_candidate_pred)) if len(test_weekly) else float("nan"),
             "holdout_mape": float(calculate_mape(test_weekly["sales"].values, legacy_candidate_pred)) if len(test_weekly) else float("nan"),
             "corr": float(np.corrcoef(test_weekly["sales"].values, legacy_candidate_pred)[0, 1]) if len(test_weekly) > 1 else float("nan"),
@@ -1649,16 +1660,13 @@ def run_full_pricing_analysis_universal(
             "mae": float(mean_absolute_error(test_weekly["sales"].values, legacy_candidate_pred)) if len(test_weekly) else float("nan"),
             "rmse": float(np.sqrt(mean_squared_error(test_weekly["sales"].values, legacy_candidate_pred))) if len(test_weekly) else float("nan"),
         }
-        weekly_baseline_candidate_comparison["expanded"] = {
-            "features": list(baseline_feature_names),
-            "holdout_wape": weekly_baseline_candidate_comparison["legacy"]["holdout_wape"],
-            "holdout_mape": weekly_baseline_candidate_comparison["legacy"]["holdout_mape"],
-            "corr": weekly_baseline_candidate_comparison["legacy"]["corr"],
-            "std_ratio": weekly_baseline_candidate_comparison["legacy"]["std_ratio"],
-            "mean_bias": weekly_baseline_candidate_comparison["legacy"]["mean_bias"],
-            "mae": weekly_baseline_candidate_comparison["legacy"]["mae"],
-            "rmse": weekly_baseline_candidate_comparison["legacy"]["rmse"],
-        }
+        weekly_baseline_candidate_comparison["legacy_reference"] = {"name": "legacy_baseline", "features": list(legacy_baseline_feature_names), **fallback_metrics}
+        weekly_baseline_candidate_comparison["candidates"] = [
+            {"name": "legacy_baseline", "features": list(legacy_baseline_feature_names), **fallback_metrics, "eligible_under_selection_rule": True, "rejection_reason": None},
+            {"name": "price_only_baseline", "features": list(legacy_baseline_feature_names), **fallback_metrics, "eligible_under_selection_rule": False, "rejection_reason": "weekly_ml_not_used"},
+            {"name": "price_promo_baseline", "features": list(legacy_baseline_feature_names), **fallback_metrics, "eligible_under_selection_rule": False, "rejection_reason": "weekly_ml_not_used"},
+            {"name": "price_promo_freight_baseline", "features": list(legacy_baseline_feature_names), **fallback_metrics, "eligible_under_selection_rule": False, "rejection_reason": "weekly_ml_not_used"},
+        ]
     weekly_baseline_candidate_comparison["selected_candidate"] = selected_candidate_name
     uplift_enabled_holdout = bool(len(uplift_bundle.get("models", [])) > 0)
     wape_core_holdout = float(calculate_wape(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)) if len(test_weekly) else float("nan")
@@ -1777,18 +1785,24 @@ def run_full_pricing_analysis_universal(
         "week_start": pd.to_datetime(test_weekly["week_start"]).dt.strftime("%Y-%m-%d"),
         "actual_sales": test_weekly["sales"].astype(float).values,
         "legacy_pred_sales": np.asarray(legacy_candidate_pred, dtype=float),
-        "expanded_pred_sales": np.asarray(expanded_candidate_pred, dtype=float),
+        "price_only_pred_sales": np.asarray(price_only_candidate_pred, dtype=float),
+        "price_promo_pred_sales": np.asarray(price_promo_candidate_pred, dtype=float),
+        "price_promo_freight_pred_sales": np.asarray(price_promo_freight_candidate_pred, dtype=float),
         "selected_pred_sales": holdout_predictions["baseline_pred_sales"].astype(float).values,
         "naive_pred_sales": np.asarray(naive_ma4, dtype=float),
         "final_pred_sales": holdout_predictions["final_pred_sales"].astype(float).values,
     })
     holdout_weekly_diagnostics["legacy_error"] = holdout_weekly_diagnostics["legacy_pred_sales"] - holdout_weekly_diagnostics["actual_sales"]
-    holdout_weekly_diagnostics["expanded_error"] = holdout_weekly_diagnostics["expanded_pred_sales"] - holdout_weekly_diagnostics["actual_sales"]
+    holdout_weekly_diagnostics["price_only_error"] = holdout_weekly_diagnostics["price_only_pred_sales"] - holdout_weekly_diagnostics["actual_sales"]
+    holdout_weekly_diagnostics["price_promo_error"] = holdout_weekly_diagnostics["price_promo_pred_sales"] - holdout_weekly_diagnostics["actual_sales"]
+    holdout_weekly_diagnostics["price_promo_freight_error"] = holdout_weekly_diagnostics["price_promo_freight_pred_sales"] - holdout_weekly_diagnostics["actual_sales"]
     holdout_weekly_diagnostics["selected_error"] = holdout_weekly_diagnostics["selected_pred_sales"] - holdout_weekly_diagnostics["actual_sales"]
     holdout_weekly_diagnostics["final_error"] = holdout_weekly_diagnostics["final_pred_sales"] - holdout_weekly_diagnostics["actual_sales"]
     holdout_weekly_diagnostics["actual_wow_change"] = holdout_weekly_diagnostics["actual_sales"].pct_change().replace([np.inf, -np.inf], np.nan)
     holdout_weekly_diagnostics["legacy_wow_change"] = holdout_weekly_diagnostics["legacy_pred_sales"].pct_change().replace([np.inf, -np.inf], np.nan)
-    holdout_weekly_diagnostics["expanded_wow_change"] = holdout_weekly_diagnostics["expanded_pred_sales"].pct_change().replace([np.inf, -np.inf], np.nan)
+    holdout_weekly_diagnostics["price_only_wow_change"] = holdout_weekly_diagnostics["price_only_pred_sales"].pct_change().replace([np.inf, -np.inf], np.nan)
+    holdout_weekly_diagnostics["price_promo_wow_change"] = holdout_weekly_diagnostics["price_promo_pred_sales"].pct_change().replace([np.inf, -np.inf], np.nan)
+    holdout_weekly_diagnostics["price_promo_freight_wow_change"] = holdout_weekly_diagnostics["price_promo_freight_pred_sales"].pct_change().replace([np.inf, -np.inf], np.nan)
     holdout_weekly_diagnostics["selected_wow_change"] = holdout_weekly_diagnostics["selected_pred_sales"].pct_change().replace([np.inf, -np.inf], np.nan)
     for col in ["price_idx", "discount_mean", "promotion_share", "promo_any", "freight_mean", "stockout_share"]:
         if col in test_weekly.columns:
@@ -1973,6 +1987,8 @@ def run_full_pricing_analysis_universal(
             reason_excluded = "no_variability"
         elif f in set(WEEKLY_UPLIFT_FEATURES) and present_in_weekly and bool(uplift_bundle.get("disabled", False)):
             reason_excluded = "weekly_feature_available_but_uplift_disabled"
+        elif f in {"discount_mean", "promo_any"} and present_in_weekly and not used_in_weekly_model:
+            reason_excluded = "excluded_from_weekly_baseline_bundle_policy"
         elif present_in_weekly and not used_in_weekly_model:
             reason_excluded = "not_selected_in_active_weekly_model"
         elif not used_in_model:
@@ -2006,16 +2022,27 @@ def run_full_pricing_analysis_universal(
         )
 
     feature_report = pd.DataFrame(feature_usage_rows)
-    expanded_feature_readiness = {}
-    for col in ["price_idx", "discount_mean", "promotion_share", "promo_any", "freight_mean"]:
+    candidate_feature_readiness = {}
+    candidate_eligibility = {
+        name: set(select_eligible_features(train_weekly, features))
+        for name, features in WEEKLY_BASELINE_BUNDLES.items()
+    }
+    for col in ["price_idx", "promotion_share", "freight_mean", "discount_mean", "promo_any"]:
         present_weekly = col in weekly_full.columns
         series_weekly = pd.to_numeric(weekly_full[col], errors="coerce") if present_weekly else pd.Series(dtype=float)
-        expanded_feature_readiness[col] = {
+        feature_row = {
             "present_in_weekly": bool(present_weekly),
             "non_null_share": float(series_weekly.notna().mean()) if present_weekly and len(series_weekly) else 0.0,
             "nunique": int(series_weekly.nunique(dropna=True)) if present_weekly else 0,
-            "used_in_expanded_candidate": bool(col in WEEKLY_BASELINE_FEATURES and col in model_frame.columns),
         }
+        if col in {"price_idx", "promotion_share", "freight_mean"}:
+            feature_row["eligible_for_price_only_baseline"] = bool(col in candidate_eligibility.get("price_only_baseline", set()))
+            feature_row["eligible_for_price_promo_baseline"] = bool(col in candidate_eligibility.get("price_promo_baseline", set()))
+            feature_row["eligible_for_price_promo_freight_baseline"] = bool(col in candidate_eligibility.get("price_promo_freight_baseline", set()))
+        else:
+            feature_row["excluded_by_design"] = True
+            feature_row["exclusion_reason"] = "removed_from_weekly_baseline_bundle_policy"
+        candidate_feature_readiness[col] = feature_row
     holdout_actual = holdout_predictions["actual_sales"].astype(float).values
     holdout_final = holdout_predictions["final_pred_sales"].astype(float).values
     holdout_actual_std = float(np.std(holdout_actual, ddof=0)) if len(holdout_actual) else float("nan")
@@ -2065,7 +2092,7 @@ def run_full_pricing_analysis_universal(
         "metrics_summary": {"holdout": holdout_metrics, "rolling_weekly_backtest": backtest_summary},
         "weekly_baseline_candidate_comparison": weekly_baseline_candidate_comparison,
         "scenario_sensitivity_diagnostics": scenario_sensitivity_diagnostics,
-        "expanded_feature_readiness": expanded_feature_readiness,
+        "candidate_feature_readiness": candidate_feature_readiness,
         "warnings": warnings,
         "small_mode_info": small_mode_info,
         "feature_usage_report": feature_report.to_dict("records"),

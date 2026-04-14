@@ -315,6 +315,70 @@ def test_holdout_final_differs_from_baseline_when_uplift_enabled():
         assert diff < 1e-6
 
 
+def test_bundle_selection_picks_price_promo_when_rule_passes(monkeypatch):
+    def fake_predict_weekly_holdout_with_actual_exog(model, train_weekly, test_weekly, feature_names, seasonal_anchor_weight=0.0):
+        actual = test_weekly["sales"].astype(float).values
+        if "freight_mean" in feature_names:
+            pred = actual * 1.01
+        elif "promotion_share" in feature_names:
+            pred = actual * 1.03
+        elif "price_idx" in feature_names:
+            pred = actual * 0.80
+        else:
+            pred = actual * 0.95
+        out = test_weekly[["week"]].copy() if "week" in test_weekly.columns else pd.DataFrame(index=test_weekly.index)
+        out["pred_weekly_sales"] = pred
+        return out
+
+    monkeypatch.setattr(app_module, "predict_weekly_holdout_with_actual_exog", fake_predict_weekly_holdout_with_actual_exog)
+
+    res = _analyze()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    ranking = summary["weekly_baseline_candidate_comparison"]
+    assert ranking["selected_candidate"] == "price_promo_baseline"
+
+
+def test_bundle_selection_rejects_non_finite_non_legacy_metrics(monkeypatch):
+    def fake_predict_weekly_holdout_with_actual_exog(model, train_weekly, test_weekly, feature_names, seasonal_anchor_weight=0.0):
+        actual = test_weekly["sales"].astype(float).values
+        if "price_idx" in feature_names and "promotion_share" not in feature_names:
+            pred = np.repeat(float(np.nanmean(actual)), len(actual))
+        elif "promotion_share" in feature_names and "freight_mean" not in feature_names:
+            pred = actual * 1.04
+        elif "freight_mean" in feature_names:
+            pred = actual * 1.02
+        else:
+            pred = actual * 0.98
+        out = test_weekly[["week"]].copy() if "week" in test_weekly.columns else pd.DataFrame(index=test_weekly.index)
+        out["pred_weekly_sales"] = pred
+        return out
+
+    monkeypatch.setattr(app_module, "predict_weekly_holdout_with_actual_exog", fake_predict_weekly_holdout_with_actual_exog)
+
+    res = _analyze()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    ranking = summary["weekly_baseline_candidate_comparison"]
+    price_only = next(row for row in ranking["candidates"] if row["name"] == "price_only_baseline")
+    assert price_only["eligible_under_selection_rule"] is False
+    assert price_only["rejection_reason"] == "corr_non_finite"
+    assert ranking["selected_candidate"] != "price_only_baseline"
+
+
+def test_holdout_weekly_diagnostics_contains_all_bundle_prediction_columns():
+    res = _analyze()
+    holdout_weekly = pd.read_csv(pd.io.common.BytesIO(res["holdout_weekly_diagnostics_csv"]))
+    expected = {
+        "legacy_pred_sales",
+        "price_only_pred_sales",
+        "price_promo_pred_sales",
+        "price_promo_freight_pred_sales",
+        "selected_pred_sales",
+        "final_pred_sales",
+        "naive_pred_sales",
+    }
+    assert expected.issubset(set(holdout_weekly.columns))
+
+
 def test_fallback_uplift_changes_uplift_log_when_bundle_disabled():
     res = _analyze()
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
