@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import json
+import app as app_module
 
 from data_adapter import build_auto_mapping, normalize_transactions, build_daily_from_transactions
 from what_if import build_sensitivity_grid, run_scenario_set
@@ -102,6 +103,10 @@ def _make_txn(n_days: int = 180) -> pd.DataFrame:
 
 def _analyze():
     return run_full_pricing_analysis_universal(_make_txn(), "cat-a", "sku-1")
+
+
+def _analyze_long_signal():
+    return run_full_pricing_analysis_universal(_make_txn(420), "cat-a", "sku-1")
 
 
 def test_scenario_not_equal_as_is_when_price_changes():
@@ -225,6 +230,8 @@ def test_holdout_final_has_decomposition():
     res = _analyze()
     holdout = pd.read_csv(pd.io.common.BytesIO(res["holdout_predictions_csv"]))
     assert {"baseline_pred_sales", "price_effect_multiplier", "uplift_multiplier", "final_pred_sales"}.issubset(set(holdout.columns))
+    assert "is_full_week" in holdout.columns
+    assert (holdout["is_full_week"] >= 1).all()
 
 
 def test_no_backward_fill_leakage_in_daily_builder():
@@ -259,8 +266,127 @@ def test_no_double_multiplier():
 
 def test_uplift_uses_baseline_feature():
     res = _analyze()
-    feats = res["_trained_bundle"]["uplift_bundle"]["features"]
+    bundle = res["_trained_bundle"]["uplift_bundle"]
+    feats = bundle["features"]
     assert "baseline_log_feature" in feats
+    if not bundle.get("disabled", False):
+        assert len(bundle.get("models", [])) > 0
+
+
+def test_uplift_bundle_enabled_when_signal_present():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"]["uplift_bundle"]
+    assert "features" in bundle
+    assert "baseline_log_feature" in bundle["features"]
+    if bundle.get("disabled") is False:
+        assert len(bundle.get("models", [])) > 0
+    else:
+        assert bundle.get("reason") in {"uplift_holdout_failed", "insufficient_weekly_uplift_signal", "benchmark_gate_failed"}
+
+
+def test_gate_accounts_for_correlation_and_std_ratio():
+    res = _analyze()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    assert "corr_final" in summary["scenario_output_summary"]
+    assert "std_ratio_final" in summary["scenario_output_summary"]
+    assert "shape_quality_low" in summary["scenario_output_summary"]
+    assert "shape_quality_low" in summary["config"]
+
+
+def test_price_and_promo_scenario_changes_demand():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    base = run_what_if_projection(bundle, manual_price=base_price, overrides={"promotion": 0.0})
+    promo = run_what_if_projection(bundle, manual_price=base_price * 0.9, overrides={"promotion": 1.0})
+    assert promo["demand_total"] != base["demand_total"]
+    assert promo["revenue_total"] != base["revenue_total"]
+
+
+def test_holdout_final_differs_from_baseline_when_uplift_enabled():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"]["uplift_bundle"]
+    holdout = pd.read_csv(pd.io.common.BytesIO(res["holdout_predictions_csv"]))
+    diff = float(np.abs(holdout["final_pred_sales"] - holdout["baseline_pred_sales"]).sum())
+    if bundle.get("disabled") is False:
+        assert diff > 1e-6
+    else:
+        assert diff < 1e-6
+
+
+def test_fallback_uplift_changes_uplift_log_when_bundle_disabled():
+    res = _analyze()
+    bundle = res["_trained_bundle"]["uplift_bundle"]
+    assert bundle.get("disabled") is True
+    base_price = float(res["_trained_bundle"]["base_ctx"]["price"])
+    scenario = run_what_if_projection(res["_trained_bundle"], manual_price=base_price * 0.9, overrides={"promotion": 1.0})
+    assert float(np.abs(scenario["daily"]["uplift_log"]).sum()) > 0.0
+
+
+def test_learned_uplift_log_changes_with_price_when_enabled():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    low = run_what_if_projection(bundle, manual_price=base_price * 0.9)
+    high = run_what_if_projection(bundle, manual_price=base_price * 1.1)
+    if bundle["uplift_bundle"].get("disabled") is False:
+        assert float(low["daily"]["uplift_log"].mean()) != float(high["daily"]["uplift_log"].mean())
+    else:
+        assert bundle["uplift_bundle"].get("reason") in {"uplift_holdout_failed", "insufficient_weekly_uplift_signal", "benchmark_gate_failed"}
+
+
+def test_baseline_decomposition_consistency_when_uplift_active():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"]
+    sc = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]) * 0.95)
+    daily = sc["daily"]
+    assert "base_pred_sales" in daily.columns
+    assert "pred_sales" in daily.columns
+    assert float(np.abs(daily["pred_sales"] - daily["base_pred_sales"]).sum()) > 1e-6
+
+
+def test_uplift_rollback_when_holdout_worse_than_baseline(monkeypatch):
+    orig_predict = app_module.predict_uplift_log_bundle
+
+    def _bad_uplift(frame, uplift_bundle):
+        pred, std = orig_predict(frame, uplift_bundle)
+        return pred + 1.5, std
+
+    monkeypatch.setattr(app_module, "predict_uplift_log_bundle", _bad_uplift)
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"]["uplift_bundle"]
+    assert bundle.get("reason") == "uplift_holdout_failed"
+    holdout = pd.read_csv(pd.io.common.BytesIO(res["holdout_predictions_csv"]))
+    assert float(np.abs(holdout["final_pred_sales"] - holdout["baseline_pred_sales"]).sum()) < 1e-6
+
+
+def test_uplift_disabled_when_benchmark_gate_fails(monkeypatch):
+    class BadWeeklyModel:
+        def predict(self, X):
+            return np.zeros(len(X), dtype=float)
+
+    monkeypatch.setattr(app_module, "train_weekly_core_model", lambda weekly_train, feature_names: BadWeeklyModel())
+    monkeypatch.setattr(
+        app_module,
+        "fit_weekly_uplift_model",
+        lambda weekly_train, baseline_pred_train, small_mode: {
+            "models": [],
+            "features": ["baseline_log_feature"],
+            "feature_stats": {},
+            "disabled": True,
+            "reason": "forced_for_test",
+            "signal_info": {},
+        },
+    )
+    res = run_full_pricing_analysis_universal(_make_txn(420), "cat-a", "sku-1")
+    bundle = res["_trained_bundle"]["uplift_bundle"]
+    assert bundle.get("disabled") is True
+    assert bundle.get("reason") == "benchmark_gate_failed"
+    assert len(bundle.get("models", [])) == 0
+    assert res["_trained_bundle"]["baseline_bundle"]["selected_forecaster"] in {"naive_lag1w", "naive_ma4w"}
+    holdout = pd.read_csv(pd.io.common.BytesIO(res["holdout_predictions_csv"]))
+    assert float(np.abs(holdout["final_pred_sales"] - holdout["baseline_pred_sales"]).sum()) < 1e-9
+    assert float(np.abs(holdout["uplift_log_pred"]).sum()) < 1e-9
 
 
 def test_refit_scope_is_full_history():
@@ -312,6 +438,23 @@ def test_feature_report_truthfulness_for_engineered_features():
     assert bool(row["engineered_feature"]) is True
     assert bool(row["found_in_raw"]) is False
     assert bool(row["present_in_daily"]) is True
+
+
+def test_feature_report_has_weekly_usage_flag():
+    res = _analyze()
+    fr = res["feature_report"]
+    row = fr[fr["factor_name"] == "sales_lag1w"].iloc[0]
+    assert "used_in_weekly_model" in fr.columns
+    assert bool(row["used_in_weekly_model"]) is True
+
+
+def test_seasonal_anchor_weight_present_in_bundle_and_summary():
+    res = _analyze_long_signal()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    weight_cfg = float(summary["config"]["seasonal_anchor_weight"])
+    weight_bundle = float(res["_trained_bundle"]["baseline_bundle"]["seasonal_anchor_weight"])
+    assert 0.0 <= weight_cfg <= 0.30
+    assert abs(weight_cfg - weight_bundle) < 1e-9
 
 
 def test_small_mode_warnings_present_on_short_history():
