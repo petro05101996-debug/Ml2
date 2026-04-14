@@ -9,6 +9,7 @@ from app import (
     apply_weekly_fallback_projection,
     build_manual_scenario_artifacts,
     read_uploaded_csv_safely,
+    resolve_scenario_driver_mode,
     robust_clean_dirty_data,
     run_full_pricing_analysis_universal,
     run_what_if_projection,
@@ -316,11 +317,17 @@ def test_holdout_final_differs_from_baseline_when_uplift_enabled():
 
 def test_fallback_uplift_changes_uplift_log_when_bundle_disabled():
     res = _analyze()
-    bundle = res["_trained_bundle"]["uplift_bundle"]
-    assert bundle.get("disabled") is True
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    cfg = summary["config"]
+    assert "fallback_multiplier_used" in cfg
     base_price = float(res["_trained_bundle"]["base_ctx"]["price"])
     scenario = run_what_if_projection(res["_trained_bundle"], manual_price=base_price * 0.9, overrides={"promotion": 1.0})
-    assert float(np.abs(scenario["daily"]["uplift_log"]).sum()) > 0.0
+    if cfg["selected_forecaster"] == "weekly_model" and cfg["baseline_has_exogenous_driver"]:
+        assert scenario["fallback_multiplier_used"] is False
+        assert float(np.abs(scenario["daily"]["uplift_log"]).sum()) < 1e-9
+    else:
+        assert scenario["fallback_multiplier_used"] is True
+        assert float(np.abs(scenario["daily"]["uplift_log"]).sum()) > 0.0
 
 
 def test_learned_uplift_log_changes_with_price_when_enabled():
@@ -355,7 +362,7 @@ def test_uplift_rollback_when_holdout_worse_than_baseline(monkeypatch):
     monkeypatch.setattr(app_module, "predict_uplift_log_bundle", _bad_uplift)
     res = _analyze_long_signal()
     bundle = res["_trained_bundle"]["uplift_bundle"]
-    assert bundle.get("reason") == "uplift_holdout_failed"
+    assert bundle.get("reason") in {"uplift_holdout_failed", "benchmark_gate_failed"}
     holdout = pd.read_csv(pd.io.common.BytesIO(res["holdout_predictions_csv"]))
     assert float(np.abs(holdout["final_pred_sales"] - holdout["baseline_pred_sales"]).sum()) < 1e-6
 
@@ -480,3 +487,78 @@ def test_stock_is_not_public_scenario_factor():
     fr = res["feature_report"]
     row = fr[fr["factor_name"] == "stock"].iloc[0]
     assert bool(row["used_in_scenario"]) is False
+
+
+def test_weekly_baseline_price_effect_works_when_uplift_disabled():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"].copy()
+
+    class PriceAwareModel:
+        def predict(self, X):
+            xdf = pd.DataFrame(X).copy()
+            price_idx = pd.to_numeric(xdf.get("price_idx", pd.Series(np.ones(len(xdf)))), errors="coerce").fillna(1.0).clip(lower=0.5, upper=1.5)
+            pred = 60.0 / price_idx.values
+            return np.log1p(np.clip(pred, 0.0, None))
+
+    bundle["baseline_bundle"] = dict(bundle["baseline_bundle"])
+    bundle["baseline_bundle"]["selected_forecaster"] = "weekly_model"
+    bundle["baseline_bundle"]["features"] = list(dict.fromkeys(app_module.WEEKLY_BASELINE_FEATURES))
+    bundle["baseline_bundle"]["model"] = PriceAwareModel()
+    bundle["uplift_bundle"] = {"models": [], "features": ["baseline_log_feature"], "feature_stats": {}, "disabled": True, "reason": "forced_for_test", "signal_info": {}}
+    base_price = float(bundle["base_ctx"]["price"])
+    low = run_what_if_projection(bundle, manual_price=base_price * 0.95)
+    high = run_what_if_projection(bundle, manual_price=base_price * 1.05)
+    assert low["demand_total"] != high["demand_total"]
+
+
+def test_no_fallback_multiplier_for_weekly_model_with_exog_baseline():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"].copy()
+    bundle["baseline_bundle"] = dict(bundle["baseline_bundle"])
+    bundle["baseline_bundle"]["selected_forecaster"] = "weekly_model"
+    bundle["baseline_bundle"]["features"] = list(dict.fromkeys(app_module.WEEKLY_BASELINE_FEATURES))
+    bundle["uplift_bundle"] = {"models": [], "features": ["baseline_log_feature"], "feature_stats": {}, "disabled": True, "reason": "forced_for_test", "signal_info": {}}
+    base_price = float(bundle["base_ctx"]["price"])
+    scenario = run_what_if_projection(bundle, manual_price=base_price * 1.08, overrides={"promotion": 1.0})
+    assert scenario["demand_total"] > 0.0
+    assert scenario["fallback_multiplier_used"] is False
+
+
+def test_resolve_scenario_driver_mode_has_three_states():
+    assert resolve_scenario_driver_mode("weekly_model", True) == "weekly_ml_exogenous"
+    assert resolve_scenario_driver_mode("weekly_model", False) == "weekly_ml_legacy_plus_rule_based_multiplier"
+    assert resolve_scenario_driver_mode("naive_ma4w", False) == "naive_plus_rule_based_multiplier"
+
+
+def test_weekly_baseline_monotone_price_idx_non_increasing():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"]
+    if bundle["baseline_bundle"]["selected_forecaster"] != "weekly_model":
+        return
+    base_price = float(bundle["base_ctx"]["price"])
+    low = run_what_if_projection(bundle, manual_price=base_price * 0.90)
+    high = run_what_if_projection(bundle, manual_price=base_price * 1.10)
+    assert high["demand_total"] <= low["demand_total"]
+
+
+def test_feature_report_weekly_only_reason_is_not_absent_after_daily_pipeline():
+    res = _analyze()
+    fr = res["feature_report"]
+    row = fr[fr["factor_name"] == "price_idx"].iloc[0]
+    assert bool(row["present_in_weekly"]) is True
+    assert row["reason_excluded"] != "absent_after_daily_pipeline"
+
+
+def test_bridge_week_keeps_immediate_scenario_reaction():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"]
+    if bundle["baseline_bundle"]["selected_forecaster"] != "weekly_model":
+        return
+    if bundle["uplift_bundle"].get("disabled") is not True:
+        return
+    base_price = float(bundle["base_ctx"]["price"])
+    low = run_what_if_projection(bundle, manual_price=base_price * 0.95)
+    high = run_what_if_projection(bundle, manual_price=base_price * 1.05)
+    low_first_week = float(low["daily"].head(7)["actual_sales"].sum())
+    high_first_week = float(high["daily"].head(7)["actual_sales"].sum())
+    assert low_first_week != high_first_week
