@@ -9,6 +9,7 @@ from app import (
     apply_weekly_fallback_projection,
     build_manual_scenario_artifacts,
     read_uploaded_csv_safely,
+    resolve_weekly_driver_mode,
     resolve_scenario_driver_mode,
     robust_clean_dirty_data,
     run_full_pricing_analysis_universal,
@@ -282,7 +283,7 @@ def test_uplift_bundle_enabled_when_signal_present():
     if bundle.get("disabled") is False:
         assert len(bundle.get("models", [])) > 0
     else:
-        assert bundle.get("reason") in {"uplift_holdout_failed", "insufficient_weekly_uplift_signal", "benchmark_gate_failed"}
+        assert bundle.get("reason") in {"uplift_holdout_failed", "uplift_no_exogenous_features", "uplift_not_enough_rows", "benchmark_gate_failed"}
 
 
 def test_gate_accounts_for_correlation_and_std_ratio():
@@ -375,8 +376,22 @@ def test_holdout_weekly_diagnostics_contains_all_bundle_prediction_columns():
         "selected_pred_sales",
         "final_pred_sales",
         "naive_pred_sales",
+        "price_gap_ref_8w",
+        "freight_pct_change_1w",
     }
     assert expected.issubset(set(holdout_weekly.columns))
+
+
+def test_summary_contains_explicit_weekly_driver_mode():
+    res = _analyze()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    mode = summary["config"].get("weekly_driver_mode")
+    assert mode in {
+        "naive_core_only",
+        "weekly_ml_core_only",
+        "weekly_ml_plus_learned_uplift",
+        "weekly_ml_plus_rule_based_multiplier",
+    }
 
 
 def test_fallback_uplift_changes_uplift_log_when_bundle_disabled():
@@ -403,7 +418,7 @@ def test_learned_uplift_log_changes_with_price_when_enabled():
     if bundle["uplift_bundle"].get("disabled") is False:
         assert float(low["daily"]["uplift_log"].mean()) != float(high["daily"]["uplift_log"].mean())
     else:
-        assert bundle["uplift_bundle"].get("reason") in {"uplift_holdout_failed", "insufficient_weekly_uplift_signal", "benchmark_gate_failed"}
+        assert bundle["uplift_bundle"].get("reason") in {"uplift_holdout_failed", "uplift_no_exogenous_features", "uplift_not_enough_rows", "benchmark_gate_failed"}
 
 
 def test_baseline_decomposition_consistency_when_uplift_active():
@@ -592,6 +607,13 @@ def test_resolve_scenario_driver_mode_has_three_states():
     assert resolve_scenario_driver_mode("weekly_model", True) == "weekly_ml_exogenous"
     assert resolve_scenario_driver_mode("weekly_model", False) == "weekly_ml_legacy_plus_rule_based_multiplier"
     assert resolve_scenario_driver_mode("naive_ma4w", False) == "naive_plus_rule_based_multiplier"
+
+
+def test_resolve_weekly_driver_mode_distinguishes_naive_and_weekly_paths():
+    assert resolve_weekly_driver_mode("naive_ma4w", False, True) == "naive_core_only"
+    assert resolve_weekly_driver_mode("weekly_model", False, False) == "weekly_ml_core_only"
+    assert resolve_weekly_driver_mode("weekly_model", True, False) == "weekly_ml_plus_learned_uplift"
+    assert resolve_weekly_driver_mode("weekly_model", False, True) == "weekly_ml_plus_rule_based_multiplier"
 
 
 def test_weekly_baseline_monotone_price_idx_non_increasing():
