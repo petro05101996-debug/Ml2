@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import json
+import copy
 import app as app_module
 
 from data_adapter import build_auto_mapping, normalize_transactions, build_daily_from_transactions
@@ -266,11 +267,14 @@ def test_no_double_multiplier():
     assert abs((high_f / base_f) - 1.5) < 1e-6
 
 
-def test_uplift_uses_baseline_feature():
+def test_uplift_uses_exogenous_features_only():
     res = _analyze()
     bundle = res["_trained_bundle"]["uplift_bundle"]
     feats = bundle["features"]
-    assert "baseline_log_feature" in feats
+    assert "baseline_log_feature" not in feats
+    assert "price_idx" not in feats
+    assert "stockout_share" not in feats
+    assert set(feats).issubset({"price_gap_ref_8w", "promotion_share", "freight_pct_change_1w", "promo_any"})
     if not bundle.get("disabled", False):
         assert len(bundle.get("models", [])) > 0
 
@@ -279,11 +283,120 @@ def test_uplift_bundle_enabled_when_signal_present():
     res = _analyze_long_signal()
     bundle = res["_trained_bundle"]["uplift_bundle"]
     assert "features" in bundle
-    assert "baseline_log_feature" in bundle["features"]
+    assert "baseline_log_feature" not in bundle["features"]
     if bundle.get("disabled") is False:
         assert len(bundle.get("models", [])) > 0
     else:
-        assert bundle.get("reason") in {"uplift_holdout_failed", "uplift_no_exogenous_features", "uplift_not_enough_rows", "benchmark_gate_failed"}
+        assert bundle.get("reason") in {"uplift_holdout_failed", "uplift_no_exogenous_features", "uplift_not_enough_rows", "benchmark_gate_failed", "holdout_support_too_low", "uplift_non_neutral_bias"}
+
+
+def test_runtime_applies_amplitude_calibrator_from_baseline_bundle():
+    res = _analyze()
+    trained = res["_trained_bundle"]
+    baseline_bundle_raw = copy.deepcopy(trained["baseline_bundle"])
+    baseline_bundle_cal = copy.deepcopy(trained["baseline_bundle"])
+    baseline_bundle_raw["amplitude_calibrator"] = {"enabled": False, "scale": 1.0, "center_mode": "forecast_mean"}
+    baseline_bundle_cal["amplitude_calibrator"] = {"enabled": True, "scale": 1.35, "center_mode": "forecast_mean"}
+    uplift_off = {"models": [], "features": [], "feature_stats": {}, "disabled": True, "reason": "test", "signal_info": {}, "neutral_reference_log": 0.0}
+
+    sim_raw = app_module.simulate_horizon_profit(
+        trained["latest_row"],
+        float(trained["base_ctx"]["price"]),
+        trained["future_dates"],
+        baseline_bundle_raw,
+        uplift_off,
+        trained["daily_base"],
+        trained["base_ctx"],
+        trained["elasticity_map"],
+        trained["pooled_elasticity"],
+    )
+    sim_cal = app_module.simulate_horizon_profit(
+        trained["latest_row"],
+        float(trained["base_ctx"]["price"]),
+        trained["future_dates"],
+        baseline_bundle_cal,
+        uplift_off,
+        trained["daily_base"],
+        trained["base_ctx"],
+        trained["elasticity_map"],
+        trained["pooled_elasticity"],
+    )
+    baseline_daily_raw = np.asarray(sim_raw["baseline_daily"]["pred_sales"], dtype=float)
+    baseline_daily_cal = np.asarray(sim_cal["baseline_daily"]["pred_sales"], dtype=float)
+    assert baseline_daily_raw.shape == baseline_daily_cal.shape
+    assert not np.allclose(baseline_daily_raw, baseline_daily_cal)
+
+
+def test_naive_forecaster_ignores_amplitude_calibrator():
+    res = _analyze()
+    trained = res["_trained_bundle"]
+    baseline_bundle_raw = copy.deepcopy(trained["baseline_bundle"])
+    baseline_bundle_cal = copy.deepcopy(trained["baseline_bundle"])
+    baseline_bundle_raw["selected_forecaster"] = "naive_lag1w"
+    baseline_bundle_raw["model"] = None
+    baseline_bundle_cal["selected_forecaster"] = "naive_lag1w"
+    baseline_bundle_cal["model"] = None
+    baseline_bundle_raw["amplitude_calibrator"] = {"enabled": False, "scale": 1.0, "center_mode": "forecast_mean"}
+    baseline_bundle_cal["amplitude_calibrator"] = {"enabled": True, "scale": 1.35, "center_mode": "forecast_mean"}
+    uplift_off = {"models": [], "features": [], "feature_stats": {}, "disabled": True, "reason": "test", "signal_info": {}, "neutral_reference_log": 0.0}
+
+    sim_raw = app_module.simulate_horizon_profit(
+        trained["latest_row"],
+        float(trained["base_ctx"]["price"]),
+        trained["future_dates"],
+        baseline_bundle_raw,
+        uplift_off,
+        trained["daily_base"],
+        trained["base_ctx"],
+        trained["elasticity_map"],
+        trained["pooled_elasticity"],
+    )
+    sim_cal = app_module.simulate_horizon_profit(
+        trained["latest_row"],
+        float(trained["base_ctx"]["price"]),
+        trained["future_dates"],
+        baseline_bundle_cal,
+        uplift_off,
+        trained["daily_base"],
+        trained["base_ctx"],
+        trained["elasticity_map"],
+        trained["pooled_elasticity"],
+    )
+    baseline_daily_raw = np.asarray(sim_raw["baseline_daily"]["pred_sales"], dtype=float)
+    baseline_daily_cal = np.asarray(sim_cal["baseline_daily"]["pred_sales"], dtype=float)
+    assert np.allclose(baseline_daily_raw, baseline_daily_cal)
+
+
+def test_uplift_training_uses_calibrated_baseline():
+    res = _analyze_long_signal()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    debug = summary["config"].get("uplift_debug_info", {})
+    assert debug.get("baseline_train_calibrated") is True
+    assert "baseline_train_mean" in debug
+    assert "baseline_train_raw_mean" in debug
+
+
+def test_neutral_uplift_multiplier_is_near_one():
+    res = _analyze_long_signal()
+    trace = pd.read_csv(pd.io.common.BytesIO(res["uplift_holdout_trace_csv"]))
+    neutral_mask = (
+        trace["price_gap_ref_8w"].abs().le(0.01)
+        & trace["promotion_share"].fillna(0.0).eq(0.0)
+        & trace["freight_pct_change_1w"].abs().le(0.02)
+    )
+    if neutral_mask.any():
+        neutral_bias = float((trace.loc[neutral_mask, "uplift_multiplier_attempted"] - 1.0).abs().mean())
+        assert neutral_bias <= 0.05
+
+
+def test_backtest_summary_contains_consistent_uplift_and_amplitude_diagnostics():
+    res = _analyze()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    backtest = summary["metrics_summary"]["rolling_weekly_backtest"]
+    assert "amplitude_scale_median" in backtest
+    assert "support_too_low_fold_rate" in backtest
+    assert "neutral_bias_mean" in backtest
+    assert "uplift_keep_fold_rate" in backtest
 
 
 def test_gate_accounts_for_correlation_and_std_ratio():
