@@ -444,6 +444,11 @@ def test_uplift_rollback_when_holdout_worse_than_baseline(monkeypatch):
     assert bundle.get("reason") in {"uplift_holdout_failed", "benchmark_gate_failed"}
     holdout = pd.read_csv(pd.io.common.BytesIO(res["holdout_predictions_csv"]))
     assert float(np.abs(holdout["final_pred_sales"] - holdout["baseline_pred_sales"]).sum()) < 1e-6
+    trace = pd.read_csv(pd.io.common.BytesIO(res["uplift_holdout_trace_csv"]))
+    if bundle.get("reason") == "uplift_holdout_failed":
+        assert float(np.abs(trace["final_pred_attempted"] - trace["core_pred"]).sum()) > 0.0
+        assert float(np.abs(trace["final_pred_active"] - trace["core_pred"]).sum()) < 1e-9
+        assert float(np.abs(trace["uplift_log_raw_attempted"]).sum()) > 0.0
 
 
 def test_uplift_disabled_when_benchmark_gate_fails(monkeypatch):
@@ -549,6 +554,14 @@ def test_small_mode_warnings_present_on_short_history():
     assert len(res["warnings"]) > 0
 
 
+def test_use_weekly_ml_false_path_keeps_attempted_bundle_initialized():
+    res = run_full_pricing_analysis_universal(_make_txn(60), "cat-a", "sku-1")
+    trained = res["_trained_bundle"]
+    assert "uplift_bundle_attempted" in trained
+    assert isinstance(trained["uplift_bundle_attempted"], dict)
+    assert "features" in trained["uplift_bundle_attempted"]
+
+
 def test_scenario_modeled_price_state_for_clipped_request():
     res = _analyze()
     bundle = res["_trained_bundle"]
@@ -648,3 +661,43 @@ def test_bridge_week_keeps_immediate_scenario_reaction():
     low_first_week = float(low["daily"].head(7)["actual_sales"].sum())
     high_first_week = float(high["daily"].head(7)["actual_sales"].sum())
     assert low_first_week != high_first_week
+
+
+def test_uplift_debug_artifacts_are_exported_with_expected_schema():
+    res = _analyze_long_signal()
+    debug_csv = pd.read_csv(pd.io.common.BytesIO(res["uplift_debug_report_csv"]))
+    trace_csv = pd.read_csv(pd.io.common.BytesIO(res["uplift_holdout_trace_csv"]))
+    assert {
+        "feature_name",
+        "present_in_train_weekly",
+        "present_in_holdout_weekly",
+        "selected_for_attempted_uplift",
+        "selected_for_active_uplift",
+        "dropped_reason",
+    }.issubset(set(debug_csv.columns))
+    assert {
+        "week_start",
+        "actual_sales",
+        "core_pred",
+        "uplift_log_raw_attempted",
+        "uplift_log_clipped_attempted",
+        "uplift_multiplier_attempted",
+        "final_pred_attempted",
+        "uplift_log_raw_active",
+        "uplift_log_clipped_active",
+        "uplift_multiplier_active",
+        "final_pred_active",
+    }.issubset(set(trace_csv.columns))
+
+
+def test_summary_contains_attempted_vs_active_uplift_blocks():
+    res = _analyze_long_signal()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    cfg = summary["config"]
+    assert "uplift_attempted_features" in cfg
+    assert "uplift_active_features" in cfg
+    assert "uplift_gate_result" in cfg
+    assert "uplift_gate_reason" in cfg
+    assert "uplift_debug_info" in cfg
+    assert "uplift_support_train" in cfg
+    assert "uplift_support_holdout" in cfg
