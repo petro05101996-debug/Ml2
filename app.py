@@ -512,6 +512,16 @@ MONOTONE_MAP: Dict[str, int] = {
 UPLIFT_MIN_ROWS = 40
 WEEKLY_UPLIFT_CLIP_LOW = -0.10
 WEEKLY_UPLIFT_CLIP_HIGH = 0.10
+LEARNED_UPLIFT_MODE = "diagnostic_only"  # diagnostic_only / gated_active
+MIN_UPLIFT_KEEP_FOLD_RATE = 0.40
+MAX_SUPPORT_TOO_LOW_FOLD_RATE = 0.50
+UPLIFT_MIN_PRICE_WEEKS = 2
+UPLIFT_MIN_PROMO_WEEKS = 2
+UPLIFT_MIN_FREIGHT_WEEKS = 3
+UPLIFT_SIGNIFICANT_PRICE_GAP = 0.01
+UPLIFT_SIGNIFICANT_FREIGHT_CHANGE = 0.02
+UPLIFT_NEUTRAL_BIAS_THRESHOLD = 0.015
+NONLEGACY_BASELINE_MODE = "diagnostic_only"
 AMPLITUDE_SCALE_GRID: List[float] = [0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40, 1.50]
 
 
@@ -1294,19 +1304,26 @@ def evaluate_uplift_holdout_support(frame: pd.DataFrame) -> Dict[str, Any]:
     price_gap = pd.to_numeric(frame.get("price_gap_ref_8w", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
     promotion = pd.to_numeric(frame.get("promotion_share", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
     freight_change = pd.to_numeric(frame.get("freight_pct_change_1w", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-    non_neutral_price_weeks = int(price_gap.abs().gt(0.01).sum()) if len(price_gap) else 0
+    non_neutral_price_weeks = int(price_gap.abs().gt(UPLIFT_SIGNIFICANT_PRICE_GAP).sum()) if len(price_gap) else 0
     promo_weeks = int(promotion.gt(0.0).sum()) if len(promotion) else 0
-    freight_change_weeks = int(freight_change.abs().gt(0.02).sum()) if len(freight_change) else 0
+    freight_change_weeks = int(freight_change.abs().gt(UPLIFT_SIGNIFICANT_FREIGHT_CHANGE).sum()) if len(freight_change) else 0
     support_too_low = bool(
-        non_neutral_price_weeks < 2
-        and promo_weeks < 2
-        and freight_change_weeks < 3
+        non_neutral_price_weeks < UPLIFT_MIN_PRICE_WEEKS
+        and promo_weeks < UPLIFT_MIN_PROMO_WEEKS
+        and freight_change_weeks < UPLIFT_MIN_FREIGHT_WEEKS
     )
     return {
         "non_neutral_price_weeks": non_neutral_price_weeks,
         "promo_weeks": promo_weeks,
         "freight_change_weeks": freight_change_weeks,
         "support_too_low": support_too_low,
+        "thresholds": {
+            "price_gap_abs_min": float(UPLIFT_SIGNIFICANT_PRICE_GAP),
+            "freight_pct_change_abs_min": float(UPLIFT_SIGNIFICANT_FREIGHT_CHANGE),
+            "min_price_weeks": int(UPLIFT_MIN_PRICE_WEEKS),
+            "min_promo_weeks": int(UPLIFT_MIN_PROMO_WEEKS),
+            "min_freight_weeks": int(UPLIFT_MIN_FREIGHT_WEEKS),
+        },
     }
 
 
@@ -1315,20 +1332,20 @@ def compute_uplift_neutral_bias(frame: pd.DataFrame, uplift_multiplier: np.ndarr
     promotion = pd.to_numeric(frame.get("promotion_share", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
     freight_change = pd.to_numeric(frame.get("freight_pct_change_1w", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
     neutral_mask = (
-        price_gap.abs().le(0.01)
+        price_gap.abs().le(UPLIFT_SIGNIFICANT_PRICE_GAP)
         & promotion.eq(0.0)
-        & freight_change.abs().le(0.02)
+        & freight_change.abs().le(UPLIFT_SIGNIFICANT_FREIGHT_CHANGE)
     )
     neutral_indices = np.asarray(neutral_mask.values if hasattr(neutral_mask, "values") else neutral_mask, dtype=bool)
     if neutral_indices.size == 0 or int(neutral_indices.sum()) == 0:
-        return {"neutral_weeks": int(neutral_indices.sum()), "neutral_bias": 0.0, "threshold": 0.015, "failed": False}
+        return {"neutral_weeks": int(neutral_indices.sum()), "neutral_bias": 0.0, "threshold": float(UPLIFT_NEUTRAL_BIAS_THRESHOLD), "failed": False}
     multipliers = np.asarray(uplift_multiplier, dtype=float)
     neutral_bias = float(np.mean(np.abs(multipliers[neutral_indices] - 1.0)))
     return {
         "neutral_weeks": int(neutral_indices.sum()),
         "neutral_bias": neutral_bias,
-        "threshold": 0.015,
-        "failed": bool(neutral_bias > 0.015),
+        "threshold": float(UPLIFT_NEUTRAL_BIAS_THRESHOLD),
+        "failed": bool(neutral_bias > UPLIFT_NEUTRAL_BIAS_THRESHOLD),
     }
 
 
@@ -1340,12 +1357,79 @@ def build_uplift_support_snapshot(frame: pd.DataFrame, feature_names: List[str])
         out[f"{col}_min"] = float(series.min()) if len(series.dropna()) else float("nan")
         out[f"{col}_max"] = float(series.max()) if len(series.dropna()) else float("nan")
     promo = pd.to_numeric(frame["promotion_share"], errors="coerce").fillna(0.0) if "promotion_share" in frame.columns else pd.Series(dtype=float)
-    out["promo_weeks"] = int(promo.gt(0).sum()) if len(promo) else 0
-    price_idx = pd.to_numeric(frame["price_idx"], errors="coerce") if "price_idx" in frame.columns else pd.Series(dtype=float)
-    out["non_neutral_price_weeks"] = int((price_idx - 1.0).abs().gt(1e-6).sum()) if len(price_idx) else 0
-    freight_change = pd.to_numeric(frame["freight_pct_change_1w"], errors="coerce") if "freight_pct_change_1w" in frame.columns else pd.Series(dtype=float)
-    out["freight_change_weeks"] = int(freight_change.abs().gt(1e-6).sum()) if len(freight_change) else 0
+    price_gap = pd.to_numeric(frame["price_gap_ref_8w"], errors="coerce").fillna(0.0) if "price_gap_ref_8w" in frame.columns else pd.Series(dtype=float)
+    freight_change = pd.to_numeric(frame["freight_pct_change_1w"], errors="coerce").fillna(0.0) if "freight_pct_change_1w" in frame.columns else pd.Series(dtype=float)
+    out["raw"] = {
+        "promo_weeks": int(promo.gt(1e-6).sum()) if len(promo) else 0,
+        "non_neutral_price_weeks": int(price_gap.abs().gt(1e-6).sum()) if len(price_gap) else 0,
+        "freight_change_weeks": int(freight_change.abs().gt(1e-6).sum()) if len(freight_change) else 0,
+    }
+    out["significant"] = {
+        "promo_weeks": int(promo.gt(0.0).sum()) if len(promo) else 0,
+        "non_neutral_price_weeks": int(price_gap.abs().gt(UPLIFT_SIGNIFICANT_PRICE_GAP).sum()) if len(price_gap) else 0,
+        "freight_change_weeks": int(freight_change.abs().gt(UPLIFT_SIGNIFICANT_FREIGHT_CHANGE).sum()) if len(freight_change) else 0,
+    }
+    out["thresholds"] = {
+        "price_gap_abs_min": float(UPLIFT_SIGNIFICANT_PRICE_GAP),
+        "freight_pct_change_abs_min": float(UPLIFT_SIGNIFICANT_FREIGHT_CHANGE),
+    }
     return out
+
+
+def decide_uplift_activation(
+    activation_mode: str,
+    support_info_holdout: Dict[str, Any],
+    neutral_bias_info: Dict[str, Any],
+    uplift_gate_metrics: Dict[str, Any],
+    backtest_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    mode_allows_activation = activation_mode == "gated_active"
+    holdout_support_ok = not bool(support_info_holdout.get("support_too_low", False))
+    neutral_bias_ok = not bool(neutral_bias_info.get("failed", False))
+    holdout_gate_ok = bool(uplift_gate_metrics.get("passed", False))
+    fold_keep_rate = float(backtest_summary.get("uplift_keep_fold_rate", float("nan")))
+    support_too_low_fold_rate = float(backtest_summary.get("support_too_low_fold_rate", float("nan")))
+    fold_keep_rate_ok = bool(np.isfinite(fold_keep_rate) and fold_keep_rate >= MIN_UPLIFT_KEEP_FOLD_RATE)
+    support_too_low_fold_rate_ok = bool(np.isfinite(support_too_low_fold_rate) and support_too_low_fold_rate <= MAX_SUPPORT_TOO_LOW_FOLD_RATE)
+    checks = {
+        "mode_allows_activation": bool(mode_allows_activation),
+        "holdout_support_ok": bool(holdout_support_ok),
+        "neutral_bias_ok": bool(neutral_bias_ok),
+        "holdout_gate_ok": bool(holdout_gate_ok),
+        "fold_keep_rate_ok": bool(fold_keep_rate_ok),
+        "support_too_low_fold_rate_ok": bool(support_too_low_fold_rate_ok),
+    }
+    if activation_mode == "diagnostic_only":
+        return {"active": False, "reason": "diagnostic_only_mode", "checks": checks}
+    if activation_mode != "gated_active":
+        return {"active": False, "reason": "unknown_activation_mode", "checks": checks}
+    if all(checks.values()):
+        return {"active": True, "reason": "gated_active_passed", "checks": checks}
+    for failed_key, reason in [
+        ("holdout_support_ok", "holdout_support_too_low"),
+        ("neutral_bias_ok", "uplift_non_neutral_bias"),
+        ("holdout_gate_ok", "uplift_holdout_failed"),
+        ("fold_keep_rate_ok", "uplift_fold_keep_rate_too_low"),
+        ("support_too_low_fold_rate_ok", "support_too_low_fold_rate_too_high"),
+    ]:
+        if not checks[failed_key]:
+            return {"active": False, "reason": reason, "checks": checks}
+    return {"active": False, "reason": "uplift_activation_failed", "checks": checks}
+
+
+def resolve_final_active_path(
+    selected_forecaster: str,
+    selected_candidate: str,
+    uplift_activation: Dict[str, Any],
+    fallback_multiplier_used: bool,
+) -> str:
+    if selected_forecaster != "weekly_model":
+        return "naive_core_only"
+    if uplift_activation.get("active", False):
+        return f"{selected_candidate}+learned_uplift"
+    if fallback_multiplier_used:
+        return f"{selected_candidate}+rule_based_multiplier"
+    return f"{selected_candidate}+core_only"
 
 
 def allocate_weekly_to_daily(weekly_forecast: pd.DataFrame, daily_history: pd.DataFrame, future_daily_context: pd.DataFrame) -> pd.DataFrame:
@@ -1401,25 +1485,27 @@ def evaluate_weekly_backtest(weekly_full: pd.DataFrame, feature_names: List[str]
         baseline_train_raw = np.expm1(model.predict(train[feature_names].astype(float))).clip(min=0.0)
         baseline_train = apply_weekly_amplitude_calibrator(baseline_train_raw, fold_calibrator_info)
         uplift_bundle = fit_weekly_uplift_model(train, baseline_train, small_mode)
-        final_pred = core_pred.copy()
+        attempted_pred = core_pred.copy()
+        active_pred = core_pred.copy()
         uplift_keep_fold = False
         uplift_gate_reason_fold = "not_run"
         support_info_fold = evaluate_uplift_holdout_support(test)
-        neutral_bias_info_fold = {"neutral_weeks": 0, "neutral_bias": 0.0, "threshold": 0.015, "failed": False}
+        neutral_bias_info_fold = {"neutral_weeks": 0, "neutral_bias": 0.0, "threshold": float(UPLIFT_NEUTRAL_BIAS_THRESHOLD), "failed": False}
         if len(uplift_bundle.get("models", [])):
             if support_info_fold.get("support_too_low", False):
                 uplift_keep_fold = False
                 uplift_gate_reason_fold = "holdout_support_too_low"
-                final_pred = core_pred.copy()
+                active_pred = core_pred.copy()
             else:
                 uplift_frame = test.copy()
                 uplift_log, _ = predict_uplift_log_bundle(uplift_frame, uplift_bundle)
                 uplift_log = np.asarray(uplift_log, dtype=float) - float(uplift_bundle.get("neutral_reference_log", 0.0))
                 uplift_log = np.clip(uplift_log, WEEKLY_UPLIFT_CLIP_LOW, WEEKLY_UPLIFT_CLIP_HIGH)
-                final_pred = np.expm1(np.log1p(np.clip(final_pred, 0.0, None)) + uplift_log).clip(min=0.0)
-                uplift_multiplier_attempted = final_pred / np.clip(core_pred, 1e-9, None)
+                attempted_pred = np.expm1(np.log1p(np.clip(core_pred, 0.0, None)) + uplift_log).clip(min=0.0)
+                active_pred = attempted_pred.copy()
+                uplift_multiplier_attempted = attempted_pred / np.clip(core_pred, 1e-9, None)
                 neutral_bias_info_fold = compute_uplift_neutral_bias(test, uplift_multiplier_attempted)
-                uplift_keep_fold, _ = uplift_passes_gate(test["sales"].astype(float).values, core_pred, final_pred)
+                uplift_keep_fold, _ = uplift_passes_gate(test["sales"].astype(float).values, core_pred, attempted_pred)
                 if neutral_bias_info_fold.get("failed", False):
                     uplift_keep_fold = False
                     uplift_gate_reason_fold = "uplift_non_neutral_bias"
@@ -1428,22 +1514,27 @@ def evaluate_weekly_backtest(weekly_full: pd.DataFrame, feature_names: List[str]
                 else:
                     uplift_gate_reason_fold = "uplift_holdout_failed"
                 if not uplift_keep_fold:
-                    final_pred = core_pred.copy()
+                    active_pred = core_pred.copy()
         else:
             uplift_gate_reason_fold = str(uplift_bundle.get("reason", "no_uplift_model")) or "no_uplift_model"
         rows.append(
             {
                 "fold": i + 1,
                 "core_weekly_wape": calculate_wape(test["sales"].values, core_pred),
-                "final_weekly_wape": calculate_wape(test["sales"].values, final_pred),
+                "attempted_weekly_wape": calculate_wape(test["sales"].values, attempted_pred),
+                "active_weekly_wape": calculate_wape(test["sales"].values, active_pred),
+                "core_weekly_mae": mean_absolute_error(test["sales"].values, core_pred),
+                "attempted_weekly_mae": mean_absolute_error(test["sales"].values, attempted_pred),
+                "active_weekly_mae": mean_absolute_error(test["sales"].values, active_pred),
+                "final_weekly_wape": calculate_wape(test["sales"].values, active_pred),
                 "uplift_keep_fold": bool(uplift_keep_fold),
                 "uplift_gate_reason_fold": str(uplift_gate_reason_fold),
                 "amplitude_scale": float(fold_calibrator_info.get("scale", 1.0)),
                 "support_too_low": bool(support_info_fold.get("support_too_low", False)),
                 "neutral_bias": float(neutral_bias_info_fold.get("neutral_bias", 0.0)),
                 "neutral_bias_failed": bool(neutral_bias_info_fold.get("failed", False)),
-                "weekly_wape": calculate_wape(test["sales"].values, final_pred),
-                "weekly_mae": mean_absolute_error(test["sales"].values, final_pred),
+                "weekly_wape": calculate_wape(test["sales"].values, active_pred),
+                "weekly_mae": mean_absolute_error(test["sales"].values, active_pred),
             }
         )
     df = pd.DataFrame(rows)
@@ -1451,6 +1542,11 @@ def evaluate_weekly_backtest(weekly_full: pd.DataFrame, feature_names: List[str]
         "weekly_wape": float(df["weekly_wape"].mean()) if len(df) else float("nan"),
         "weekly_mae": float(df["weekly_mae"].mean()) if len(df) else float("nan"),
         "core_weekly_wape": float(df["core_weekly_wape"].mean()) if len(df) and "core_weekly_wape" in df.columns else float("nan"),
+        "core_weekly_mae": float(df["core_weekly_mae"].mean()) if len(df) and "core_weekly_mae" in df.columns else float("nan"),
+        "attempted_weekly_wape": float(df["attempted_weekly_wape"].mean()) if len(df) and "attempted_weekly_wape" in df.columns else float("nan"),
+        "attempted_weekly_mae": float(df["attempted_weekly_mae"].mean()) if len(df) and "attempted_weekly_mae" in df.columns else float("nan"),
+        "active_weekly_wape": float(df["active_weekly_wape"].mean()) if len(df) and "active_weekly_wape" in df.columns else float("nan"),
+        "active_weekly_mae": float(df["active_weekly_mae"].mean()) if len(df) and "active_weekly_mae" in df.columns else float("nan"),
         "final_weekly_wape": float(df["final_weekly_wape"].mean()) if len(df) and "final_weekly_wape" in df.columns else float("nan"),
         "uplift_keep_fold_rate": float(df["uplift_keep_fold"].mean()) if len(df) and "uplift_keep_fold" in df.columns else float("nan"),
         "amplitude_scale_median": float(df["amplitude_scale"].median()) if len(df) and "amplitude_scale" in df.columns else float("nan"),
@@ -1899,6 +1995,7 @@ def run_full_pricing_analysis_universal(
     weekly_baseline_candidate_comparison = {
         "selected_candidate": "legacy_baseline",
         "selection_reason": "weekly_ml_not_used",
+        "nonlegacy_baseline_mode": NONLEGACY_BASELINE_MODE,
         "selection_rule": {
             "wape_tolerance_pp": 0.5,
             "corr_tolerance_down": 0.05,
@@ -2006,8 +2103,12 @@ def run_full_pricing_analysis_universal(
                 weekly_baseline_candidate_comparison["selection_reason"] = "legacy_retained_no_nonlegacy_passed_rule"
 
         weekly_baseline_candidate_comparison["candidates"] = bundle_results
+        if NONLEGACY_BASELINE_MODE == "diagnostic_only":
+            selected_candidate_name = "legacy_baseline"
+            weekly_baseline_candidate_comparison["selection_reason"] = "nonlegacy_candidates_diagnostic_only"
+            selected_bundle = next((row for row in bundle_results if row["name"] == "legacy_baseline"), selected_bundle)
         if selected_bundle is not None:
-            selected_candidate_name = str(selected_bundle["name"])
+            selected_candidate_name = "legacy_baseline" if NONLEGACY_BASELINE_MODE == "diagnostic_only" else str(selected_bundle["name"])
             weekly_model = bundle_models[selected_candidate_name]
             baseline_feature_names = bundle_features_selected[selected_candidate_name]
             test_pred_weekly = bundle_pred_frames[selected_candidate_name]
@@ -2103,22 +2204,28 @@ def run_full_pricing_analysis_universal(
             {"name": "price_promo_freight_baseline", "features": list(legacy_baseline_feature_names), **fallback_metrics, "eligible_under_selection_rule": False, "rejection_reason": "weekly_ml_not_used"},
         ]
     weekly_baseline_candidate_comparison["selected_candidate"] = selected_candidate_name
-    uplift_enabled_holdout = bool(len(uplift_bundle.get("models", [])) > 0)
+    support_snapshot_train = build_uplift_support_snapshot(train_weekly, ["price_gap_ref_8w", "promotion_share", "freight_pct_change_1w"])
+    support_snapshot_holdout = build_uplift_support_snapshot(test_weekly, ["price_gap_ref_8w", "promotion_share", "freight_pct_change_1w"])
+    uplift_enabled_holdout = bool(len(uplift_bundle_attempted.get("models", [])) > 0)
     wape_core_holdout = float(calculate_wape(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)) if len(test_weekly) else float("nan")
-    wape_final_holdout = float(calculate_wape(test_weekly["sales"].values, final_pred_test)) if len(test_weekly) else float("nan")
+    wape_attempted_holdout = float(calculate_wape(test_weekly["sales"].values, final_pred_attempted)) if len(test_weekly) else float("nan")
     uplift_gate_diagnostics = {
         "wape_core": wape_core_holdout,
-        "wape_final": wape_final_holdout,
+        "wape_attempted": wape_attempted_holdout,
         "corr_core": float("nan"),
-        "corr_final": float("nan"),
+        "corr_attempted": float("nan"),
         "std_ratio_core": float("nan"),
-        "std_ratio_final": float("nan"),
+        "std_ratio_attempted": float("nan"),
     }
     uplift_keep = False
     uplift_gate_result = "not_run"
-    uplift_gate_reason = str(uplift_bundle.get("reason", ""))
+    holdout_support = evaluate_uplift_holdout_support(test_weekly) if uplift_enabled_holdout else {
+        "non_neutral_price_weeks": 0, "promo_weeks": 0, "freight_change_weeks": 0, "support_too_low": True, "thresholds": {}
+    }
+    neutral_bias_info = {"neutral_weeks": 0, "neutral_bias": 0.0, "threshold": float(UPLIFT_NEUTRAL_BIAS_THRESHOLD), "failed": False}
+    uplift_gate_reason = str(uplift_bundle_attempted.get("reason", ""))
+    uplift_gate_passed = False
     if uplift_enabled_holdout:
-        holdout_support = evaluate_uplift_holdout_support(test_weekly)
         uplift_gate_diagnostics["holdout_support"] = holdout_support
         if holdout_support.get("support_too_low", False):
             uplift_keep = False
@@ -2128,7 +2235,7 @@ def run_full_pricing_analysis_universal(
             uplift_keep, uplift_gate_diagnostics = uplift_passes_gate(
                 test_weekly["sales"].astype(float).values,
                 test_pred_weekly["pred_weekly_sales"].astype(float).values,
-                final_pred_test.astype(float),
+                final_pred_attempted.astype(float),
             )
             uplift_gate_diagnostics["holdout_support"] = holdout_support
             neutral_bias_info = compute_uplift_neutral_bias(test_weekly, uplift_multiplier_attempted)
@@ -2140,10 +2247,29 @@ def run_full_pricing_analysis_universal(
             elif uplift_keep:
                 uplift_gate_result = "passed"
                 uplift_gate_reason = "passed"
+                uplift_gate_passed = True
             else:
                 uplift_gate_result = "failed"
                 uplift_gate_reason = "uplift_holdout_failed"
-    if uplift_enabled_holdout and not uplift_keep:
+    if not uplift_enabled_holdout:
+        uplift_gate_reason = str(uplift_bundle_attempted.get("reason", "no_uplift_model")) or "no_uplift_model"
+    _, backtest_summary = evaluate_weekly_backtest(usable, baseline_feature_names, small_mode, n_folds=5, horizon_weeks=4) if use_weekly_ml else (pd.DataFrame(), {"weekly_wape": float("nan"), "weekly_mae": float("nan")})
+    uplift_gate_metrics = {"result": uplift_gate_result, "reason": uplift_gate_reason, "passed": bool(uplift_gate_passed)}
+    uplift_activation = decide_uplift_activation(
+        activation_mode=LEARNED_UPLIFT_MODE,
+        support_info_holdout=holdout_support,
+        neutral_bias_info=neutral_bias_info,
+        uplift_gate_metrics=uplift_gate_metrics,
+        backtest_summary=backtest_summary if isinstance(backtest_summary, dict) else {},
+    )
+    uplift_keep = bool(uplift_activation.get("active", False))
+    if uplift_keep:
+        uplift_bundle = dict(uplift_bundle_attempted)
+        final_pred_test = np.asarray(final_pred_attempted, dtype=float)
+        uplift_multiplier = np.asarray(uplift_multiplier_attempted, dtype=float)
+        uplift_log_pred = np.asarray(uplift_log_clipped_attempted, dtype=float)
+        uplift_log_raw = np.asarray(uplift_log_raw_attempted, dtype=float)
+    else:
         final_pred_test = test_pred_weekly["pred_weekly_sales"].astype(float).values.copy()
         uplift_multiplier = np.ones(len(final_pred_test), dtype=float)
         uplift_log_pred = np.zeros(len(final_pred_test), dtype=float)
@@ -2153,7 +2279,7 @@ def run_full_pricing_analysis_universal(
             "features": [],
             "feature_stats": {},
             "disabled": True,
-            "reason": uplift_gate_reason or "uplift_holdout_failed",
+            "reason": str(uplift_gate_reason) if str(uplift_gate_reason) else "uplift_holdout_failed",
             "signal_info": dict(uplift_bundle_attempted.get("signal_info", {})),
             "debug_info": dict(uplift_bundle_attempted.get("debug_info", {})),
             "neutral_reference_log": float(uplift_bundle_attempted.get("neutral_reference_log", 0.0)),
@@ -2179,7 +2305,6 @@ def run_full_pricing_analysis_universal(
     })
     holdout_predictions["abs_error"] = np.abs(holdout_predictions["actual_sales"] - holdout_predictions["final_pred_sales"])
     holdout_predictions["signed_error"] = holdout_predictions["final_pred_sales"] - holdout_predictions["actual_sales"]
-    _, backtest_summary = evaluate_weekly_backtest(usable, baseline_feature_names, small_mode, n_folds=5, horizon_weeks=4) if use_weekly_ml else (pd.DataFrame(), {"weekly_wape": float("nan"), "weekly_mae": float("nan")})
 
     naive_lag_val = float(train_weekly["sales"].iloc[-1]) if len(train_weekly) else 0.0
     naive_lag = np.full(len(test_weekly), naive_lag_val, dtype=float)
@@ -2448,6 +2573,33 @@ def run_full_pricing_analysis_universal(
     scenario_sim = None
     scenario_forecast = scenario_sim["daily"] if scenario_sim else None
     confidence = float(1.0 / (1.0 + max(0.0, holdout_metrics.get("wape", 100.0) / 100.0)))
+    holdout_core_metrics = {
+        "rmse": float(np.sqrt(mean_squared_error(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values))),
+        "mae": float(mean_absolute_error(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)),
+        "mape": float(calculate_mape(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)),
+        "smape": float(calculate_smape(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)),
+        "wape": float(calculate_wape(test_weekly["sales"].values, test_pred_weekly["pred_weekly_sales"].values)),
+    } if len(test_weekly) else {}
+    attempted_uplift_metrics = {
+        "holdout_wape": float(calculate_wape(test_weekly["sales"].values, final_pred_attempted)) if len(test_weekly) else float("nan"),
+        "holdout_mae": float(mean_absolute_error(test_weekly["sales"].values, final_pred_attempted)) if len(test_weekly) else float("nan"),
+        "holdout_rmse": float(np.sqrt(mean_squared_error(test_weekly["sales"].values, final_pred_attempted))) if len(test_weekly) else float("nan"),
+        "active_possible": bool(uplift_enabled_holdout),
+        "model_count": int(len(uplift_bundle_attempted.get("models", []))),
+    }
+    active_uplift_metrics = {
+        "holdout_wape": float(calculate_wape(test_weekly["sales"].values, final_pred_test)) if len(test_weekly) else float("nan"),
+        "holdout_mae": float(mean_absolute_error(test_weekly["sales"].values, final_pred_test)) if len(test_weekly) else float("nan"),
+        "holdout_rmse": float(np.sqrt(mean_squared_error(test_weekly["sales"].values, final_pred_test))) if len(test_weekly) else float("nan"),
+        "active": bool(uplift_activation.get("active", False)),
+        "reason": str(uplift_activation.get("reason", "")),
+        "model_count": int(len(uplift_bundle.get("models", []))),
+    }
+    attempted_vs_active_delta = {
+        "holdout_wape_delta": float(active_uplift_metrics["holdout_wape"] - attempted_uplift_metrics["holdout_wape"]) if np.isfinite(active_uplift_metrics["holdout_wape"]) and np.isfinite(attempted_uplift_metrics["holdout_wape"]) else float("nan"),
+        "holdout_mae_delta": float(active_uplift_metrics["holdout_mae"] - attempted_uplift_metrics["holdout_mae"]) if np.isfinite(active_uplift_metrics["holdout_mae"]) and np.isfinite(attempted_uplift_metrics["holdout_mae"]) else float("nan"),
+        "holdout_rmse_delta": float(active_uplift_metrics["holdout_rmse"] - attempted_uplift_metrics["holdout_rmse"]) if np.isfinite(active_uplift_metrics["holdout_rmse"]) and np.isfinite(attempted_uplift_metrics["holdout_rmse"]) else float("nan"),
+    }
 
     excel_buffer = BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
@@ -2501,6 +2653,15 @@ def run_full_pricing_analysis_universal(
         used_in_baseline = f in baseline_feature_names
         used_in_uplift_attempted = f in uplift_bundle_attempted.get("features", [])
         used_in_uplift_active = bool(len(uplift_bundle.get("models", [])) > 0) and (f in uplift_bundle.get("features", []))
+        used_in_final_active_forecast = bool(used_in_baseline or used_in_uplift_active)
+        if used_in_uplift_active:
+            active_usage_reason = "active_learned_uplift"
+        elif used_in_uplift_attempted and not used_in_uplift_active:
+            active_usage_reason = "uplift_deactivated_by_gate"
+        elif used_in_baseline:
+            active_usage_reason = "active_baseline_feature"
+        else:
+            active_usage_reason = "not_used_in_active_path"
         used_in_uplift = used_in_uplift_active
         used_in_weekly_baseline = used_in_baseline
         used_in_weekly_uplift = used_in_uplift
@@ -2548,6 +2709,11 @@ def run_full_pricing_analysis_universal(
                 "used_in_uplift": bool(used_in_uplift),
                 "used_in_uplift_attempted": bool(used_in_uplift_attempted),
                 "used_in_uplift_active": bool(used_in_uplift_active),
+                "used_in_attempted_uplift": bool(used_in_uplift_attempted),
+                "used_in_active_uplift": bool(used_in_uplift_active),
+                "used_in_active_baseline": bool(used_in_baseline),
+                "used_in_final_active_forecast": bool(used_in_final_active_forecast),
+                "active_usage_reason": active_usage_reason,
                 "used_in_weekly_baseline": bool(used_in_weekly_baseline),
                 "used_in_weekly_uplift": bool(used_in_weekly_uplift),
                 "used_in_weekly_uplift_attempted": bool(used_in_uplift_attempted),
@@ -2572,10 +2738,27 @@ def run_full_pricing_analysis_universal(
     for col in ["price_idx", "price_gap_ref_8w", "promotion_share", "freight_mean", "freight_pct_change_1w", "discount_mean", "promo_any", "stockout_share"]:
         present_weekly = col in weekly_full.columns
         series_weekly = pd.to_numeric(weekly_full[col], errors="coerce") if present_weekly else pd.Series(dtype=float)
+        used_in_baseline = bool(col in baseline_feature_names)
+        used_in_attempted_uplift = bool(col in uplift_bundle_attempted.get("features", []))
+        used_in_active_uplift = bool(len(uplift_bundle.get("models", [])) > 0 and col in uplift_bundle.get("features", []))
+        used_in_final_active_forecast = bool(used_in_baseline or used_in_active_uplift)
+        if used_in_active_uplift:
+            active_usage_reason = "active_learned_uplift"
+        elif used_in_attempted_uplift:
+            active_usage_reason = "uplift_deactivated_by_gate"
+        elif used_in_baseline:
+            active_usage_reason = "active_baseline_feature"
+        else:
+            active_usage_reason = "not_used_in_active_path"
         feature_row = {
             "present_in_weekly": bool(present_weekly),
             "non_null_share": float(series_weekly.notna().mean()) if present_weekly and len(series_weekly) else 0.0,
             "nunique": int(series_weekly.nunique(dropna=True)) if present_weekly else 0,
+            "used_in_attempted_uplift": used_in_attempted_uplift,
+            "used_in_active_uplift": used_in_active_uplift,
+            "used_in_active_baseline": used_in_baseline,
+            "used_in_final_active_forecast": used_in_final_active_forecast,
+            "active_usage_reason": active_usage_reason,
         }
         if col in {"price_idx", "promotion_share", "freight_mean"}:
             feature_row["eligible_for_price_only_baseline"] = bool(col in candidate_eligibility.get("price_only_baseline", set()))
@@ -2619,6 +2802,12 @@ def run_full_pricing_analysis_universal(
         "promo_plus_10pp_demand_delta_pct": float(((promo_plus_10pp_sim["daily"]["actual_sales"].sum() - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
         "freight_plus_10pct_demand_delta_pct": float(((freight_plus_10pct_sim["daily"]["actual_sales"].sum() - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
     }
+    final_active_path = resolve_final_active_path(
+        selected_forecaster=selected_forecaster,
+        selected_candidate=selected_candidate_name,
+        uplift_activation=uplift_activation,
+        fallback_multiplier_used=bool(as_is_sim.get("fallback_multiplier_used", False)),
+    )
     run_summary = {
             "config": {
             "git_commit": _safe_git_commit(),
@@ -2650,14 +2839,26 @@ def run_full_pricing_analysis_universal(
             "uplift_gate_reason": str(uplift_gate_reason),
             "uplift_gate_diagnostics": uplift_gate_diagnostics,
             "uplift_debug_info": uplift_bundle_attempted.get("debug_info", {}),
-            "uplift_support_train": build_uplift_support_snapshot(train_weekly, uplift_trace_columns),
-            "uplift_support_holdout": build_uplift_support_snapshot(test_weekly, uplift_trace_columns),
+            "uplift_support_train": support_snapshot_train,
+            "uplift_support_holdout": support_snapshot_holdout,
+            "support_snapshot_train": support_snapshot_train,
+            "support_snapshot_holdout": support_snapshot_holdout,
             "uplift_enabled": bool(len(uplift_bundle.get("models", [])) > 0),
             "uplift_reason": str(uplift_bundle.get("reason", "")),
             "uplift_holdout_keep": bool(uplift_keep),
+            "uplift_activation_mode": LEARNED_UPLIFT_MODE,
+            "uplift_activation": uplift_activation,
+            "quality_improvement_expected": False,
+            "quality_improvement_expectation_reason": "diagnostic_only_modes_active_path_frozen",
+            "final_active_path": final_active_path,
+            "attempted_uplift_metrics": attempted_uplift_metrics,
+            "active_uplift_metrics": active_uplift_metrics,
+            "final_active_metrics": active_uplift_metrics,
+            "attempted_vs_active_delta": attempted_vs_active_delta,
             "benchmark_gate_passed": bool(model_enabled),
             "shape_quality_low": bool(shape_quality_low),
             "selected_forecaster": selected_forecaster,
+            "selected_candidate": selected_candidate_name,
             "baseline_has_exogenous_driver": bool(baseline_has_exog),
             "scenario_driver_mode": resolve_scenario_driver_mode(selected_forecaster, bool(baseline_has_exog)),
             "weekly_driver_mode": str(as_is_sim.get("weekly_driver_mode", "naive_core_only")),
@@ -2666,7 +2867,39 @@ def run_full_pricing_analysis_universal(
             "fallback_reason": str(as_is_sim.get("fallback_reason", "")),
         },
         "dataset_passport": _build_dataset_passport(txn),
-        "metrics_summary": {"holdout": holdout_metrics, "rolling_weekly_backtest": backtest_summary},
+        "metrics_summary": {
+            "holdout": {
+                "core": holdout_core_metrics,
+                "attempted_uplift": attempted_uplift_metrics,
+                "final_active": active_uplift_metrics,
+            },
+            "holdout_flat": dict(holdout_metrics),
+            "rolling_weekly_backtest": {
+                "active_fold_gate_weekly_wape": float(backtest_summary.get("active_weekly_wape", float("nan"))),
+                "active_fold_gate_weekly_mae": float(backtest_summary.get("active_weekly_mae", float("nan"))),
+                "amplitude_scale_median": float(backtest_summary.get("amplitude_scale_median", float("nan"))),
+                "uplift_keep_fold_rate": float(backtest_summary.get("uplift_keep_fold_rate", float("nan"))),
+                "support_too_low_fold_rate": float(backtest_summary.get("support_too_low_fold_rate", float("nan"))),
+                "neutral_bias_mean": float(backtest_summary.get("neutral_bias_mean", float("nan"))),
+                "core": {
+                    "weekly_wape": float(backtest_summary.get("core_weekly_wape", float("nan"))),
+                    "weekly_mae": float(backtest_summary.get("core_weekly_mae", float("nan"))),
+                },
+                "attempted_uplift": {
+                    "weekly_wape": float(backtest_summary.get("attempted_weekly_wape", float("nan"))),
+                    "weekly_mae": float(backtest_summary.get("attempted_weekly_mae", float("nan"))),
+                    "uplift_keep_fold_rate": float(backtest_summary.get("uplift_keep_fold_rate", float("nan"))),
+                    "support_too_low_fold_rate": float(backtest_summary.get("support_too_low_fold_rate", float("nan"))),
+                    "neutral_bias_mean": float(backtest_summary.get("neutral_bias_mean", float("nan"))),
+                },
+                "final_active": {
+                    "weekly_wape": float(backtest_summary.get("active_weekly_wape", float("nan"))) if bool(uplift_activation.get("active", False)) else float(backtest_summary.get("core_weekly_wape", float("nan"))),
+                    "weekly_mae": float(backtest_summary.get("active_weekly_mae", float("nan"))) if bool(uplift_activation.get("active", False)) else float(backtest_summary.get("core_weekly_mae", float("nan"))),
+                    "uplift_active": bool(uplift_activation.get("active", False)),
+                    "activation_reason": str(uplift_activation.get("reason", "")),
+                },
+            },
+        },
         "weekly_baseline_candidate_comparison": weekly_baseline_candidate_comparison,
         "scenario_sensitivity_diagnostics": scenario_sensitivity_diagnostics,
         "candidate_feature_readiness": candidate_feature_readiness,
