@@ -6,6 +6,7 @@ import app as app_module
 
 from data_adapter import build_auto_mapping, normalize_transactions, build_daily_from_transactions
 from what_if import build_sensitivity_grid, run_scenario_set
+from scenario_engine import run_scenario
 from app import (
     apply_weekly_fallback_projection,
     build_manual_scenario_artifacts,
@@ -814,3 +815,113 @@ def test_summary_contains_attempted_vs_active_uplift_blocks():
     assert "uplift_debug_info" in cfg
     assert "uplift_support_train" in cfg
     assert "uplift_support_holdout" in cfg
+
+
+def test_no_change_with_existing_promo_keeps_baseline():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    promo_state = float(bundle["base_ctx"].get("promotion", 0.0))
+    sc = run_what_if_projection(bundle, manual_price=base_price, overrides={"promotion": promo_state})
+    daily = sc["daily"]
+    pred = pd.to_numeric(daily["pred_sales"], errors="coerce").fillna(0.0).values
+    base = pd.to_numeric(daily["base_pred_sales"], errors="coerce").fillna(0.0).values
+    assert np.allclose(pred, base)
+
+
+def test_stock_constraint_not_double_counted():
+    baseline = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=2, freq="D"), "baseline_units": [100.0, 100.0]})
+    out = run_scenario(
+        baseline_output=baseline,
+        scenario_inputs={
+            "baseline_price_ref": 100.0,
+            "scenario_price": 100.0,
+            "promo_baseline": 0.0,
+            "promo_scenario": 0.0,
+            "freight_ref": 5.0,
+            "freight_scenario": 5.0,
+            "available_stock": np.array([20.0, 15.0]),
+            "scenario_net_price": 100.0,
+            "unit_cost": 65.0,
+            "freight_value": 5.0,
+        },
+    )
+    assert np.allclose(out["final_units"], np.array([20.0, 15.0]))
+
+
+def test_small_mode_does_not_override_scenario_result():
+    res = run_full_pricing_analysis_universal(_make_txn(60), "cat-a", "sku-1")
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    sc = run_what_if_projection(bundle, manual_price=base_price * 1.1)
+    daily = sc["daily"]
+    assert float(np.abs(daily["pred_sales"] - daily["base_pred_sales"]).sum()) > 0.0
+
+
+def test_real_integration_run_what_if_projection_uses_scenario_engine_result(monkeypatch):
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+
+    def fake_run_scenario(baseline_output, scenario_inputs, shocks=None, metadata=None):
+        n = len(baseline_output)
+        zeros = np.zeros(n, dtype=float)
+        ones = np.ones(n, dtype=float)
+        return {
+            "baseline_units": pd.to_numeric(baseline_output["baseline_units"], errors="coerce").fillna(0.0).to_numpy(),
+            "price_effect": 1.0,
+            "promo_effect": 1.0,
+            "freight_effect": 1.0,
+            "stock_effect": 1.0,
+            "shock_multiplier": ones,
+            "shock_units": zeros,
+            "final_units": zeros,
+            "baseline_revenue": zeros,
+            "final_revenue": zeros,
+            "baseline_margin": zeros,
+            "final_margin": zeros,
+            "confidence": {},
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(app_module, "run_scenario", fake_run_scenario)
+    sc = run_what_if_projection(bundle, manual_price=base_price)
+    assert float(sc["demand_total"]) == 0.0
+    assert "legacy_baseline_meta" in sc and "scenario_engine_meta" in sc
+    assert "price_confidence_score" in sc["scenario_engine_meta"]
+
+
+def test_discount_multiplier_affects_scenario_economics():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    base = run_what_if_projection(bundle, manual_price=base_price, discount_multiplier=1.0, overrides={"discount": 0.10})
+    deep_discount = run_what_if_projection(bundle, manual_price=base_price, discount_multiplier=2.0, overrides={"discount": 0.10})
+    assert float(deep_discount["revenue_total"]) < float(base["revenue_total"])
+
+
+def test_cost_multiplier_affects_profit():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    base = run_what_if_projection(bundle, manual_price=base_price, cost_multiplier=1.0)
+    high_cost = run_what_if_projection(bundle, manual_price=base_price, cost_multiplier=1.2)
+    assert float(high_cost["profit_total_raw"]) < float(base["profit_total_raw"])
+
+
+def test_stock_cap_affects_realized_sales():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    uncapped = run_what_if_projection(bundle, manual_price=base_price)
+    capped = run_what_if_projection(bundle, manual_price=base_price, stock_cap=1.0)
+    assert float(capped["demand_total"]) < float(uncapped["demand_total"])
+
+
+def test_demand_multiplier_is_applied_as_global_shock():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    base = run_what_if_projection(bundle, manual_price=base_price, demand_multiplier=1.0)
+    up = run_what_if_projection(bundle, manual_price=base_price, demand_multiplier=1.15)
+    assert float(up["demand_total"]) > float(base["demand_total"])
