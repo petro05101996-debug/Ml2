@@ -26,6 +26,7 @@ from data_adapter import (
     normalize_transactions,
 )
 from data_schema import CANONICAL_FIELDS
+from scenario_engine import run_scenario
 from what_if import build_sensitivity_grid, run_scenario_set
 
 warnings.filterwarnings("ignore")
@@ -3059,6 +3060,26 @@ def run_what_if_projection(
     if horizon_days is not None:
         future_dates = forecast_future_dates(pd.Timestamp(base_history["date"].max()), n_days=int(horizon_days))
 
+    baseline_price_ref = float(current_ctx.get("price", manual_price))
+    baseline_overrides = {
+        "promotion": float(current_ctx.get("promotion", 0.0)),
+        "freight_multiplier": 1.0,
+        "discount_multiplier": 1.0,
+        "cost_multiplier": 1.0,
+        "manual_shock_multiplier": 1.0,
+    }
+    baseline_sim = simulate_horizon_profit(
+        latest_row_current,
+        baseline_price_ref,
+        future_dates,
+        trained_bundle["baseline_bundle"],
+        trained_bundle["uplift_bundle"],
+        base_history,
+        current_ctx,
+        trained_bundle["elasticity_map"],
+        trained_bundle["pooled_elasticity"],
+        overrides=baseline_overrides,
+    )
     sim = simulate_horizon_profit(
         latest_row_current,
         float(manual_price),
@@ -3069,11 +3090,94 @@ def run_what_if_projection(
         current_ctx,
         trained_bundle["elasticity_map"],
         trained_bundle["pooled_elasticity"],
-        overrides=scenario_overrides,
+        overrides=baseline_overrides,
     )
     daily = sim["daily"].copy()
-    if bool(trained_bundle.get("small_mode", False)):
-        daily = apply_weekly_fallback_projection(daily, trained_bundle["daily_base"])
+    baseline_daily = baseline_sim["daily"].copy()
+    shocks = list(scenario_overrides.get("shocks", [])) if isinstance(scenario_overrides.get("shocks", []), list) else []
+    if float(demand_multiplier) != 1.0 and len(future_dates):
+        dm = float(demand_multiplier)
+        shocks.append(
+            {
+                "shock_name": "demand_multiplier",
+                "shock_type": "percent",
+                "shock_value": dm - 1.0,
+                "start_date": str(pd.to_datetime(future_dates["date"]).min().date()),
+                "end_date": str(pd.to_datetime(future_dates["date"]).max().date()),
+            }
+        )
+
+    baseline_discount = float(np.clip(current_ctx.get("discount", 0.0), 0.0, 0.95))
+    scenario_discount = float(scenario_overrides.get("discount", baseline_discount))
+    scenario_discount *= float(scenario_overrides.get("discount_multiplier", 1.0))
+    scenario_discount = float(np.clip(scenario_discount, 0.0, 0.95))
+    scenario_price = float(sim.get("price_for_model", manual_price))
+    scenario_net_price = float(max(0.01, scenario_price * (1.0 - scenario_discount)))
+
+    baseline_cost = float(current_ctx.get("cost", baseline_price_ref * CONFIG["COST_PROXY_RATIO"]))
+    scenario_cost = float(scenario_overrides.get("cost", baseline_cost))
+    scenario_cost *= float(scenario_overrides.get("cost_multiplier", 1.0))
+    scenario_cost = max(0.0, scenario_cost)
+
+    baseline_freight = float(current_ctx.get("freight_value", 0.0))
+    scenario_freight = float(scenario_overrides.get("freight_value", baseline_freight))
+    scenario_freight *= float(scenario_overrides.get("freight_multiplier", 1.0))
+    scenario_freight = max(0.0, scenario_freight)
+
+    stock_series = pd.to_numeric(
+        baseline_daily.get("stock", daily.get("stock", pd.Series([np.inf] * len(daily)))),
+        errors="coerce",
+    ).fillna(np.inf).to_numpy(dtype=float)
+    if float(scenario_overrides.get("stock_cap", 0.0)) > 0:
+        stock_series = np.minimum(stock_series, float(scenario_overrides["stock_cap"]))
+
+    scenario_inputs = {
+        "baseline_price_ref": baseline_price_ref,
+        "scenario_price": scenario_price,
+        "baseline_net_price": float(current_ctx.get("price", baseline_price_ref)) * (1.0 - float(current_ctx.get("discount", 0.0))),
+        "scenario_net_price": scenario_net_price,
+        "price_elasticity": float(trained_bundle.get("pooled_elasticity", CONFIG["PRIOR_ELASTICITY"])),
+        "price_elasticity_prior": float(CONFIG["PRIOR_ELASTICITY"]),
+        "price_cap": 0.35,
+        "promo_flag_baseline": 1.0 if float(current_ctx.get("promotion", 0.0)) > 0 else 0.0,
+        "promo_flag_scenario": 1.0 if float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))) > 0 else 0.0,
+        "promo_intensity_baseline": float(current_ctx.get("promotion", 0.0)),
+        "promo_intensity_scenario": float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))),
+        "freight_ref": float(current_ctx.get("freight_value", 0.0)),
+        "freight_scenario": scenario_freight,
+        "baseline_freight_value": float(current_ctx.get("freight_value", 0.0)),
+        "freight_value": scenario_freight,
+        "baseline_unit_cost": float(current_ctx.get("cost", baseline_price_ref * CONFIG["COST_PROXY_RATIO"])),
+        "unit_cost": scenario_cost,
+        "available_stock": stock_series,
+    }
+    baseline_for_scenario = pd.DataFrame(
+        {
+            "date": pd.to_datetime(daily["date"]) if "date" in daily.columns else pd.Series(dtype="datetime64[ns]"),
+            "baseline_units": pd.to_numeric(baseline_sim["daily"].get("base_pred_sales", pd.Series(np.zeros(len(daily)))), errors="coerce").fillna(0.0).values,
+        }
+    )
+    scenario_meta = dict(trained_bundle.get("small_mode_info", {}))
+    scenario_result = run_scenario(
+        baseline_output=baseline_for_scenario,
+        scenario_inputs=scenario_inputs,
+        shocks=shocks if isinstance(shocks, list) else [],
+        metadata=scenario_meta,
+    )
+    if len(daily):
+        daily["base_pred_sales"] = np.asarray(scenario_result["baseline_units"], dtype=float)
+        daily["pred_sales"] = np.asarray(scenario_result["final_units"], dtype=float)
+        daily["discount"] = scenario_discount
+        daily["cost"] = scenario_cost
+        daily["freight_value"] = scenario_freight
+        daily["net_unit_price"] = scenario_net_price
+        daily["stock"] = stock_series
+        daily["unconstrained_demand"] = daily["pred_sales"].clip(lower=0.0)
+        stock_lookup = pd.to_numeric(daily.get("stock", pd.Series([np.inf] * len(daily))), errors="coerce").fillna(np.inf).values
+        daily["actual_sales"] = np.minimum(daily["unconstrained_demand"].values, stock_lookup)
+        daily["lost_sales"] = (daily["unconstrained_demand"] - daily["actual_sales"]).clip(lower=0.0)
+        daily["revenue"] = daily["net_unit_price"] * daily["actual_sales"]
+        daily["profit"] = (daily["net_unit_price"] - daily["cost"] - daily["freight_value"]) * daily["actual_sales"]
     demand_total = float(daily["actual_sales"].sum()) if "actual_sales" in daily.columns else 0.0
     profit_total_raw = float(daily["profit"].sum()) if "profit" in daily.columns else 0.0
     revenue_total = float(daily["revenue"].sum()) if "revenue" in daily.columns else 0.0
@@ -3083,6 +3187,22 @@ def run_what_if_projection(
     horizon_penalty = max(0.0, (len(future_dates) - 30) / 120.0)
     extreme_penalty = max(0.0, abs(float(freight_multiplier) - 1.0) + abs(float(discount_multiplier) - 1.0) + abs(float(cost_multiplier) - 1.0) - 0.25) * 0.08
     confidence_scenario = float(np.clip(base_confidence - ood_penalty - horizon_penalty - extreme_penalty, 0.05, 0.99))
+    legacy_meta = {
+        "fallback_multiplier_used": bool(sim.get("fallback_multiplier_used", False)),
+        "fallback_reason": str(sim.get("fallback_reason", "")),
+        "learned_uplift_active": bool(sim.get("learned_uplift_active", False)),
+        "scenario_driver_mode": str(sim.get("scenario_driver_mode", "unknown")),
+        "weekly_driver_mode": str(sim.get("weekly_driver_mode", "naive_core_only")),
+        "baseline_has_exogenous_driver": bool(sim.get("baseline_has_exogenous_driver", False)),
+    }
+    scenario_engine_meta = {
+        "engine": "scenario_engine_v1",
+        "legacy_simulation_used_upstream": True,
+        "price_elasticity_local": float(scenario_inputs["price_elasticity"]),
+        "price_elasticity_prior": float(scenario_inputs["price_elasticity_prior"]),
+        "price_confidence_score": float(scenario_result.get("confidence", {}).get("price", {}).get("score", float("nan"))),
+        "price_confidence_label": str(scenario_result.get("confidence", {}).get("price", {}).get("label", "unknown")),
+    }
     return {
         "daily": daily,
         "demand_total": demand_total,
@@ -3101,13 +3221,25 @@ def run_what_if_projection(
         "requested_price": float(sim.get("requested_price", manual_price)),
         "price_for_model": float(sim.get("price_for_model", manual_price)),
         "price_clipped": bool(abs(float(sim.get("requested_price", manual_price)) - float(sim.get("price_for_model", manual_price))) > 1e-9),
-        "fallback_multiplier_used": bool(sim.get("fallback_multiplier_used", False)),
-        "fallback_reason": str(sim.get("fallback_reason", "")),
-        "learned_uplift_active": bool(sim.get("learned_uplift_active", False)),
-        "scenario_driver_mode": str(sim.get("scenario_driver_mode", "unknown")),
-        "weekly_driver_mode": str(sim.get("weekly_driver_mode", "naive_core_only")),
-        "baseline_has_exogenous_driver": bool(sim.get("baseline_has_exogenous_driver", False)),
+        "fallback_multiplier_used": legacy_meta["fallback_multiplier_used"],
+        "fallback_reason": legacy_meta["fallback_reason"],
+        "learned_uplift_active": legacy_meta["learned_uplift_active"],
+        "scenario_driver_mode": legacy_meta["scenario_driver_mode"],
+        "weekly_driver_mode": legacy_meta["weekly_driver_mode"],
+        "baseline_has_exogenous_driver": legacy_meta["baseline_has_exogenous_driver"],
+        "legacy_simulation_used": True,
+        "legacy_baseline_meta": legacy_meta,
+        "scenario_engine_meta": scenario_engine_meta,
         "applied_overrides": scenario_overrides,
+        "effects": {
+            "price_effect": float(scenario_result["price_effect"]),
+            "promo_effect": float(scenario_result["promo_effect"]),
+            "freight_effect": float(scenario_result["freight_effect"]),
+            "stock_effect": float(scenario_result["stock_effect"]),
+            "shock_multiplier_mean": float(np.mean(scenario_result["shock_multiplier"])) if len(scenario_result["shock_multiplier"]) else 1.0,
+        },
+        "confidence_factors": scenario_result.get("confidence", {}),
+        "warnings": scenario_result.get("warnings", []),
     }
 
 
