@@ -181,7 +181,7 @@ def test_manual_scenario_artifacts_created_after_runtime_what_if():
     summary_blob, daily_blob = build_manual_scenario_artifacts(res, wr)
     summary = json.loads(summary_blob.decode("utf-8"))
     daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
-    assert summary["scenario_status"] == "computed"
+    assert summary["scenario_status"] == "executed"
     assert len(daily) > 0
     assert "scenario_demand" in daily.columns
 
@@ -196,6 +196,58 @@ def test_manual_scenario_totals_not_equal_as_is_when_price_changes():
     assert summary["requested_price"] != base_price
     assert abs(summary["delta_vs_as_is"]["demand_total"]) > 0
     assert "applied_overrides" in summary
+
+
+def test_manual_scenario_executes_and_populates_summary():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(bundle, manual_price=base_price * 1.1)
+    summary_blob, _ = build_manual_scenario_artifacts(res, wr)
+    summary = json.loads(summary_blob.decode("utf-8"))
+    assert summary["scenario_status"] == "executed"
+    assert np.isfinite(summary["scenario_demand_total"])
+    assert np.isfinite(summary["scenario_revenue_total"])
+    assert np.isfinite(summary["scenario_profit_total"])
+    assert len(summary["scenario_forecast"]) > 0
+    assert np.isfinite(summary["scenario_vs_as_is_demand_pct"])
+    assert np.isfinite(summary["scenario_vs_as_is_profit_pct"])
+
+
+def test_price_increase_above_train_max_is_not_silent():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    train_max_price = float(bundle["daily_base"]["price"].max())
+    base = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]))
+    high = run_what_if_projection(bundle, manual_price=train_max_price * 1.25)
+    changed = not np.isclose(float(high["demand_total"]), float(base["demand_total"]))
+    explained_clip = bool(high.get("clip_applied")) and str(high.get("clip_reason", "")) != ""
+    assert changed or explained_clip
+
+
+def test_active_path_never_uses_nonlegacy_bundle_in_v1():
+    res = _analyze_long_signal()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    assert summary["config"]["final_active_path"] == "legacy_baseline+rule_based_multiplier"
+
+
+def test_feature_contract_block():
+    res = _analyze_long_signal()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    if summary["config"].get("uplift_gate_result") == "passed":
+        return
+    fr = res["feature_report"]
+    attempted_col = "used_in_weekly_uplift_attempted" if "used_in_weekly_uplift_attempted" in fr.columns else "used_in_uplift_attempted"
+    active_col = "used_in_weekly_uplift_active" if "used_in_weekly_uplift_active" in fr.columns else "used_in_uplift_active"
+    baseline_col = "used_in_weekly_baseline" if "used_in_weekly_baseline" in fr.columns else "used_in_baseline"
+    blocked = fr[
+        (fr[attempted_col] == True)
+        & (fr[active_col] == False)
+        & (fr[baseline_col] == False)
+    ]
+    if blocked.empty:
+        return
+    assert (blocked["used_in_final_active_forecast"] == False).all()
 
 
 def test_analysis_summary_contains_schema_version_and_commit_signature():

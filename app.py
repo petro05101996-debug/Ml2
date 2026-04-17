@@ -1424,13 +1424,8 @@ def resolve_final_active_path(
     uplift_activation: Dict[str, Any],
     fallback_multiplier_used: bool,
 ) -> str:
-    if selected_forecaster != "weekly_model":
-        return "naive_core_only"
-    if uplift_activation.get("active", False):
-        return f"{selected_candidate}+learned_uplift"
-    if fallback_multiplier_used:
-        return f"{selected_candidate}+rule_based_multiplier"
-    return f"{selected_candidate}+core_only"
+    _ = (selected_forecaster, selected_candidate, uplift_activation, fallback_multiplier_used)
+    return "legacy_baseline+rule_based_multiplier"
 
 
 def allocate_weekly_to_daily(weekly_forecast: pd.DataFrame, daily_history: pd.DataFrame, future_daily_context: pd.DataFrame) -> pd.DataFrame:
@@ -1921,6 +1916,15 @@ def simulate_horizon_profit(base_row: Dict[str, Any], price_candidate: float, fu
         "price_for_model": float(price_for_model),
         "current_price_raw": float(current_price_raw),
         "current_price_for_model": float(current_price_model),
+        "clip_applied": bool(abs(float(requested_price) - float(price_for_model)) > 1e-9),
+        "clip_reason": (
+            "price_below_train_min_weekly_baseline_clipped"
+            if float(requested_price) < float(train_min)
+            else "price_above_train_max_weekly_baseline_clipped"
+            if float(requested_price) > float(train_max)
+            else ""
+        ),
+        "scenario_price_effect_source": "requested_price_over_current_price_raw",
         "daily": daily,
         "daily_prices": daily["price"].values if len(daily) else np.array([]),
         "daily_demands": daily["pred_sales"].values if len(daily) else np.array([]),
@@ -2685,6 +2689,29 @@ def run_full_pricing_analysis_universal(
         )
 
     feature_report = pd.DataFrame(feature_usage_rows)
+    active_model_factors = sorted(
+        feature_report.loc[
+            feature_report["used_in_final_active_forecast"].astype(bool),
+            "factor_name",
+        ].astype(str).unique().tolist()
+    ) if len(feature_report) else []
+    scenario_only_factors = sorted(
+        feature_report.loc[
+            feature_report["used_in_scenario"].astype(bool)
+            & (~feature_report["used_in_final_active_forecast"].astype(bool)),
+            "factor_name",
+        ].astype(str).unique().tolist()
+    ) if len(feature_report) else []
+    if "manual_shock_multiplier" not in scenario_only_factors:
+        scenario_only_factors.append("manual_shock_multiplier")
+    attempted_but_disabled_factors = sorted(
+        feature_report.loc[
+            feature_report["used_in_weekly_uplift_attempted"].astype(bool)
+            & (~feature_report["used_in_weekly_uplift_active"].astype(bool))
+            & (~feature_report["used_in_final_active_forecast"].astype(bool)),
+            "factor_name",
+        ].astype(str).unique().tolist()
+    ) if len(feature_report) else []
     candidate_feature_readiness = {}
     candidate_eligibility = {
         name: set(select_eligible_features(train_weekly, features))
@@ -2846,6 +2873,11 @@ def run_full_pricing_analysis_universal(
                 "learned_uplift_status": "diagnostic_only_inactive",
                 "factor_application": "scenario_layer_for_price_promo_freight",
             },
+            "factor_contract": {
+                "active_model_factors": active_model_factors,
+                "scenario_only_factors": scenario_only_factors,
+                "attempted_but_disabled_factors": attempted_but_disabled_factors,
+            },
             "attempted_uplift_metrics": attempted_uplift_metrics,
             "active_uplift_metrics": active_uplift_metrics,
             "final_active_metrics": active_uplift_metrics,
@@ -2908,6 +2940,11 @@ def run_full_pricing_analysis_universal(
             "scenario_reason": "manual_what_if_not_executed" if scenario_sim is None else "",
             "active_path_contract": final_active_path,
             "learned_uplift_contract": "diagnostic_only_inactive",
+            "scenario_driver_mode": str(as_is_sim.get("scenario_driver_mode", "unknown")),
+            "weekly_driver_mode": str(as_is_sim.get("weekly_driver_mode", "naive_core_only")),
+            "fallback_multiplier_used": bool(as_is_sim.get("fallback_multiplier_used", False)),
+            "fallback_reason": str(as_is_sim.get("fallback_reason", "")),
+            "holdout_support_status": "low" if bool(holdout_support.get("support_too_low", True)) else "ok",
             "scenario_sensitivity_status": "computed",
             "baseline_demand_total": float(baseline_sim["daily"]["actual_sales"].sum()),
             "as_is_demand_total": float(as_is_sim["daily"]["actual_sales"].sum()),
@@ -3084,8 +3121,9 @@ def run_what_if_projection(
     scenario_discount = float(scenario_overrides.get("discount", baseline_discount))
     scenario_discount *= float(scenario_overrides.get("discount_multiplier", 1.0))
     scenario_discount = float(np.clip(scenario_discount, 0.0, 0.95))
-    scenario_price = float(sim.get("price_for_model", manual_price))
-    scenario_net_price = float(max(0.01, scenario_price * (1.0 - scenario_discount)))
+    requested_price = float(sim.get("requested_price", manual_price))
+    scenario_price_for_model = float(sim.get("price_for_model", manual_price))
+    scenario_net_price = float(max(0.01, requested_price * (1.0 - scenario_discount)))
 
     baseline_cost = float(current_ctx.get("cost", baseline_price_ref * CONFIG["COST_PROXY_RATIO"]))
     scenario_cost = float(scenario_overrides.get("cost", baseline_cost))
@@ -3106,7 +3144,7 @@ def run_what_if_projection(
 
     scenario_inputs = {
         "baseline_price_ref": baseline_price_ref,
-        "scenario_price": scenario_price,
+        "scenario_price": requested_price,
         "baseline_net_price": float(current_ctx.get("price", baseline_price_ref)) * (1.0 - float(current_ctx.get("discount", 0.0))),
         "scenario_net_price": scenario_net_price,
         "price_elasticity": float(trained_bundle.get("pooled_elasticity", CONFIG["PRIOR_ELASTICITY"])),
@@ -3191,9 +3229,13 @@ def run_what_if_projection(
         "confidence_scenario": confidence_scenario,
         "uncertainty": 1.0 - confidence_scenario,
         "ood_flag": bool(sim.get("ood_flag")),
-        "requested_price": float(sim.get("requested_price", manual_price)),
-        "price_for_model": float(sim.get("price_for_model", manual_price)),
-        "price_clipped": bool(abs(float(sim.get("requested_price", manual_price)) - float(sim.get("price_for_model", manual_price))) > 1e-9),
+        "requested_price": requested_price,
+        "price_for_model": scenario_price_for_model,
+        "current_price_raw": float(sim.get("current_price_raw", current_ctx.get("price", manual_price))),
+        "price_clipped": bool(sim.get("clip_applied", abs(requested_price - scenario_price_for_model) > 1e-9)),
+        "clip_applied": bool(sim.get("clip_applied", abs(requested_price - scenario_price_for_model) > 1e-9)),
+        "clip_reason": str(sim.get("clip_reason", "")),
+        "scenario_price_effect_source": str(sim.get("scenario_price_effect_source", "requested_price_over_current_price_raw")),
         "fallback_multiplier_used": legacy_meta["fallback_multiplier_used"],
         "fallback_reason": legacy_meta["fallback_reason"],
         "learned_uplift_active": legacy_meta["learned_uplift_active"],
@@ -3351,14 +3393,20 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
     ].copy()
     summary = {
         "artifact_scope": "manual_scenario",
-        "scenario_status": "computed",
+        "scenario_status": "executed",
         "requested_price": float(what_if_result.get("requested_price", np.nan)),
         "modeled_price": float(what_if_result.get("price_for_model", np.nan)),
+        "current_price_raw": float(what_if_result.get("current_price_raw", np.nan)),
+        "clip_applied": bool(what_if_result.get("clip_applied", what_if_result.get("price_clipped", False))),
+        "clip_reason": str(what_if_result.get("clip_reason", "")),
+        "scenario_price_effect_source": str(what_if_result.get("scenario_price_effect_source", "")),
         "ood_flag": bool(what_if_result.get("ood_flag", False)),
         "horizon_days": int(len(scenario)),
         "scenario_demand_total": float(manual_daily["scenario_demand"].sum()),
         "scenario_revenue_total": float(manual_daily["scenario_revenue"].sum()),
         "scenario_profit_total": float(manual_daily["scenario_profit"].sum()),
+        "scenario_vs_as_is_demand_pct": float((manual_daily["delta_demand"].sum() / max(float(manual_daily["as_is_demand"].sum()), 1e-9)) * 100.0),
+        "scenario_vs_as_is_profit_pct": float((manual_daily["delta_profit"].sum() / max(float(manual_daily["as_is_profit"].sum()), 1e-9)) * 100.0),
         "delta_vs_as_is": {
             "demand_total": float(manual_daily["delta_demand"].sum()),
             "revenue_total": float(manual_daily["delta_revenue"].sum()),
@@ -3371,7 +3419,14 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         },
         "uncertainty_penalty": float(what_if_result.get("uncertainty_penalty", 0.0)),
         "confidence": float(what_if_result.get("confidence", np.nan)),
+        "scenario_assumptions": what_if_result.get("applied_overrides", {}),
         "applied_overrides": what_if_result.get("applied_overrides", {}),
+        "scenario_forecast": manual_daily.to_dict("records"),
+        "active_path_contract": "legacy_baseline+rule_based_multiplier",
+        "scenario_driver_mode": str(what_if_result.get("scenario_driver_mode", "unknown")),
+        "weekly_driver_mode": str(what_if_result.get("weekly_driver_mode", "unknown")),
+        "fallback_multiplier_used": bool(what_if_result.get("fallback_multiplier_used", False)),
+        "fallback_reason": str(what_if_result.get("fallback_reason", "")),
     }
     return json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"), manual_daily.to_csv(index=False).encode("utf-8")
 
@@ -3816,6 +3871,69 @@ if st.session_state.results is not None:
         )
     if scenario_not_run:
         st.info("Сценарий ещё не запускался")
+    scenario_summary_ui = (run_summary_ui.get("scenario_output_summary", {}) or {})
+    manual_summary_ui = {}
+    if r.get("manual_scenario_summary_json"):
+        try:
+            manual_summary_ui = json.loads(r["manual_scenario_summary_json"].decode("utf-8"))
+        except Exception:
+            manual_summary_ui = {}
+    scenario_result_ui = manual_summary_ui if str(manual_summary_ui.get("scenario_status", "")) == "executed" else scenario_summary_ui
+    factor_contract_ui = ((run_summary_ui.get("config", {}) or {}).get("factor_contract", {}) or {})
+    st.markdown("### 1) Активный контракт расчета")
+    st.write({
+        "active_path": scenario_summary_ui.get("active_path_contract", "legacy_baseline+rule_based_multiplier"),
+        "uplift_status": scenario_summary_ui.get("learned_uplift_contract", "diagnostic_only_inactive"),
+        "scenario_mode": scenario_summary_ui.get("scenario_driver_mode", "unknown"),
+        "holdout_support_status": scenario_summary_ui.get("holdout_support_status", "unknown"),
+    })
+    st.markdown("### 2) Качество holdout")
+    st.write({
+        "WAPE": scenario_summary_ui.get("wape_final"),
+        "MAPE": scenario_summary_ui.get("mape_final"),
+        "Corr": scenario_summary_ui.get("corr_final"),
+        "Std ratio": scenario_summary_ui.get("std_ratio_final"),
+        "flat_or_shape_warning": scenario_summary_ui.get("shape_quality_low"),
+    })
+    st.markdown("### 3) Что влияет сейчас")
+    cfa, cfb, cfc = st.columns(3)
+    with cfa:
+        st.caption("Active model")
+        st.write(factor_contract_ui.get("active_model_factors", []))
+    with cfb:
+        st.caption("Scenario layer")
+        st.write(factor_contract_ui.get("scenario_only_factors", []))
+    with cfc:
+        st.caption("Attempted, but disabled by gate")
+        st.write(factor_contract_ui.get("attempted_but_disabled_factors", []))
+    st.markdown("### 4) Сценарный результат")
+    scenario_demand_total_ui = scenario_result_ui.get("scenario_demand_total", float("nan"))
+    scenario_revenue_total_ui = scenario_result_ui.get("scenario_revenue_total", float("nan"))
+    scenario_profit_total_ui = scenario_result_ui.get("scenario_profit_total", float("nan"))
+    as_is_demand_total_ui = float(current_forecast["actual_sales"].sum()) if current_forecast is not None else float("nan")
+    as_is_revenue_total_ui = float(current_forecast["revenue"].sum()) if current_forecast is not None else float("nan")
+    as_is_profit_total_ui = float(current_forecast["profit"].sum()) if current_forecast is not None else float("nan")
+    st.write({
+        "as_is_totals": {
+            "demand": as_is_demand_total_ui,
+            "revenue": as_is_revenue_total_ui,
+            "profit": as_is_profit_total_ui,
+        },
+        "scenario_totals": {
+            "demand": scenario_demand_total_ui,
+            "revenue": scenario_revenue_total_ui,
+            "profit": scenario_profit_total_ui,
+        },
+        "delta_vs_as_is": {
+            "demand": (scenario_demand_total_ui - as_is_demand_total_ui) if pd.notna(scenario_demand_total_ui) else None,
+            "profit": (scenario_profit_total_ui - as_is_profit_total_ui) if pd.notna(scenario_profit_total_ui) else None,
+        },
+        "scenario_status": scenario_result_ui.get("scenario_status", "not_run"),
+        "clip_warning": {
+            "clip_applied": scenario_result_ui.get("clip_applied"),
+            "clip_reason": scenario_result_ui.get("clip_reason"),
+        } if scenario_result_ui else None,
+    })
     st.markdown('<div class="micro-note">Цель интерфейса — показать baseline/as-is и эффект what-if сценариев без ложной оптимизационной ветки.</div>', unsafe_allow_html=True)
     k1, k2, k3, k4 = st.columns(4)
     current_price = float(r["current_price"])
@@ -3932,8 +4050,15 @@ if st.session_state.results is not None:
                 f"Profit raw: {w['profit_total_raw']:.0f} | Profit adjusted: {w['profit_total_adjusted']:.0f} | "
                 f"Penalty: {w['uncertainty_penalty']:.0f}"
             )
-            if w.get("ood_flag") or w.get("price_clipped"):
-                st.warning("Цена вне обученного диапазона: модель использовала clipped price.")
+            if w.get("ood_flag") or w.get("clip_applied") or w.get("price_clipped"):
+                st.warning(
+                    "clip_applied=true | "
+                    f"clip_reason={w.get('clip_reason', '')} | "
+                    f"requested_price={w.get('requested_price', np.nan):.2f} | "
+                    f"price_for_model={w.get('price_for_model', np.nan):.2f} | "
+                    f"current_price_raw={w.get('current_price_raw', np.nan):.2f} | "
+                    f"scenario_price_effect_source={w.get('scenario_price_effect_source', '')}"
+                )
             st.markdown('<div class="micro-note">Положительные дельты показывают улучшение относительно базового сценария.</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
