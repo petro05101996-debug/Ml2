@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import json
 import copy
+import pytest
 import app as app_module
 
 from data_adapter import build_auto_mapping, normalize_transactions, build_daily_from_transactions
@@ -430,7 +431,7 @@ def test_holdout_final_differs_from_baseline_when_uplift_enabled():
         assert diff < 1e-6
 
 
-def test_bundle_selection_picks_price_promo_when_rule_passes(monkeypatch):
+def test_bundle_selection_keeps_legacy_candidate_in_diagnostic_only_mode(monkeypatch):
     def fake_predict_weekly_holdout_with_actual_exog(model, train_weekly, test_weekly, feature_names, seasonal_anchor_weight=0.0):
         actual = test_weekly["sales"].astype(float).values
         if "freight_mean" in feature_names:
@@ -450,7 +451,8 @@ def test_bundle_selection_picks_price_promo_when_rule_passes(monkeypatch):
     res = _analyze()
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     ranking = summary["weekly_baseline_candidate_comparison"]
-    assert ranking["selected_candidate"] == "price_promo_baseline"
+    assert ranking["selected_candidate"] == "legacy_baseline"
+    assert ranking["selection_reason"] == "nonlegacy_candidates_diagnostic_only"
 
 
 def test_bundle_selection_rejects_non_finite_non_legacy_metrics(monkeypatch):
@@ -925,3 +927,60 @@ def test_demand_multiplier_is_applied_as_global_shock():
     base = run_what_if_projection(bundle, manual_price=base_price, demand_multiplier=1.0)
     up = run_what_if_projection(bundle, manual_price=base_price, demand_multiplier=1.15)
     assert float(up["demand_total"]) > float(base["demand_total"])
+
+
+def test_summary_sensitivity_is_computed_via_runtime_what_if_path():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"]
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    sens = summary["scenario_sensitivity_diagnostics"]
+    base_price = float(bundle["base_ctx"]["price"])
+
+    base = run_what_if_projection(bundle, manual_price=base_price)
+    low = run_what_if_projection(bundle, manual_price=base_price * 0.95)
+    high = run_what_if_projection(bundle, manual_price=base_price * 1.05)
+    promo = run_what_if_projection(bundle, manual_price=base_price, overrides={"promotion": min(1.0, float(bundle["base_ctx"].get("promotion", 0.0)) + 0.10)})
+    freight = run_what_if_projection(bundle, manual_price=base_price, overrides={"freight_value": float(bundle["base_ctx"].get("freight_value", 0.0)) * 1.10})
+
+    base_total = float(base["demand_total"])
+    assert sens["source"] == "run_what_if_projection_runtime_path"
+    assert sens["price_minus_5pct_demand_delta_pct"] == pytest.approx(((float(low["demand_total"]) - base_total) / max(base_total, 1e-9)) * 100.0)
+    assert sens["price_plus_5pct_demand_delta_pct"] == pytest.approx(((float(high["demand_total"]) - base_total) / max(base_total, 1e-9)) * 100.0)
+    assert sens["promo_plus_10pp_demand_delta_pct"] == pytest.approx(((float(promo["demand_total"]) - base_total) / max(base_total, 1e-9)) * 100.0)
+    assert sens["freight_plus_10pct_demand_delta_pct"] == pytest.approx(((float(freight["demand_total"]) - base_total) / max(base_total, 1e-9)) * 100.0)
+
+
+def test_summary_and_runtime_price_plus_5pct_have_same_direction():
+    res = _analyze_long_signal()
+    bundle = res["_trained_bundle"]
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    sens = summary["scenario_sensitivity_diagnostics"]
+    base_price = float(bundle["base_ctx"]["price"])
+    runtime_base = run_what_if_projection(bundle, manual_price=base_price)
+    runtime_high = run_what_if_projection(bundle, manual_price=base_price * 1.05)
+    runtime_delta = float(runtime_high["demand_total"] - runtime_base["demand_total"])
+    summary_delta = float(sens["price_plus_5pct_demand_delta_pct"])
+    assert np.sign(runtime_delta) == np.sign(summary_delta)
+
+
+def test_diagnostic_only_summary_explicitly_exposes_v1_active_path_contract():
+    res = _analyze_long_signal()
+    summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    cfg = summary["config"]
+    assert cfg["uplift_activation_mode"] == "diagnostic_only"
+    assert cfg["v1_contract"]["active_path"] == cfg["final_active_path"]
+    assert summary["scenario_output_summary"]["active_path_contract"] == cfg["final_active_path"]
+
+
+def test_attempted_uplift_only_factor_not_marked_as_active_model_factor():
+    res = _analyze_long_signal()
+    fr = res["feature_report"]
+    subset = fr[
+        (fr["used_in_uplift_attempted"] == True)
+        & (fr["used_in_uplift_active"] == False)
+        & (fr["used_in_baseline"] == False)
+    ]
+    if subset.empty:
+        return
+    assert (subset["used_in_final_active_forecast"] == False).all()
+    assert (subset["active_usage_reason"] == "uplift_deactivated_by_gate").all()
