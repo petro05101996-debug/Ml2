@@ -2525,52 +2525,6 @@ def run_full_pricing_analysis_universal(
     as_is_sim = simulate_horizon_profit(latest_row, float(base_ctx.get("price")), future_dates, baseline_bundle, uplift_bundle, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef)
     neutral_overrides = {"discount": 0.0, "promotion": 0.0, "freight_value": float(safe_median(daily_base.get("freight_value", pd.Series([0.0])), 0.0))}
     baseline_sim = simulate_horizon_profit(latest_row, baseline_price, future_dates, baseline_bundle, uplift_bundle, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef, overrides=neutral_overrides)
-    price_minus_5_sim = simulate_horizon_profit(
-        latest_row,
-        float(base_ctx.get("price", baseline_price)) * 0.95,
-        future_dates,
-        baseline_bundle,
-        uplift_bundle,
-        daily_base,
-        base_ctx,
-        shrunk_random_effects,
-        fixed_log_price_coef,
-    )
-    price_plus_5_sim = simulate_horizon_profit(
-        latest_row,
-        float(base_ctx.get("price", baseline_price)) * 1.05,
-        future_dates,
-        baseline_bundle,
-        uplift_bundle,
-        daily_base,
-        base_ctx,
-        shrunk_random_effects,
-        fixed_log_price_coef,
-    )
-    promo_plus_10pp_sim = simulate_horizon_profit(
-        latest_row,
-        float(base_ctx.get("price", baseline_price)),
-        future_dates,
-        baseline_bundle,
-        uplift_bundle,
-        daily_base,
-        base_ctx,
-        shrunk_random_effects,
-        fixed_log_price_coef,
-        overrides={"promotion": min(1.0, float(base_ctx.get("promotion", 0.0)) + 0.10)},
-    )
-    freight_plus_10pct_sim = simulate_horizon_profit(
-        latest_row,
-        float(base_ctx.get("price", baseline_price)),
-        future_dates,
-        baseline_bundle,
-        uplift_bundle,
-        daily_base,
-        base_ctx,
-        shrunk_random_effects,
-        fixed_log_price_coef,
-        overrides={"freight_value": float(base_ctx.get("freight_value", 0.0)) * 1.10},
-    )
     scenario_sim = None
     scenario_forecast = scenario_sim["daily"] if scenario_sim else None
     confidence = float(1.0 / (1.0 + max(0.0, holdout_metrics.get("wape", 100.0) / 100.0)))
@@ -2789,19 +2743,54 @@ def run_full_pricing_analysis_universal(
     holdout_final = holdout_predictions["final_pred_sales"].astype(float).values
     holdout_actual_std = float(np.std(holdout_actual, ddof=0)) if len(holdout_actual) else float("nan")
     holdout_pred_std = float(np.std(holdout_final, ddof=0)) if len(holdout_final) else float("nan")
-    base_demand_total = float(as_is_sim["daily"]["actual_sales"].sum())
+    sensitivity_trained_bundle = {
+        "baseline_bundle": baseline_bundle,
+        "uplift_bundle": uplift_bundle,
+        "daily_base": daily_base,
+        "base_ctx": base_ctx,
+        "latest_row": latest_row,
+        "future_dates": future_dates,
+        "elasticity_map": shrunk_random_effects,
+        "pooled_elasticity": fixed_log_price_coef,
+        "confidence": confidence,
+        "small_mode_info": small_mode_info,
+    }
+    sensitivity_base = run_what_if_projection(
+        sensitivity_trained_bundle,
+        manual_price=float(base_ctx.get("price", baseline_price)),
+    )
+    sensitivity_price_minus_5 = run_what_if_projection(
+        sensitivity_trained_bundle,
+        manual_price=float(base_ctx.get("price", baseline_price)) * 0.95,
+    )
+    sensitivity_price_plus_5 = run_what_if_projection(
+        sensitivity_trained_bundle,
+        manual_price=float(base_ctx.get("price", baseline_price)) * 1.05,
+    )
+    sensitivity_promo_plus_10pp = run_what_if_projection(
+        sensitivity_trained_bundle,
+        manual_price=float(base_ctx.get("price", baseline_price)),
+        overrides={"promotion": min(1.0, float(base_ctx.get("promotion", 0.0)) + 0.10)},
+    )
+    sensitivity_freight_plus_10pct = run_what_if_projection(
+        sensitivity_trained_bundle,
+        manual_price=float(base_ctx.get("price", baseline_price)),
+        overrides={"freight_value": float(base_ctx.get("freight_value", 0.0)) * 1.10},
+    )
+    base_demand_total = float(sensitivity_base["demand_total"])
     scenario_sensitivity_diagnostics = {
         "selected_forecaster": selected_forecaster,
         "baseline_has_exogenous_driver": bool(baseline_has_exog),
         "scenario_driver_mode": resolve_scenario_driver_mode(selected_forecaster, bool(baseline_has_exog)),
-        "weekly_driver_mode": str(as_is_sim.get("weekly_driver_mode", "naive_core_only")),
+        "weekly_driver_mode": str(sensitivity_base.get("weekly_driver_mode", "naive_core_only")),
         "learned_uplift_active": bool(len(uplift_bundle.get("models", [])) > 0),
-        "fallback_multiplier_used": bool(as_is_sim.get("fallback_multiplier_used", False)),
-        "fallback_reason": str(as_is_sim.get("fallback_reason", "")),
-        "price_minus_5pct_demand_delta_pct": float(((price_minus_5_sim["daily"]["actual_sales"].sum() - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
-        "price_plus_5pct_demand_delta_pct": float(((price_plus_5_sim["daily"]["actual_sales"].sum() - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
-        "promo_plus_10pp_demand_delta_pct": float(((promo_plus_10pp_sim["daily"]["actual_sales"].sum() - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
-        "freight_plus_10pct_demand_delta_pct": float(((freight_plus_10pct_sim["daily"]["actual_sales"].sum() - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
+        "fallback_multiplier_used": bool(sensitivity_base.get("fallback_multiplier_used", False)),
+        "fallback_reason": str(sensitivity_base.get("fallback_reason", "")),
+        "source": "run_what_if_projection_runtime_path",
+        "price_minus_5pct_demand_delta_pct": float(((sensitivity_price_minus_5["demand_total"] - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
+        "price_plus_5pct_demand_delta_pct": float(((sensitivity_price_plus_5["demand_total"] - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
+        "promo_plus_10pp_demand_delta_pct": float(((sensitivity_promo_plus_10pp["demand_total"] - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
+        "freight_plus_10pct_demand_delta_pct": float(((sensitivity_freight_plus_10pct["demand_total"] - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
     }
     final_active_path = resolve_final_active_path(
         selected_forecaster=selected_forecaster,
@@ -2852,6 +2841,11 @@ def run_full_pricing_analysis_universal(
             "quality_improvement_expected": False,
             "quality_improvement_expectation_reason": "diagnostic_only_modes_active_path_frozen",
             "final_active_path": final_active_path,
+            "v1_contract": {
+                "active_path": final_active_path,
+                "learned_uplift_status": "diagnostic_only_inactive",
+                "factor_application": "scenario_layer_for_price_promo_freight",
+            },
             "attempted_uplift_metrics": attempted_uplift_metrics,
             "active_uplift_metrics": active_uplift_metrics,
             "final_active_metrics": active_uplift_metrics,
@@ -2912,6 +2906,8 @@ def run_full_pricing_analysis_universal(
             "artifact_scope": "analysis_only",
             "scenario_status": "not_run" if scenario_sim is None else "computed",
             "scenario_reason": "manual_what_if_not_executed" if scenario_sim is None else "",
+            "active_path_contract": final_active_path,
+            "learned_uplift_contract": "diagnostic_only_inactive",
             "scenario_sensitivity_status": "computed",
             "baseline_demand_total": float(baseline_sim["daily"]["actual_sales"].sum()),
             "as_is_demand_total": float(as_is_sim["daily"]["actual_sales"].sum()),
@@ -2963,26 +2959,6 @@ def run_full_pricing_analysis_universal(
         },
     }
     current_price = float(base_ctx.get("price"))
-    curve_prices = np.linspace(max(0.01, current_price * 0.9), current_price * 1.1, 9)
-    profit_curve = pd.DataFrame(
-        [
-            {
-                "price": p,
-                "adjusted_profit": simulate_horizon_profit(
-                    latest_row,
-                    float(p),
-                    future_dates,
-                    baseline_bundle,
-                    uplift_bundle,
-                    daily_base,
-                    base_ctx,
-                    shrunk_random_effects,
-                    fixed_log_price_coef,
-                )["adjusted_profit"],
-            }
-            for p in curve_prices
-        ]
-    )
     return {
         "history_daily": daily_base,
         "quality_report": {"holdout_metrics": holdout_metrics},
@@ -2995,14 +2971,11 @@ def run_full_pricing_analysis_universal(
         "delta_vs_baseline": delta_vs_baseline,
         "warnings": warnings,
         "small_mode_info": small_mode_info,
-        "profit_curve": profit_curve,
         "holdout_metrics": pd.DataFrame([holdout_metrics]),
         "elasticity_map": shrunk_random_effects,
         "current_price": float(base_ctx.get("price")),
         "scenario_price": None,
         "current_profit": float(as_is_sim.get("adjusted_profit", as_is_sim.get("total_profit", 0.0))),
-        "best_profit": float(as_is_sim.get("adjusted_profit", as_is_sim.get("total_profit", 0.0))),
-        "profit_lift_pct": 0.0,
         "excel_buffer": excel_buffer,
         "analysis_run_summary_json": json.dumps(run_summary, ensure_ascii=False, indent=2).encode("utf-8"),
         "holdout_predictions_csv": holdout_predictions.to_csv(index=False).encode("utf-8"),
@@ -3833,20 +3806,34 @@ if st.session_state.results is not None:
     if r.get("warnings"):
         for msg in r["warnings"]:
             st.warning(msg)
+    run_summary_ui = json.loads(r.get("analysis_run_summary_json", b"{}").decode("utf-8")) if r.get("analysis_run_summary_json") else {}
+    contract_ui = (((run_summary_ui.get("config", {}) or {}).get("v1_contract", {})) or {})
+    if contract_ui:
+        st.info(
+            "Контракт v1: active path = legacy_baseline + rule_based_multiplier; "
+            "learned uplift = diagnostic only/inactive; "
+            "price/promo/freight применяются через scenario layer."
+        )
     if scenario_not_run:
         st.info("Сценарий ещё не запускался")
     st.markdown('<div class="micro-note">Цель интерфейса — показать baseline/as-is и эффект what-if сценариев без ложной оптимизационной ветки.</div>', unsafe_allow_html=True)
     k1, k2, k3, k4 = st.columns(4)
     current_price = float(r["current_price"])
     raw_scenario_price = r.get("scenario_price_modeled", r.get("scenario_price"))
-    best_price = float(raw_scenario_price) if raw_scenario_price is not None and np.isfinite(raw_scenario_price) else float(r.get("current_price", 0.0))
-    delta_pct = ((best_price - current_price) / current_price * 100) if current_price else 0.0
+    scenario_price_display = float(raw_scenario_price) if raw_scenario_price is not None and np.isfinite(raw_scenario_price) else float(r.get("current_price", 0.0))
+    delta_pct = ((scenario_price_display - current_price) / current_price * 100) if current_price else 0.0
 
     with k1: _metric_card("Текущая цена", f"₽ {current_price:,.2f}", "База", True, history_daily["price"], "#FF8A00")
-    with k2: _metric_card("Сценарная цена", f"₽ {best_price:,.2f}", f"{delta_pct:+.2f}%", delta_pct >= 0, (scenario_forecast["actual_sales"] if scenario_forecast is not None else current_forecast["actual_sales"]), "#00D4FF")
+    with k2: _metric_card("Сценарная цена", f"₽ {scenario_price_display:,.2f}", f"{delta_pct:+.2f}%", delta_pct >= 0, (scenario_forecast["actual_sales"] if scenario_forecast is not None else current_forecast["actual_sales"]), "#00D4FF")
     with k3:
-        abs_lift = float(r["best_profit"] - r["current_profit"])
-        _metric_card("Δ прибыли сценария", f"{r['profit_lift_pct']:.2f}%", f"≈ ₽ {abs_lift:,.0f}", r["profit_lift_pct"] >= 0, r["profit_curve"]["adjusted_profit"], "#E400FF")
+        _metric_card(
+            "Текущая прибыль (as-is)",
+            f"₽ {float(r['current_profit']):,.0f}",
+            "без оптимизатора",
+            True,
+            current_forecast["profit"],
+            "#E400FF",
+        )
     with k4:
         elast = list(r["elasticity_map"].values())[-1] if len(r["elasticity_map"]) else np.nan
         _metric_card("Эластичность", f"{elast:.2f}" if np.isfinite(elast) else "n/a", "последний месяц", True, history_daily["sales"], "#FFFFFF")
@@ -3889,16 +3876,11 @@ if st.session_state.results is not None:
         st.plotly_chart(fig_e, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
         st.caption(f"Интерпретация: зона [-5; -1] — эластичный спрос, зона (-1; 0] — слабоэластичный. Сейчас: {elasticity_zone}.")
 
-        fig_p = px.line(r["profit_curve"], x="price", y="adjusted_profit", template="plotly_dark")
-        fig_p.update_traces(line_color="#FF8A00", line_width=3)
-        fig_p.add_vline(x=r["current_price"], line_dash="dash", line_color="#ffffff", annotation_text="Текущая")
-        vline_price = r.get("scenario_price_modeled", r.get("scenario_price"))
-        if vline_price is None or not np.isfinite(vline_price):
-            vline_price = r["current_price"]
-        fig_p.add_vline(x=vline_price, line_dash="solid", line_color="#00D4FF", annotation_text="Scenario")
-        fig_p.update_layout(**_base_plotly_layout("Кривая прибыли"), dragmode="pan")
-        st.plotly_chart(fig_p, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
-        st.caption("Вершина кривой — ценовой диапазон с максимумом ожидаемой прибыли.")
+        st.markdown(
+            '<div class="micro-note">Ограничение v1: shape может быть плоской (shape_quality_low). '
+            'Confidence носит advisory-характер и не является гарантией.</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown('</div>', unsafe_allow_html=True)
 
     with right:
@@ -3918,8 +3900,6 @@ if st.session_state.results is not None:
                 r["scenario_price_requested"] = float(wr.get("requested_price", manual_price))
                 r["scenario_price_modeled"] = float(wr.get("price_for_model", manual_price))
                 r["scenario_price"] = r["scenario_price_modeled"]
-                r["best_profit"] = float(wr.get("profit_total_adjusted", wr.get("profit_total", 0.0)))
-                r["profit_lift_pct"] = ((r["best_profit"] - r["current_profit"]) / max(abs(r["current_profit"]), 1e-9)) * 100.0
                 r["manual_scenario_summary_json"], r["manual_scenario_daily_csv"] = build_manual_scenario_artifacts(r, wr)
                 st.session_state.results = r
                 st.rerun()
