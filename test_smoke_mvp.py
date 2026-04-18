@@ -9,8 +9,13 @@ from data_adapter import build_auto_mapping, normalize_transactions, build_daily
 from what_if import build_sensitivity_grid, run_scenario_set
 from scenario_engine import run_scenario
 from app import (
+    build_business_report_payload,
+    build_data_sufficiency_status,
+    build_scenario_comparison_table,
+    build_trust_block,
     apply_weekly_fallback_projection,
     build_manual_scenario_artifacts,
+    read_uploaded_table_safely,
     read_uploaded_csv_safely,
     resolve_weekly_driver_mode,
     resolve_scenario_driver_mode,
@@ -320,6 +325,112 @@ def test_no_double_multiplier():
     base_f = float(base["daily"]["freight_value"].iloc[0])
     high_f = float(high["daily"]["freight_value"].iloc[0])
     assert abs((high_f / base_f) - 1.5) < 1e-6
+
+
+class _DummyUpload:
+    def __init__(self, payload: bytes, name: str):
+        self._payload = payload
+        self.name = name
+
+    def getvalue(self):
+        return self._payload
+
+
+def test_product_valid_upload_supports_csv_and_xlsx_and_baseline():
+    csv_payload = (
+        "date,product_id,category,price,quantity,revenue,cost,discount,freight_value,promotion\n"
+        "2025-01-01,sku-1,cat-a,100,2,200,60,0,5,0\n"
+        "2025-01-02,sku-1,cat-a,101,2,202,61,0,5,1\n"
+    ).encode("utf-8")
+    csv_df = read_uploaded_table_safely(_DummyUpload(csv_payload, "data.csv"))
+    assert len(csv_df) == 2
+    xlsx_buf = pd.io.common.BytesIO()
+    pd.DataFrame({"date": ["2025-01-01"], "product_id": ["sku-1"], "price": [100]}).to_excel(xlsx_buf, index=False)
+    xlsx_df = read_uploaded_table_safely(_DummyUpload(xlsx_buf.getvalue(), "data.xlsx"))
+    assert "product_id" in xlsx_df.columns
+    res = _analyze()
+    assert len(res["as_is_forecast"]) > 0
+
+
+def test_product_invalid_upload_missing_required_columns_has_clear_error():
+    bad = pd.DataFrame({"date": ["2025-01-01"], "price": [100]})
+    mapping = build_auto_mapping(list(bad.columns))
+    _, quality = normalize_transactions(bad, mapping)
+    assert quality["errors"]
+    assert "обязательные поля" in quality["errors"][0].lower()
+
+
+def test_product_trust_signals_limited_and_out_of_range():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    w = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]) * 1.5, overrides={"promotion": 1.0, "freight_value": 999.0})
+    trust = build_trust_block(res, w)
+    assert trust["scenario_range_status"] == "out-of-range"
+    assert trust["data_sufficiency"] in {"enough", "limited", "poor"}
+
+
+def test_product_report_integrity_and_margin_honesty():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    w = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]) * 1.1)
+    payload = build_business_report_payload(res, w, {"Scenario A": {"units": 1}})
+    assert "active_path_summary" in payload
+    assert "warnings_reliability_notes" in payload
+    assert payload["scenario_forecast"]["units"] is not None
+    res_no_cost = dict(res)
+    res_no_cost["cost_input_available"] = False
+    payload_no_cost = build_business_report_payload(res_no_cost, w, {})
+    assert payload_no_cost["as_is_forecast"]["profit"] is None
+
+
+def test_product_scenario_recalc_price_promo_freight_shock_changes_result():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    base = run_what_if_projection(bundle, manual_price=base_price, overrides={"promotion": 0.0}, freight_multiplier=1.0, demand_multiplier=1.0)
+    changed = run_what_if_projection(
+        bundle,
+        manual_price=base_price * 1.08,
+        overrides={"promotion": 1.0},
+        freight_multiplier=1.2,
+        demand_multiplier=1.1,
+    )
+    assert float(changed["demand_total"]) != float(base["demand_total"])
+    assert float(changed["revenue_total"]) != float(base["revenue_total"])
+
+
+def test_product_trust_signal_for_limited_data():
+    tiny = pd.DataFrame(
+        {
+            "date": pd.date_range("2025-01-01", periods=20, freq="D"),
+            "product_id": ["sku-1"] * 20,
+        }
+    )
+    status = build_data_sufficiency_status(tiny)
+    assert status["status"] == "poor"
+
+
+def test_product_comparison_table_as_is_and_saved_scenarios():
+    res = _analyze()
+    as_is = res["as_is_forecast"]
+    saved = {
+        "Scenario A": {"units": 10, "revenue": 100, "profit": 30, "delta_units": 1, "delta_revenue": 2, "delta_profit": 3},
+        "Scenario B": {"units": 11, "revenue": 110, "profit": 31, "delta_units": 2, "delta_revenue": 3, "delta_profit": 4},
+        "Scenario C": {"units": 12, "revenue": 120, "profit": 32, "delta_units": 3, "delta_revenue": 4, "delta_profit": 5},
+    }
+    out = build_scenario_comparison_table(as_is, saved, show_margin=True)
+    assert set(out["scenario"]) == {"As-is", "Scenario A", "Scenario B", "Scenario C"}
+    as_is_row = out[out["scenario"] == "As-is"].iloc[0]
+    assert float(as_is_row["delta_units"]) == 0.0
+
+
+def test_product_report_contains_active_path_and_warnings():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    w = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]) * 1.5, overrides={"freight_value": 999.0})
+    payload = build_business_report_payload(res, w, {})
+    assert payload["active_path_summary"]["active_path"] != ""
+    assert isinstance(payload["warnings_reliability_notes"], list)
 
 
 def test_uplift_uses_exogenous_features_only():
