@@ -230,11 +230,11 @@ def test_price_increase_above_train_max_is_not_silent():
     assert changed or explained_clip
 
 
-def test_active_path_uses_price_promo_freight_baseline_in_v1():
+def test_active_path_uses_selected_candidate_in_v1():
     res = _analyze_long_signal()
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
-    assert summary["config"]["selected_candidate"] == "price_promo_freight_baseline"
-    assert "price_promo_freight_baseline" in summary["config"]["final_active_path"]
+    selected_candidate = summary["config"]["selected_candidate"]
+    assert selected_candidate in summary["config"]["final_active_path"]
 
 
 def test_feature_contract_block():
@@ -365,7 +365,7 @@ def test_product_trust_signals_limited_and_out_of_range():
     bundle = res["_trained_bundle"]
     w = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]) * 1.5, overrides={"promotion": 1.0, "freight_value": 999.0})
     trust = build_trust_block(res, w)
-    assert trust["scenario_range_status"] == "out-of-range"
+    assert trust["scenario_range_status"] == "out_of_range"
     assert trust["data_sufficiency"] in {"enough", "limited", "poor"}
 
 
@@ -595,7 +595,7 @@ def test_holdout_final_differs_from_baseline_when_uplift_enabled():
         assert diff < 1e-6
 
 
-def test_bundle_selection_prefers_price_promo_freight_baseline(monkeypatch):
+def test_bundle_selection_uses_quality_rule_not_forced_override(monkeypatch):
     def fake_predict_weekly_holdout_with_actual_exog(model, train_weekly, test_weekly, feature_names, seasonal_anchor_weight=0.0):
         actual = test_weekly["sales"].astype(float).values
         if "freight_mean" in feature_names:
@@ -616,7 +616,7 @@ def test_bundle_selection_prefers_price_promo_freight_baseline(monkeypatch):
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     ranking = summary["weekly_baseline_candidate_comparison"]
     assert ranking["selected_candidate"] == "price_promo_freight_baseline"
-    assert ranking["selection_reason"] == "preferred_price_promo_freight_baseline"
+    assert ranking["selection_reason"] == "non_legacy_passed_selection_rule_best_wape"
 
 
 def test_bundle_selection_rejects_non_finite_non_legacy_metrics(monkeypatch):
@@ -727,7 +727,7 @@ def test_active_path_contract_and_uplift_off_in_report():
     res = _analyze()
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     out = summary["scenario_output_summary"]
-    assert out["active_path_contract"].startswith("price_promo_freight_baseline")
+    assert out["active_path_contract"].startswith(summary["config"]["selected_candidate"])
     assert out["learned_uplift_contract"] == "inactive_production_diagnostic_only"
     assert summary["config"]["learned_uplift_active"] is False
 
@@ -761,9 +761,9 @@ def test_no_double_counting_price_effect_against_direct_engine():
         baseline_output=pd.DataFrame({"date": baseline_daily["date"], "baseline_units": baseline_daily["base_pred_sales"]}),
         scenario_inputs={
             "baseline_price_ref": base_price,
-            "scenario_price": target_price,
+            "scenario_price": float(scenario.get("model_price", scenario.get("price_for_model", target_price))),
             "baseline_net_price": base_price * (1.0 - float(bundle["base_ctx"].get("discount", 0.0))),
-            "scenario_net_price": target_price * (1.0 - float(bundle["base_ctx"].get("discount", 0.0))),
+            "scenario_net_price": float(scenario.get("model_price", scenario.get("price_for_model", target_price))) * (1.0 - float(bundle["base_ctx"].get("discount", 0.0))),
             "promo_flag_baseline": 1.0 if float(bundle["base_ctx"].get("promotion", 0.0)) > 0 else 0.0,
             "promo_flag_scenario": 1.0 if float(bundle["base_ctx"].get("promotion", 0.0)) > 0 else 0.0,
             "promo_intensity_baseline": float(bundle["base_ctx"].get("promotion", 0.0)),

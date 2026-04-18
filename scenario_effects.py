@@ -25,8 +25,10 @@ def compute_promo_effect(
     alpha_share: float = 0.20,
     cap: float = 0.40,
 ) -> float:
-    promo_term = alpha_share * max(float(promo_share), 0.0) + alpha_flag * max(float(promo_flag), 0.0)
-    return float(1.0 + np.clip(promo_term, 0.0, max(cap, 0.0)))
+    promo_term = alpha_share * float(promo_share) + alpha_flag * float(promo_flag)
+    clipped = float(np.clip(promo_term, -abs(cap), abs(cap)))
+    effect = float(np.exp(clipped))
+    return float(np.clip(effect, 0.25, 4.0))
 
 
 def compute_freight_effect(
