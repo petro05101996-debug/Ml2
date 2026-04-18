@@ -28,6 +28,14 @@ from data_adapter import (
 from data_schema import CANONICAL_FIELDS, canonical_required_fields
 from scenario_engine import run_scenario
 from what_if import build_sensitivity_grid, run_scenario_set
+from ui.components import (
+    render_action_buttons,
+    render_action_row,
+    render_chip_row,
+    render_kpi_cards,
+    render_top_header,
+)
+from ui.theme import apply_theme
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -3630,6 +3638,8 @@ if "sensitivity_df" not in st.session_state:
     st.session_state.sensitivity_df = None
 if "saved_scenarios" not in st.session_state:
     st.session_state.saved_scenarios = {}
+if "active_workspace_tab" not in st.session_state:
+    st.session_state.active_workspace_tab = "Dashboard"
 
 PLOTLY_WORKSPACE_CONFIG = {
     "displayModeBar": True,
@@ -3638,130 +3648,8 @@ PLOTLY_WORKSPACE_CONFIG = {
     "modeBarButtonsToAdd": ["pan2d", "zoomIn2d", "zoomOut2d", "resetScale2d"],
 }
 
-st.markdown(
-    """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=Space+Grotesk:wght@600;700&display=swap');
-
-:root {
-  --bg: #0A0A12;
-  --text: #F0F4FF;
-  --muted: #A0A8C0;
-  --card: rgba(20,22,38,.92);
-  --border: rgba(255,255,255,.12);
-  --orange: #FF8A00;
-  --magenta: #E400FF;
-  --cyan: #00D4FF;
-}
-
-html, body, [class*="css"], .stApp { font-family: Inter, sans-serif; color: var(--text); }
-.stApp {
-  background:
-    radial-gradient(circle at 15% -10%, rgba(255,138,0,.22), transparent 35%),
-    radial-gradient(circle at 80% -10%, rgba(228,0,255,.20), transparent 35%),
-    radial-gradient(circle at 50% 0%, rgba(0,212,255,.10), transparent 42%),
-    var(--bg);
-}
-.block-container { max-width: 1450px; padding-top: 1.2rem; padding-bottom: 2rem; }
-#MainMenu, footer, header { visibility: hidden; }
-
-.glass-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 18px;
-  padding: 18px;
-  backdrop-filter: blur(12px);
-  box-shadow: 0 12px 30px rgba(0,0,0,.35), 0 0 24px rgba(228,0,255,.08);
-  animation: fadeScale .45s ease;
-}
-.metric-card:hover, .feature-card:hover {
-  transform: translateY(-3px);
-  transition: .25s ease;
-  border-color: rgba(255,138,0,.5);
-  box-shadow: 0 12px 32px rgba(255,138,0,.16), 0 0 20px rgba(0,212,255,.10);
-}
-.hero-title {
-  font-family: "Space Grotesk", Inter, sans-serif;
-  font-size: clamp(2rem, 5vw, 3.5rem);
-  font-weight: 700;
-  line-height: 1.05;
-  background: linear-gradient(90deg, var(--orange), #ffbf63, var(--magenta));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  margin-bottom: .5rem;
-}
-.hero-sub { color: var(--muted); font-size: 1.03rem; }
-.section-title { font-family: "Space Grotesk", Inter, sans-serif; font-size: 1.2rem; margin: .2rem 0 .7rem; }
-.timeline { display:flex; gap:10px; flex-wrap:wrap; }
-.timeline-step { padding: 8px 12px; border-radius: 999px; border:1px solid var(--border); background: rgba(255,255,255,.03); font-size:.84rem; }
-.kpi-label {color:var(--muted); font-size:.84rem;} .kpi-val{font-size:1.6rem;font-weight:800;}
-.kpi-pos {color:#3bd98c;font-weight:700;font-size:.85rem;} .kpi-neg{color:#ff5a7d;font-weight:700;font-size:.85rem;}
-.explain {color:var(--muted); font-size:.86rem; margin-top:.4rem;}
-.micro-note { color: var(--muted); font-size: .82rem; line-height: 1.35; margin-top: .35rem; }
-.stTabs [data-baseweb="tab-list"] { gap:8px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:5px; }
-.stTabs [data-baseweb="tab"] { border-radius:10px; height:40px; }
-.stButton button, .stDownloadButton button { border-radius:12px !important; border:1px solid rgba(255,138,0,.55)!important; }
-.stButton button:hover, .stDownloadButton button:hover { box-shadow:0 0 24px rgba(255,138,0,.28); }
-.pill-row { display:flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-.pill { border:1px solid var(--border); color:var(--muted); background:rgba(255,255,255,.03); border-radius:999px; padding:6px 10px; font-size:.78rem; }
-.big-cta { text-align: center; margin-top: .3rem; }
-.big-cta h3 { margin: .25rem 0 .5rem; font-weight: 700; }
-.mock-shell {
-  border: 1px solid rgba(255,255,255,.28);
-  border-radius: 28px;
-  padding: 24px;
-  background: linear-gradient(180deg, rgba(8,9,22,.95), rgba(7,8,20,.92));
-  box-shadow: inset 0 0 45px rgba(228,0,255,.08), 0 15px 45px rgba(0,0,0,.45);
-}
-.mock-top {
-  display:flex; align-items:center; justify-content:space-between; margin-bottom: 16px;
-}
-.badge-id {
-  border:1px solid rgba(255,255,255,.23); border-radius: 13px; padding: 8px 14px; font-weight:600; color:#D9DEEF; background: rgba(255,255,255,.03);
-}
-.hero-center { text-align:center; padding: 10px 0 6px; }
-.hero-sub2 { color:#cfd5ec; opacity:.9; max-width:660px; margin: 0 auto 12px; }
-.cta-glow button {
-  background: linear-gradient(90deg, #ffcc66, #ff8a00 40%, #f96af7 70%, #8f5cff) !important;
-  color:#111 !important; font-weight: 800 !important; border: none !important;
-  box-shadow: 0 0 28px rgba(255,138,0,.38), 0 0 30px rgba(228,0,255,.34) !important;
-}
-.feature-grid { display:grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; }
-.fcard { border:1px solid rgba(255,255,255,.16); border-radius: 13px; padding: 10px; background: rgba(255,255,255,.05); min-height: 94px; }
-.fcard h5 { margin:0 0 3px; font-size:.93rem; }
-.fcard p { margin:0; font-size:.75rem; color:var(--muted); line-height: 1.28; }
-.stage-row { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px; flex-wrap:wrap; }
-.stage-dot { width:42px; height:42px; border-radius:999px; display:flex; align-items:center; justify-content:center; background: radial-gradient(circle at 30% 20%, #ffd96c, #ff8a00 45%, #ff4fd8 100%); color:#241625; font-weight:800; border:1px solid rgba(255,255,255,.24); box-shadow:0 0 20px rgba(255,138,0,.35);}
-.stage-item { text-align:center; min-width:74px; }
-.stage-item span { display:block; margin-top:4px; font-size:.76rem; color:#d5daf0; }
-.tech-list { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
-.tech-pill { border:1px solid rgba(255,255,255,.2); border-radius:10px; padding:5px 9px; font-size:.78rem; background: rgba(255,255,255,.04); }
-.dashboard-grid { display:grid; grid-template-columns: 1.25fr .95fr; gap: 14px; }
-.hero-kpis { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
-.hero-kpi { border:1px solid rgba(255,255,255,.14); border-radius: 14px; padding: 12px; background: rgba(255,255,255,.03); }
-.hero-kpi h4 { margin:0 0 4px; font-size:.92rem; font-weight:700; color:#e9edf8; }
-.hero-kpi p { margin:0; font-size:.78rem; color:var(--muted); line-height:1.35; }
-.deliverables-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:10px; }
-.deliver-item { border:1px solid rgba(255,255,255,.16); border-radius: 12px; padding: 10px; background: rgba(255,255,255,.04);}
-.deliver-item h5 { margin:0 0 4px; font-size:.9rem; }
-.deliver-item p { margin:0; color:var(--muted); font-size:.77rem; line-height:1.35; }
-.guide-box { border-left:3px solid var(--cyan); padding:10px 12px; border-radius:10px; background: rgba(0,212,255,.08); margin: 10px 0 4px; }
-.guide-box ol { margin:0; padding-left: 18px; }
-.guide-box li { margin: 4px 0; color:#d7def4; font-size:.82rem; }
-@keyframes fadeScale { from{opacity:0;transform:translateY(8px) scale(.98);} to{opacity:1;transform:translateY(0) scale(1);} }
-@media (max-width: 980px) {
-  .block-container { padding-top: .6rem; padding-left: .8rem; padding-right: .8rem; }
-  .glass-card { padding: 14px; border-radius: 14px; }
-  .kpi-val { font-size: 1.25rem; }
-  .hero-sub { font-size: .95rem; }
-  .feature-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
-  .dashboard-grid { grid-template-columns: 1fr; }
-  .hero-kpis, .deliverables-grid { grid-template-columns: 1fr; }
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
+apply_theme()
+render_top_header("AI Pricing Control Panel", "Dark dashboard • Universal CSV what-if v1")
 
 
 def _base_plotly_layout(title: str) -> Dict[str, Any]:
@@ -4080,6 +3968,67 @@ if st.session_state.results is not None:
     else:
         scenario_forecast = r["scenario_forecast"]
     baseline_forecast = r["neutral_baseline_forecast"]
+    run_ts = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    st.markdown(
+        f"""
+<div class="cloud-card elevated">
+  <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <div>
+      <div class="card-title">Active scenario instance</div>
+      <div class="muted">SKU: {st.session_state.get("selected_sku_for_results", "n/a")} • Category: {st.session_state.get("selected_category_for_results", "n/a")}</div>
+      <div class="chip-row">
+        <span class="chip active">Active path: price_promo_freight_baseline</span>
+        <span class="chip {'warn' if scenario_not_run else 'ok'}">{'Scenario not executed' if scenario_not_run else 'Scenario executed'}</span>
+      </div>
+    </div>
+    <div style="text-align:right;">
+      <div class="muted">Run metadata</div>
+      <div style="font-size:1.05rem;font-weight:700;">{run_ts}</div>
+      <div class="muted">Confidence advisory only</div>
+    </div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    render_action_row(
+        [
+            ("↻", "Recalculate"),
+            ("⇄", "Compare scenarios"),
+            ("⇩", "Export report"),
+            ("⟲", "Reset scenario"),
+            ("◉", "Open diagnostics"),
+        ]
+    )
+    action_clicked = render_action_buttons(
+        [
+            ("recalculate", "↻", "Recalculate"),
+            ("compare", "⇄", "Compare"),
+            ("export", "⇩", "Export"),
+            ("reset", "⟲", "Reset"),
+            ("diagnostics", "◉", "Diagnostics"),
+        ]
+    )
+    if action_clicked == "recalculate":
+        st.toast("Измените параметры сценария и нажмите «Пересчитать сценарий».", icon="↻")
+    elif action_clicked == "compare":
+        st.session_state.active_workspace_tab = "Scenario"
+        st.toast("Открыт раздел сравнения сценариев.", icon="⇄")
+    elif action_clicked == "export":
+        st.session_state.active_workspace_tab = "Report"
+        st.toast("Откройте вкладку Report для выгрузки артефактов.", icon="⇩")
+    elif action_clicked == "diagnostics":
+        st.session_state.active_workspace_tab = "Diagnostics"
+        st.toast("Открыт раздел диагностики.", icon="◉")
+    elif action_clicked == "reset":
+        st.session_state.what_if_result = None
+        st.session_state.scenario_table = None
+        st.session_state.sensitivity_df = None
+        st.session_state.saved_scenarios = {}
+        r["scenario_forecast"] = None
+        st.session_state.results = r
+        st.toast("Сценарий сброшен к as-is.", icon="⟲")
+        st.rerun()
     st.markdown('<div class="section-title">KPI и ключевой вывод</div>', unsafe_allow_html=True)
     if r.get("warnings"):
         for msg in r["warnings"]:
@@ -4120,15 +4069,27 @@ if st.session_state.results is not None:
     scenario_revenue_total = float(scenario_live["revenue_total"]) if scenario_live else as_is_revenue_total
     scenario_profit_total = float(scenario_live["profit_total_adjusted"]) if scenario_live else as_is_profit_total
     show_margin = bool(r.get("cost_input_available", False))
-    card_a, card_b, card_c, card_d = st.columns(4)
-    card_a.metric("Baseline / as-is units", f"{baseline_units_total:,.1f}", f"as-is: {as_is_units_total:,.1f}")
-    card_b.metric("Scenario units", f"{scenario_units_total:,.1f}", f"Δ {scenario_units_total - as_is_units_total:+,.1f}")
-    card_c.metric("Scenario revenue", f"₽ {scenario_revenue_total:,.0f}", f"Δ ₽ {scenario_revenue_total - as_is_revenue_total:+,.0f}")
+    kpi_items = [
+        {"label": "Active forecast (units)", "value": f"{scenario_units_total:,.1f}", "delta": f"as-is: {as_is_units_total:,.1f}", "positive": True},
+        {"label": "Scenario revenue", "value": f"₽ {scenario_revenue_total:,.0f}", "delta": f"Δ ₽ {scenario_revenue_total - as_is_revenue_total:+,.0f}", "positive": scenario_revenue_total >= as_is_revenue_total},
+        {"label": "Scenario delta units", "value": f"{scenario_units_total - as_is_units_total:+,.1f}", "delta": "vs as-is", "positive": (scenario_units_total - as_is_units_total) >= 0},
+        {"label": "Data quality", "value": str(trust_block['data_sufficiency']).upper(), "delta": str(trust_block['scenario_range_status']), "positive": trust_block["data_sufficiency"] == "enough"},
+        {"label": "Active model path", "value": "Price+Promo+Freight", "delta": "production baseline", "positive": True},
+    ]
     if show_margin:
-        card_d.metric("Scenario gross profit", f"₽ {scenario_profit_total:,.0f}", f"Δ ₽ {scenario_profit_total - as_is_profit_total:+,.0f}")
-    else:
-        card_d.info("Margin/profit unavailable: required cost fields missing.")
+        kpi_items[1] = {"label": "Scenario gross profit", "value": f"₽ {scenario_profit_total:,.0f}", "delta": f"Δ ₽ {scenario_profit_total - as_is_profit_total:+,.0f}", "positive": scenario_profit_total >= as_is_profit_total}
+    render_kpi_cards(kpi_items)
+    if not show_margin:
+        st.info("Margin/profit unavailable: required cost fields missing.")
     st.markdown("#### Quality / trust")
+    render_chip_row(
+        [
+            (f"Data: {trust_block['data_sufficiency']}", "ok" if trust_block["data_sufficiency"] == "enough" else "warn"),
+            (f"Range: {trust_block['scenario_range_status']}", "ok" if trust_block["scenario_range_status"] == "in_range" else "warn"),
+            (f"Fallback: {trust_block['fallback_used']}", "warn" if trust_block["fallback_used"] else "ok"),
+            (f"Mode: {trust_block['active_calculation_mode']}", "active"),
+        ]
+    )
     st.write(
         {
             "data_sufficiency": trust_block["data_sufficiency"],
@@ -4262,19 +4223,35 @@ if st.session_state.results is not None:
 
     with right:
         st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("### What-if: ручной сценарий")
-        st.markdown('<div class="micro-note">Сценарий считается в реальном времени на уже обученном бандле, без переобучения.</div>', unsafe_allow_html=True)
-        manual_price = st.number_input("Новая цена (₽)", min_value=0.01, value=float(r["current_price"]), step=1.0, key="what_if_price")
+        st.markdown("### Scenario editor")
+        st.markdown('<div class="micro-note">Price / Promo / Freight / Shock factor считаются на уже обученном бандле (без переобучения).</div>', unsafe_allow_html=True)
+        st.markdown('<div class="cloud-card elevated">', unsafe_allow_html=True)
+        st.markdown("**Price**")
+        manual_price = st.number_input("Scenario value (₽)", min_value=0.01, value=float(r["current_price"]), step=1.0, key="what_if_price")
+        st.caption(f"Current value: ₽ {float(r['current_price']):,.2f}")
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="cloud-card elevated">', unsafe_allow_html=True)
+        st.markdown("**Promo**")
         promo_value = st.slider(
-            "Promo level",
+            "Scenario value",
             0.0,
             1.0,
             float(np.clip(r["_trained_bundle"]["base_ctx"].get("promotion", 0.0), 0.0, 1.0)),
             0.05,
             key="what_if_promo",
         )
-        freight_mult = st.slider("Коэффициент freight", 0.5, 1.5, 1.0, 0.05, key="what_if_freight")
-        demand_mult = st.slider("Manual shock multiplier", 0.7, 1.3, 1.0, 0.05, key="what_if_demand")
+        st.caption(f"Current value: {float(np.clip(r['_trained_bundle']['base_ctx'].get('promotion', 0.0), 0.0, 1.0)):.2f}")
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="cloud-card elevated">', unsafe_allow_html=True)
+        st.markdown("**Freight**")
+        freight_mult = st.slider("Scenario multiplier", 0.5, 1.5, 1.0, 0.05, key="what_if_freight")
+        st.caption("Current value: 1.00x")
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="cloud-card elevated">', unsafe_allow_html=True)
+        st.markdown("**Shock factor**")
+        demand_mult = st.slider("Scenario multiplier", 0.7, 1.3, 1.0, 0.05, key="what_if_demand")
+        st.caption("Current value: 1.00x")
+        st.markdown('</div>', unsafe_allow_html=True)
         horizon_days = st.slider("Горизонт прогноза (дней)", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
 
         if st.button("Пересчитать сценарий", use_container_width=True):
@@ -4410,28 +4387,30 @@ if st.session_state.results is not None:
         st.plotly_chart(fig_heat, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    tabs = st.tabs(["История продаж и цены", "Метрики качества", "Полная таблица прогноза", "Детальная эластичность"])
-    with tabs[0]:
+    selected_section = st.radio(
+        "Workspace",
+        ["Dashboard", "Scenario", "Results", "Diagnostics", "Report"],
+        index=["Dashboard", "Scenario", "Results", "Diagnostics", "Report"].index(st.session_state.get("active_workspace_tab", "Dashboard")),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.session_state.active_workspace_tab = selected_section
+    if selected_section == "Dashboard":
         fig_h = go.Figure()
         fig_h.add_trace(go.Scatter(x=history_daily["date"], y=history_daily["sales"], name="Продажи", line=dict(color="#00D4FF", width=2.6), yaxis="y1"))
         fig_h.add_trace(go.Scatter(x=history_daily["date"], y=history_daily["price"], name="Цена", line=dict(color="#FF8A00", width=2.2), yaxis="y2"))
         fig_h.update_layout(**_base_plotly_layout("История продаж и цены"), yaxis=dict(title="Продажи"), yaxis2=dict(title="Цена", overlaying="y", side="right"), dragmode="pan")
         st.plotly_chart(fig_h, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
         st.caption("Динамика цены и объёма продаж на одной шкале времени.")
-    with tabs[1]:
-        metric_df = r["holdout_metrics"].copy()
-        st.dataframe(metric_df, use_container_width=True)
-        st.caption("MAPE/WAPE/RMSE показывают среднюю ошибку модели на отложенной выборке.")
-        if "feature_report" in r:
-            st.markdown("**Feature usage diagnostics**")
-            st.dataframe(r["feature_report"], use_container_width=True)
-            st.caption(
-                "found_in_raw — фактор был в нормализованном сыром источнике; "
-                "present_in_daily — дошёл до дневного ряда; "
-                "engineered_feature — создан внутри пайплайна; "
-                "used_in_* — фактическое использование в активной модели."
-            )
-    with tabs[2]:
+    elif selected_section == "Scenario":
+        st.markdown("#### Scenario editor status")
+        st.markdown("Карточки и инпуты сценария расположены в блоке **What-if: ручной сценарий** выше; изменения применяются без переобучения.")
+        st.info("Используйте Price / Promo / Freight / Shock factor, затем «Пересчитать сценарий».")
+        if st.session_state.what_if_result is not None:
+            st.write(st.session_state.what_if_result.get("scenario_inputs_contract", {}))
+        else:
+            st.warning("Сценарий пока не запущен.")
+    elif selected_section == "Results":
         scenario_table_src = scenario_forecast if scenario_forecast is not None else current_forecast.copy()
         full_table = current_forecast[["date", "actual_sales", "revenue", "profit"]].rename(
             columns={"actual_sales": "sales_current", "revenue": "revenue_current", "profit": "profit_current"}
@@ -4446,13 +4425,30 @@ if st.session_state.results is not None:
         full_table["delta_revenue"] = full_table["revenue_scenario"] - full_table["revenue_current"]
         full_table["delta_profit"] = full_table["profit_scenario"] - full_table["profit_current"]
         st.dataframe(full_table, use_container_width=True, height=320)
-    with tabs[3]:
+    elif selected_section == "Diagnostics":
+        metric_df = r["holdout_metrics"].copy()
+        st.dataframe(metric_df, use_container_width=True)
+        st.caption("MAPE/WAPE/RMSE показывают среднюю ошибку модели на отложенной выборке.")
+        if "feature_report" in r:
+            st.markdown("**Feature usage diagnostics**")
+            st.dataframe(r["feature_report"], use_container_width=True)
+            st.caption(
+                "found_in_raw — фактор был в нормализованном сыром источнике; "
+                "present_in_daily — дошёл до дневного ряда; "
+                "engineered_feature — создан внутри пайплайна; "
+                "used_in_* — фактическое использование в активной модели."
+            )
+        with st.expander("Advanced raw debug JSON"):
+            st.json(run_summary_ui)
+    elif selected_section == "Report":
         elast_df = pd.DataFrame(list(r["elasticity_map"].items()), columns=["month", "elasticity"])
-        st.dataframe(elast_df, use_container_width=True, height=260)
+        st.markdown("#### Report summary")
+        st.dataframe(elast_df, use_container_width=True, height=200)
         fig_ed = px.bar(elast_df, x="month", y="elasticity", template="plotly_dark")
         fig_ed.update_traces(marker_color="#E400FF")
         fig_ed.update_layout(**_base_plotly_layout("Детальная эластичность"), dragmode="pan")
         st.plotly_chart(fig_ed, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
+        st.caption(f"Timestamp: {run_ts}")
 
     cta1, cta2 = st.columns(2)
     with cta1:
