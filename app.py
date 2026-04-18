@@ -25,7 +25,7 @@ from data_adapter import (
     build_daily_from_transactions,
     normalize_transactions,
 )
-from data_schema import CANONICAL_FIELDS
+from data_schema import CANONICAL_FIELDS, canonical_required_fields
 from scenario_engine import run_scenario
 from what_if import build_sensitivity_grid, run_scenario_set
 
@@ -212,6 +212,67 @@ def read_uploaded_csv_safely(uploaded_file: Any) -> pd.DataFrame:
                 parse_errors.append(f"{enc}/{repr(sep)}: {e}")
     msg = " ; ".join(parse_errors[-4:]) if parse_errors else "не удалось определить разделитель/кодировку"
     raise ValueError(f"Не удалось прочитать CSV ({msg})")
+
+
+def read_uploaded_table_safely(uploaded_file: Any) -> pd.DataFrame:
+    if uploaded_file is None:
+        raise ValueError("Файл не загружен.")
+    file_name = str(getattr(uploaded_file, "name", "")).lower()
+    if file_name.endswith(".xlsx"):
+        raw_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+        if not raw_bytes:
+            raise ValueError("Загруженный XLSX пустой.")
+        try:
+            return pd.read_excel(BytesIO(raw_bytes), engine="openpyxl")
+        except Exception as e:
+            raise ValueError(f"Не удалось прочитать XLSX: {e}") from e
+    return read_uploaded_csv_safely(uploaded_file)
+
+
+def validate_mapping_required_columns(mapping: Dict[str, Optional[str]]) -> List[str]:
+    required = canonical_required_fields()
+    missing_required = [c for c in required if not mapping.get(c)]
+    return missing_required
+
+
+def build_data_sufficiency_status(txn: pd.DataFrame) -> Dict[str, Any]:
+    if txn is None or len(txn) == 0:
+        return {
+            "status": "poor",
+            "label": "poor",
+            "message": "После нормализации нет валидных строк: прогноз ненадёжен.",
+            "warnings": ["Недостаточно данных для расчёта."],
+        }
+    date_series = pd.to_datetime(txn.get("date"), errors="coerce")
+    valid_dates = date_series.dropna()
+    history_days = int((valid_dates.max() - valid_dates.min()).days + 1) if len(valid_dates) else 0
+    rows = int(len(txn))
+    sku_count = int(txn["product_id"].nunique()) if "product_id" in txn.columns else 0
+    if history_days >= 120 and rows >= 250 and sku_count >= 2:
+        status = "enough"
+        message = "Истории и объёма данных достаточно для v1."
+    elif history_days >= 60 and rows >= 100:
+        status = "limited"
+        message = "Данные ограничены: используйте результат как ориентир, а не как гарантию."
+    else:
+        status = "poor"
+        message = "Данных мало, рекомендации будут нестабильными."
+    warnings_local: List[str] = []
+    if history_days < 60:
+        warnings_local.append("История короче 60 дней.")
+    if rows < 100:
+        warnings_local.append("Меньше 100 наблюдений.")
+    if sku_count < 2:
+        warnings_local.append("Только один SKU — сравнительная устойчивость ниже.")
+    return {
+        "status": status,
+        "label": status,
+        "message": message,
+        "rows": rows,
+        "history_days": history_days,
+        "sku_count": sku_count,
+        "warnings": warnings_local,
+    }
 
 
 def calculate_mape(y_true, y_pred, eps: float = 1e-9) -> float:
@@ -3006,6 +3067,7 @@ def run_full_pricing_analysis_universal(
         "current_price": float(base_ctx.get("price")),
         "scenario_price": None,
         "current_profit": float(as_is_sim.get("adjusted_profit", as_is_sim.get("total_profit", 0.0))),
+        "cost_input_available": bool("cost" in txn.columns and pd.to_numeric(txn.get("cost"), errors="coerce").notna().any()),
         "excel_buffer": excel_buffer,
         "analysis_run_summary_json": json.dumps(run_summary, ensure_ascii=False, indent=2).encode("utf-8"),
         "holdout_predictions_csv": holdout_predictions.to_csv(index=False).encode("utf-8"),
@@ -3437,6 +3499,117 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
     return json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"), manual_daily.to_csv(index=False).encode("utf-8")
 
 
+def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    history = results.get("history_daily", pd.DataFrame())
+    sufficiency = build_data_sufficiency_status(history)
+    active_path = "unknown"
+    try:
+        run_summary = json.loads(results.get("analysis_run_summary_json", b"{}").decode("utf-8"))
+        active_path = str(run_summary.get("config", {}).get("final_active_path", "unknown"))
+    except Exception:
+        pass
+    scenario_contract = (what_if_result or {}).get("scenario_inputs_contract", {})
+    price_min = float(pd.to_numeric(history.get("price", pd.Series([0.0])), errors="coerce").dropna().min()) if len(history) else 0.0
+    price_max = float(pd.to_numeric(history.get("price", pd.Series([0.0])), errors="coerce").dropna().max()) if len(history) else 0.0
+    freight_min = float(pd.to_numeric(history.get("freight_value", pd.Series([0.0])), errors="coerce").dropna().min()) if len(history) else 0.0
+    freight_max = float(pd.to_numeric(history.get("freight_value", pd.Series([0.0])), errors="coerce").dropna().max()) if len(history) else 0.0
+    promo_min = float(pd.to_numeric(history.get("promotion", pd.Series([0.0])), errors="coerce").dropna().min()) if len(history) else 0.0
+    promo_max = float(pd.to_numeric(history.get("promotion", pd.Series([0.0])), errors="coerce").dropna().max()) if len(history) else 0.0
+    warnings_local: List[str] = []
+    in_range = True
+    if scenario_contract:
+        sc_price = float(scenario_contract.get("scenario_price", scenario_contract.get("base_price", 0.0)))
+        sc_freight = float(scenario_contract.get("scenario_freight", scenario_contract.get("base_freight", 0.0)))
+        sc_promo = float(scenario_contract.get("scenario_promo", scenario_contract.get("base_promo", 0.0)))
+        if price_max > price_min and (sc_price < price_min * 0.85 or sc_price > price_max * 1.15):
+            warnings_local.append("price change too far beyond historical range.")
+            in_range = False
+        if freight_max > freight_min and (sc_freight < max(0.0, freight_min * 0.85) or sc_freight > freight_max * 1.15):
+            warnings_local.append("freight change outside observed window.")
+            in_range = False
+        if promo_max > promo_min and (sc_promo < max(0.0, promo_min - 0.10) or sc_promo > min(1.0, promo_max + 0.10)):
+            warnings_local.append("promo level exceeds historical support.")
+            in_range = False
+    return {
+        "data_sufficiency": sufficiency["label"],
+        "data_message": sufficiency["message"],
+        "scenario_range_status": "in-range" if in_range else "out-of-range",
+        "active_calculation_mode": active_path,
+        "fallback_used": bool((what_if_result or {}).get("fallback_multiplier_used", False)),
+        "warnings": sufficiency.get("warnings", []) + warnings_local + list((what_if_result or {}).get("warnings", [])),
+    }
+
+
+def build_business_report_payload(
+    results: Dict[str, Any],
+    what_if_result: Optional[Dict[str, Any]] = None,
+    saved_scenarios: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    as_is = results.get("as_is_forecast", pd.DataFrame())
+    baseline = results.get("neutral_baseline_forecast", pd.DataFrame())
+    scenario_daily = (what_if_result or {}).get("daily", None)
+    trust = build_trust_block(results, what_if_result)
+    as_is_units = float(as_is["actual_sales"].sum()) if len(as_is) else float("nan")
+    as_is_revenue = float(as_is["revenue"].sum()) if len(as_is) else float("nan")
+    as_is_profit = float(as_is["profit"].sum()) if len(as_is) and "profit" in as_is.columns else float("nan")
+    scenario_units = float(scenario_daily["actual_sales"].sum()) if isinstance(scenario_daily, pd.DataFrame) and len(scenario_daily) else float("nan")
+    scenario_revenue = float(scenario_daily["revenue"].sum()) if isinstance(scenario_daily, pd.DataFrame) and len(scenario_daily) else float("nan")
+    scenario_profit = float(scenario_daily["profit"].sum()) if isinstance(scenario_daily, pd.DataFrame) and len(scenario_daily) and "profit" in scenario_daily.columns else float("nan")
+    margin_available = bool(results.get("cost_input_available", False))
+    return {
+        "timestamp_utc": str(pd.Timestamp.utcnow()),
+        "input_summary": {
+            "sku": str(results.get("_trained_bundle", {}).get("base_ctx", {}).get("product_id", "")),
+            "category": str(results.get("_trained_bundle", {}).get("base_ctx", {}).get("category", "")),
+            "history_rows": int(len(results.get("history_daily", pd.DataFrame()))),
+            "history_start": str(pd.to_datetime(results.get("history_daily", pd.DataFrame()).get("date"), errors="coerce").min()),
+            "history_end": str(pd.to_datetime(results.get("history_daily", pd.DataFrame()).get("date"), errors="coerce").max()),
+        },
+        "active_path_summary": {"active_path": trust["active_calculation_mode"], "fallback_used": trust["fallback_used"]},
+        "margin_available": margin_available,
+        "baseline_forecast": {
+            "units": float(baseline["actual_sales"].sum()) if len(baseline) else float("nan"),
+            "revenue": float(baseline["revenue"].sum()) if len(baseline) else float("nan"),
+            "profit": float(baseline["profit"].sum()) if margin_available and len(baseline) and "profit" in baseline.columns else None,
+        },
+        "as_is_forecast": {"units": as_is_units, "revenue": as_is_revenue, "profit": as_is_profit if margin_available else None},
+        "scenario_forecast": {"units": scenario_units, "revenue": scenario_revenue, "profit": scenario_profit if margin_available else None},
+        "delta_vs_as_is": {
+            "units": scenario_units - as_is_units if np.isfinite(scenario_units) else None,
+            "revenue": scenario_revenue - as_is_revenue if np.isfinite(scenario_revenue) else None,
+            "profit": scenario_profit - as_is_profit if margin_available and np.isfinite(scenario_profit) and np.isfinite(as_is_profit) else None,
+        },
+        "warnings_reliability_notes": trust["warnings"],
+        "saved_scenarios": saved_scenarios or {},
+    }
+
+
+def build_scenario_comparison_table(
+    as_is_forecast: pd.DataFrame,
+    saved_scenarios: Dict[str, Dict[str, Any]],
+    show_margin: bool,
+) -> pd.DataFrame:
+    compare_rows = [
+        {
+            "scenario": "As-is",
+            "units": float(as_is_forecast["actual_sales"].sum()),
+            "revenue": float(as_is_forecast["revenue"].sum()),
+            "profit": float(as_is_forecast["profit"].sum()),
+            "delta_units": 0.0,
+            "delta_revenue": 0.0,
+            "delta_profit": 0.0,
+        }
+    ]
+    for name in ["Scenario A", "Scenario B", "Scenario C"]:
+        if name in saved_scenarios:
+            compare_rows.append({"scenario": name, **saved_scenarios[name]})
+    compare_df = pd.DataFrame(compare_rows)
+    if not show_margin and "profit" in compare_df.columns:
+        compare_df["profit"] = np.nan
+        compare_df["delta_profit"] = np.nan
+    return compare_df
+
+
 st.set_page_config(page_title="💰 AI What-if Engine", layout="wide", page_icon="💰")
 
 if "results" not in st.session_state:
@@ -3455,6 +3628,8 @@ if "scenario_table" not in st.session_state:
     st.session_state.scenario_table = None
 if "sensitivity_df" not in st.session_state:
     st.session_state.sensitivity_df = None
+if "saved_scenarios" not in st.session_state:
+    st.session_state.saved_scenarios = {}
 
 PLOTLY_WORKSPACE_CONFIG = {
     "displayModeBar": True,
@@ -3621,18 +3796,20 @@ def _metric_card(title: str, value: str, delta_text: str, delta_positive: bool, 
 def render_upload_block() -> Dict[str, Any]:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">Загрузка данных</div>', unsafe_allow_html=True)
-    st.caption("Поддерживается только Universal CSV (единый контур what-if v1).")
+    st.caption("Поддерживается Universal CSV/XLSX (единый контур what-if v1).")
     load_mode = "Universal CSV"
 
     orders_file = items_file = products_file = reviews_file = None
     universal_file = None
 
-    universal_file = st.file_uploader("Universal transactions CSV", type=["csv"], key="universal_file")
+    universal_file = st.file_uploader("Universal transactions file", type=["csv", "xlsx"], key="universal_file")
     st.progress(1.0 if universal_file else 0.0, text=f"Обязательные файлы: {1 if universal_file else 0}/1")
 
     raw_for_select = None
     universal_txn = None
     universal_quality = {}
+    schema_valid = False
+    schema_errors: List[str] = []
     universal_mapping: Dict[str, Optional[str]] = {}
     orders_col_map: Dict[str, Optional[str]] = {}
     items_col_map: Dict[str, Optional[str]] = {}
@@ -3641,7 +3818,7 @@ def render_upload_block() -> Dict[str, Any]:
 
     if load_mode == "Universal CSV" and universal_file is not None:
         try:
-            preview = read_uploaded_csv_safely(universal_file)
+            preview = read_uploaded_table_safely(universal_file)
             auto_map = build_auto_mapping(list(preview.columns))
             with st.expander("⚙️ Сопоставление колонок (каноническая схема)", expanded=True):
                 for f in CANONICAL_FIELDS:
@@ -3655,14 +3832,36 @@ def render_upload_block() -> Dict[str, Any]:
                         key=f"map_universal_{f.name}",
                     )
                     universal_mapping[f.name] = None if selected == "<не использовать>" else selected
-            universal_txn, universal_quality = normalize_transactions(preview, universal_mapping)
-            if universal_quality.get("errors"):
-                st.error(" ; ".join(universal_quality["errors"]))
+            missing_required = validate_mapping_required_columns(universal_mapping)
+            if missing_required:
+                required_hint = ", ".join(missing_required)
+                schema_errors.append(
+                    "Схема данных невалидна: отсутствует маппинг обязательных полей "
+                    f"({required_hint}). Укажите соответствующие колонки в блоке маппинга."
+                )
+                schema_errors.append(
+                    "Что можно поправить: проверьте названия обязательных полей date/product_id/price "
+                    "и перезагрузите файл при необходимости."
+                )
             else:
-                st.success(f"Нормализация завершена: {len(universal_txn):,} строк.")
-                for w in universal_quality.get("warnings", []):
-                    st.warning(w)
-                raw_for_select = universal_txn.copy().rename(columns={"category": "product_category_name", "product_id": "product_id"})
+                universal_txn, universal_quality = normalize_transactions(preview, universal_mapping)
+                if universal_quality.get("errors"):
+                    schema_errors.extend(list(universal_quality["errors"]))
+                else:
+                    schema_valid = True
+                    st.success(f"Нормализация завершена: {len(universal_txn):,} строк.")
+                    for w in universal_quality.get("warnings", []):
+                        st.warning(w)
+                    sufficiency = build_data_sufficiency_status(universal_txn)
+                    if sufficiency["status"] == "poor":
+                        st.warning(f"Data sufficiency: {sufficiency['status']} — {sufficiency['message']}")
+                    elif sufficiency["status"] == "limited":
+                        st.info(f"Data sufficiency: {sufficiency['status']} — {sufficiency['message']}")
+                    else:
+                        st.success(f"Data sufficiency: {sufficiency['status']}.")
+                    raw_for_select = universal_txn.copy().rename(columns={"category": "product_category_name", "product_id": "product_id"})
+            for err in schema_errors:
+                st.error(err)
         except Exception as e:
             st.error(f"Ошибка предобработки universal CSV: {e}")
 
@@ -3688,6 +3887,8 @@ def render_upload_block() -> Dict[str, Any]:
         "universal_file": universal_file,
         "universal_txn": universal_txn,
         "universal_quality": universal_quality,
+        "schema_valid": schema_valid,
+        "schema_errors": schema_errors,
         "universal_mapping": universal_mapping,
         "load_mode": load_mode,
         "target_category": target_category,
@@ -3799,12 +4000,25 @@ else:
             st.session_state.what_if_result = None
             st.session_state.scenario_table = None
             st.session_state.sensitivity_df = None
+            st.session_state.saved_scenarios = {}
             st.session_state.app_stage = "landing"
             st.rerun()
     with right_toolbar:
         has_results = st.session_state.results is not None
         st.download_button("📥 Скачать полный Excel-отчёт", data=st.session_state.results["excel_buffer"] if has_results else b"", file_name=f"pricing_report_{st.session_state.get('selected_sku_for_results', 'report')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, disabled=not has_results)
         if has_results:
+            report_payload = build_business_report_payload(
+                st.session_state.results,
+                st.session_state.what_if_result,
+                st.session_state.saved_scenarios,
+            )
+            st.download_button(
+                "📄 business_ready_report.json",
+                data=json.dumps(report_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name="business_ready_report.json",
+                mime="application/json",
+                use_container_width=True,
+            )
             st.caption("initial analysis artifacts")
             st.download_button("🧾 analysis_run_summary.json", data=st.session_state.results.get("analysis_run_summary_json", b""), file_name="analysis_run_summary.json", mime="application/json", use_container_width=True)
             st.download_button("📈 holdout_predictions.csv", data=st.session_state.results.get("holdout_predictions_csv", b""), file_name="holdout_predictions.csv", mime="text/csv", use_container_width=True)
@@ -3830,7 +4044,9 @@ if ctx and ctx.get("run_requested"):
     target_category = ctx["target_category"]
     target_sku = ctx["target_sku"]
     if load_mode == "Universal CSV" and ctx.get("universal_txn") is None:
-        st.error("Загрузите и сопоставьте universal CSV.")
+        st.error("Загрузите и сопоставьте universal CSV/XLSX.")
+    elif load_mode == "Universal CSV" and not bool(ctx.get("schema_valid", False)):
+        st.error("Схема данных невалидна. Исправьте ошибки маппинга/обязательных полей и запустите снова.")
     elif target_category is None or target_sku is None:
         st.error("Выберите категорию и SKU для анализа.")
     else:
@@ -3847,6 +4063,7 @@ if ctx and ctx.get("run_requested"):
                 st.session_state.what_if_result = None
                 st.session_state.scenario_table = None
                 st.session_state.sensitivity_df = None
+                st.session_state.saved_scenarios = {}
                 st.session_state.app_stage = "dashboard"
                 st.rerun()
             except Exception as e:
@@ -3886,6 +4103,42 @@ if st.session_state.results is not None:
             manual_summary_ui = {}
     scenario_result_ui = manual_summary_ui if str(manual_summary_ui.get("scenario_status", "")) == "executed" else scenario_summary_ui
     factor_contract_ui = ((run_summary_ui.get("config", {}) or {}).get("factor_contract", {}) or {})
+    st.markdown(
+        "This is a transparent what-if forecasting and decision-support tool. "
+        "It estimates scenario impact from historical patterns and selected factors; "
+        "it is not a fully autonomous pricing AI."
+    )
+    trust_block = build_trust_block(r, st.session_state.what_if_result)
+    baseline_units_total = float(baseline_forecast["actual_sales"].sum())
+    baseline_revenue_total = float(baseline_forecast["revenue"].sum())
+    baseline_profit_total = float(baseline_forecast["profit"].sum()) if "profit" in baseline_forecast.columns else float("nan")
+    as_is_units_total = float(current_forecast["actual_sales"].sum())
+    as_is_revenue_total = float(current_forecast["revenue"].sum())
+    as_is_profit_total = float(current_forecast["profit"].sum()) if "profit" in current_forecast.columns else float("nan")
+    scenario_live = st.session_state.what_if_result
+    scenario_units_total = float(scenario_live["demand_total"]) if scenario_live else as_is_units_total
+    scenario_revenue_total = float(scenario_live["revenue_total"]) if scenario_live else as_is_revenue_total
+    scenario_profit_total = float(scenario_live["profit_total_adjusted"]) if scenario_live else as_is_profit_total
+    show_margin = bool(r.get("cost_input_available", False))
+    card_a, card_b, card_c, card_d = st.columns(4)
+    card_a.metric("Baseline / as-is units", f"{baseline_units_total:,.1f}", f"as-is: {as_is_units_total:,.1f}")
+    card_b.metric("Scenario units", f"{scenario_units_total:,.1f}", f"Δ {scenario_units_total - as_is_units_total:+,.1f}")
+    card_c.metric("Scenario revenue", f"₽ {scenario_revenue_total:,.0f}", f"Δ ₽ {scenario_revenue_total - as_is_revenue_total:+,.0f}")
+    if show_margin:
+        card_d.metric("Scenario gross profit", f"₽ {scenario_profit_total:,.0f}", f"Δ ₽ {scenario_profit_total - as_is_profit_total:+,.0f}")
+    else:
+        card_d.info("Margin/profit unavailable: required cost fields missing.")
+    st.markdown("#### Quality / trust")
+    st.write(
+        {
+            "data_sufficiency": trust_block["data_sufficiency"],
+            "scenario_range_status": trust_block["scenario_range_status"],
+            "active_calculation_mode": trust_block["active_calculation_mode"],
+            "fallback_used": trust_block["fallback_used"],
+        }
+    )
+    for warn_msg in trust_block.get("warnings", []):
+        st.warning(warn_msg)
     st.markdown("### 1) Активный контракт расчета")
     st.write({
         "active_path": scenario_summary_ui.get("active_path_contract", "price_promo_freight_baseline+scenario_recompute"),
@@ -4012,12 +4265,27 @@ if st.session_state.results is not None:
         st.markdown("### What-if: ручной сценарий")
         st.markdown('<div class="micro-note">Сценарий считается в реальном времени на уже обученном бандле, без переобучения.</div>', unsafe_allow_html=True)
         manual_price = st.number_input("Новая цена (₽)", min_value=0.01, value=float(r["current_price"]), step=1.0, key="what_if_price")
+        promo_value = st.slider(
+            "Promo level",
+            0.0,
+            1.0,
+            float(np.clip(r["_trained_bundle"]["base_ctx"].get("promotion", 0.0), 0.0, 1.0)),
+            0.05,
+            key="what_if_promo",
+        )
         freight_mult = st.slider("Коэффициент freight", 0.5, 1.5, 1.0, 0.05, key="what_if_freight")
         demand_mult = st.slider("Manual shock multiplier", 0.7, 1.3, 1.0, 0.05, key="what_if_demand")
         horizon_days = st.slider("Горизонт прогноза (дней)", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
 
         if st.button("Пересчитать сценарий", use_container_width=True):
-            st.session_state.what_if_result = run_what_if_projection(r["_trained_bundle"], manual_price=float(manual_price), freight_multiplier=float(freight_mult), demand_multiplier=float(demand_mult), horizon_days=int(horizon_days))
+            st.session_state.what_if_result = run_what_if_projection(
+                r["_trained_bundle"],
+                manual_price=float(manual_price),
+                freight_multiplier=float(freight_mult),
+                demand_multiplier=float(demand_mult),
+                horizon_days=int(horizon_days),
+                overrides={"promotion": float(promo_value)},
+            )
             if st.session_state.what_if_result is not None:
                 wr = st.session_state.what_if_result
                 r["scenario_forecast"] = wr["daily"].copy()
@@ -4051,6 +4319,16 @@ if st.session_state.results is not None:
             m1.metric("Δ Спрос", f"{delta_d:+.1f}")
             m2.metric("Δ Прибыль", f"₽ {delta_p:+,.0f}")
             m3.metric("Δ Выручка", f"₽ {delta_r:+,.0f}")
+            st.markdown("**Scenario inputs summary**")
+            st.write(w.get("scenario_inputs_contract", {}))
+            st.markdown(
+                f"Изменение сценария: price {w.get('scenario_inputs_contract', {}).get('base_price', np.nan):.2f} → "
+                f"{w.get('scenario_inputs_contract', {}).get('scenario_price', np.nan):.2f}, "
+                f"promo {w.get('scenario_inputs_contract', {}).get('base_promo', np.nan):.2f} → "
+                f"{w.get('scenario_inputs_contract', {}).get('scenario_promo', np.nan):.2f}, "
+                f"freight {w.get('scenario_inputs_contract', {}).get('base_freight', np.nan):.2f} → "
+                f"{w.get('scenario_inputs_contract', {}).get('scenario_freight', np.nan):.2f}."
+            )
             st.caption(
                 f"Requested price: {w['requested_price']:.2f} | Modeled price: {w['price_for_model']:.2f} | "
                 f"Profit raw: {w['profit_total_raw']:.0f} | Profit adjusted: {w['profit_total_adjusted']:.0f} | "
@@ -4065,8 +4343,40 @@ if st.session_state.results is not None:
                     f"current_price_raw={w.get('current_price_raw', np.nan):.2f} | "
                     f"scenario_price_effect_source={w.get('scenario_price_effect_source', '')}"
                 )
+            save_a, save_b, save_c = st.columns(3)
+            if save_a.button("Save as Scenario A", use_container_width=True):
+                st.session_state.saved_scenarios["Scenario A"] = {
+                    "units": float(w["demand_total"]),
+                    "revenue": float(w["revenue_total"]),
+                    "profit": float(w["profit_total_adjusted"]),
+                    "delta_units": float(w["demand_total"] - current_forecast["actual_sales"].sum()),
+                    "delta_revenue": float(w["revenue_total"] - current_forecast["revenue"].sum()),
+                    "delta_profit": float(w["profit_total_adjusted"] - current_forecast["profit"].sum()),
+                }
+            if save_b.button("Save as Scenario B", use_container_width=True):
+                st.session_state.saved_scenarios["Scenario B"] = {
+                    "units": float(w["demand_total"]),
+                    "revenue": float(w["revenue_total"]),
+                    "profit": float(w["profit_total_adjusted"]),
+                    "delta_units": float(w["demand_total"] - current_forecast["actual_sales"].sum()),
+                    "delta_revenue": float(w["revenue_total"] - current_forecast["revenue"].sum()),
+                    "delta_profit": float(w["profit_total_adjusted"] - current_forecast["profit"].sum()),
+                }
+            if save_c.button("Save as Scenario C", use_container_width=True):
+                st.session_state.saved_scenarios["Scenario C"] = {
+                    "units": float(w["demand_total"]),
+                    "revenue": float(w["revenue_total"]),
+                    "profit": float(w["profit_total_adjusted"]),
+                    "delta_units": float(w["demand_total"] - current_forecast["actual_sales"].sum()),
+                    "delta_revenue": float(w["revenue_total"] - current_forecast["revenue"].sum()),
+                    "delta_profit": float(w["profit_total_adjusted"] - current_forecast["profit"].sum()),
+                }
             st.markdown('<div class="micro-note">Положительные дельты показывают улучшение относительно базового сценария.</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("### Scenario comparison table")
+    compare_df = build_scenario_comparison_table(current_forecast, st.session_state.saved_scenarios, show_margin)
+    st.dataframe(compare_df, use_container_width=True, height=180)
 
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.markdown("### What-if панель: baseline + 3 сценария")
@@ -4155,6 +4465,7 @@ if st.session_state.results is not None:
             st.session_state.what_if_result = None
             st.session_state.scenario_table = None
             st.session_state.sensitivity_df = None
+            st.session_state.saved_scenarios = {}
             st.session_state.app_stage = "landing"
             st.rerun()
 
