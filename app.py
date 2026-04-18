@@ -27,6 +27,12 @@ from data_adapter import (
 )
 from data_schema import CANONICAL_FIELDS, canonical_required_fields
 from scenario_engine import run_scenario
+from v1_runtime_helpers import (
+    build_backend_warning,
+    compute_scenario_price_inputs,
+    get_model_backend_status,
+    select_weekly_baseline_candidate,
+)
 from what_if import build_sensitivity_grid, run_scenario_set
 from ui.components import (
     render_action_buttons,
@@ -993,6 +999,8 @@ def train_weekly_core_model(weekly_train: pd.DataFrame, feature_names: List[str]
             thread_count=1,
         )
         model.fit(X, y)
+        setattr(model, "model_backend", "catboost")
+        setattr(model, "backend_reason", "catboost_available")
         return model
     class DeterministicWeeklyModel:
         def predict(self, X_local):
@@ -1003,7 +1011,10 @@ def train_weekly_core_model(weekly_train: pd.DataFrame, feature_names: List[str]
                 return np.log1p(pd.to_numeric(xdf["sales_lag1w"], errors="coerce").fillna(0.0).values.clip(min=0.0))
             return np.zeros(len(xdf), dtype=float)
 
-    return DeterministicWeeklyModel()
+    model = DeterministicWeeklyModel()
+    setattr(model, "model_backend", "deterministic_fallback")
+    setattr(model, "backend_reason", "catboost_unavailable_or_disabled")
+    return model
 
 
 def fit_weekly_uplift_model(weekly_train: pd.DataFrame, baseline_pred_train: np.ndarray, small_mode: bool) -> Dict[str, Any]:
@@ -2124,52 +2135,20 @@ def run_full_pricing_analysis_universal(
             legacy_reference = bundle_results[0]
         weekly_baseline_candidate_comparison["legacy_reference"] = dict(legacy_reference) if legacy_reference else {}
 
-        selected_bundle = legacy_reference
-        passed_alternatives: List[Dict[str, Any]] = []
-        if legacy_reference is not None:
-            for candidate in bundle_results:
-                if candidate["name"] == "legacy_baseline":
-                    candidate["eligible_under_selection_rule"] = True
-                    candidate["rejection_reason"] = None
-                    continue
-                checks: List[str] = []
-                if not (candidate["holdout_wape"] <= legacy_reference["holdout_wape"] + 0.5):
-                    checks.append("wape_tolerance_failed")
-                if not np.isfinite(candidate["corr"]):
-                    checks.append("corr_non_finite")
-                elif np.isfinite(legacy_reference["corr"]) and candidate["corr"] < legacy_reference["corr"] - 0.05:
-                    checks.append("corr_tolerance_failed")
-                if not np.isfinite(candidate["std_ratio"]):
-                    checks.append("std_ratio_non_finite")
-                elif np.isfinite(legacy_reference["std_ratio"]) and candidate["std_ratio"] < legacy_reference["std_ratio"] + 0.02:
-                    checks.append("std_ratio_improvement_failed")
-                candidate["eligible_under_selection_rule"] = len(checks) == 0
-                candidate["rejection_reason"] = None if len(checks) == 0 else checks[0]
-                if len(checks) == 0:
-                    passed_alternatives.append(candidate)
-
-            if passed_alternatives:
-                passed_alternatives = sorted(
-                    passed_alternatives,
-                    key=lambda row: (
-                        -row["std_ratio"] if np.isfinite(row["std_ratio"]) else float("inf"),
-                        row["holdout_wape"],
-                        -(row["corr"] if np.isfinite(row["corr"]) else -1e9),
-                    ),
-                )
-                selected_bundle = passed_alternatives[0]
-                weekly_baseline_candidate_comparison["selection_reason"] = "non_legacy_passed_selection_rule"
-            else:
-                weekly_baseline_candidate_comparison["selection_reason"] = "legacy_retained_no_nonlegacy_passed_rule"
-
-        weekly_baseline_candidate_comparison["candidates"] = bundle_results
-        preferred_candidate = "price_promo_freight_baseline"
-        if preferred_candidate in bundle_models:
-            selected_candidate_name = preferred_candidate
-            selected_bundle = next((row for row in bundle_results if row["name"] == preferred_candidate), selected_bundle)
-            weekly_baseline_candidate_comparison["selection_reason"] = "preferred_price_promo_freight_baseline"
-        elif selected_bundle is not None:
-            selected_candidate_name = str(selected_bundle["name"])
+        selection_result = select_weekly_baseline_candidate(
+            bundle_results=bundle_results,
+            bundle_models=bundle_models,
+            bundle_features_selected=bundle_features_selected,
+            baseline_bundle_name="legacy_baseline",
+            nonlegacy_mode=NONLEGACY_BASELINE_MODE,
+            wape_tol_pp=0.5,
+            corr_tol=0.05,
+            std_ratio_floor=0.02,
+            std_ratio_cap=0.80,
+        )
+        selected_candidate_name = str(selection_result["selected_candidate_name"])
+        selected_bundle = selection_result["selected_bundle"]
+        weekly_baseline_candidate_comparison = selection_result["comparison_payload"]
         if selected_bundle is not None:
             weekly_model = bundle_models[selected_candidate_name]
             baseline_feature_names = bundle_features_selected[selected_candidate_name]
@@ -2576,6 +2555,12 @@ def run_full_pricing_analysis_universal(
         "seasonal_anchor_weight": float(seasonal_anchor_weight_full),
         "amplitude_calibrator": dict(amplitude_calibrator_info),
     }
+    backend_status = get_model_backend_status(weekly_model)
+    baseline_bundle["model_backend"] = backend_status["model_backend"]
+    baseline_bundle["backend_reason"] = backend_status["backend_reason"]
+    backend_warning_text = build_backend_warning(backend_status["model_backend"], backend_status["backend_reason"])
+    if backend_warning_text:
+        warnings.append(backend_warning_text)
     baseline_has_exog = any(f in set(baseline_feature_names) for f in WEEKLY_EXOGENOUS_FEATURES)
     fixed_log_price_coef = CONFIG["PRIOR_ELASTICITY"]
     shrunk_random_effects = {}
@@ -2869,12 +2854,16 @@ def run_full_pricing_analysis_universal(
     base_demand_total = float(sensitivity_base["demand_total"])
     scenario_sensitivity_diagnostics = {
         "selected_forecaster": selected_forecaster,
+        "selected_candidate": selected_candidate_name,
+        "selection_reason": str(weekly_baseline_candidate_comparison.get("selection_reason", "")),
         "baseline_has_exogenous_driver": bool(baseline_has_exog),
         "scenario_driver_mode": resolve_scenario_driver_mode(selected_forecaster, bool(baseline_has_exog)),
         "weekly_driver_mode": str(sensitivity_base.get("weekly_driver_mode", "naive_core_only")),
         "learned_uplift_active": False,
         "fallback_multiplier_used": bool(sensitivity_base.get("fallback_multiplier_used", False)),
         "fallback_reason": str(sensitivity_base.get("fallback_reason", "")),
+        "model_backend": backend_status["model_backend"],
+        "backend_reason": backend_status["backend_reason"],
         "source": "run_what_if_projection_runtime_path",
         "price_minus_5pct_demand_delta_pct": float(((sensitivity_price_minus_5["demand_total"] - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
         "price_plus_5pct_demand_delta_pct": float(((sensitivity_price_plus_5["demand_total"] - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
@@ -2948,12 +2937,16 @@ def run_full_pricing_analysis_universal(
             "shape_quality_low": bool(shape_quality_low),
             "selected_forecaster": selected_forecaster,
             "selected_candidate": selected_candidate_name,
+            "selection_reason": str(weekly_baseline_candidate_comparison.get("selection_reason", "")),
+            "model_backend": backend_status["model_backend"],
+            "backend_reason": backend_status["backend_reason"],
             "baseline_has_exogenous_driver": bool(baseline_has_exog),
             "scenario_driver_mode": resolve_scenario_driver_mode(selected_forecaster, bool(baseline_has_exog)),
             "weekly_driver_mode": str(as_is_sim.get("weekly_driver_mode", "naive_core_only")),
             "learned_uplift_active": False,
             "fallback_multiplier_used": bool(as_is_sim.get("fallback_multiplier_used", False)),
             "fallback_reason": str(as_is_sim.get("fallback_reason", "")),
+            "backend_warning": backend_warning_text,
         },
         "dataset_passport": _build_dataset_passport(txn),
         "metrics_summary": {
@@ -3006,6 +2999,11 @@ def run_full_pricing_analysis_universal(
             "weekly_driver_mode": str(as_is_sim.get("weekly_driver_mode", "naive_core_only")),
             "fallback_multiplier_used": bool(as_is_sim.get("fallback_multiplier_used", False)),
             "fallback_reason": str(as_is_sim.get("fallback_reason", "")),
+            "selected_candidate": selected_candidate_name,
+            "selection_reason": str(weekly_baseline_candidate_comparison.get("selection_reason", "")),
+            "model_backend": backend_status["model_backend"],
+            "backend_reason": backend_status["backend_reason"],
+            "backend_warning": backend_warning_text,
             "holdout_support_status": "low" if bool(holdout_support.get("support_too_low", True)) else "ok",
             "scenario_sensitivity_status": "computed",
             "baseline_demand_total": float(baseline_sim["daily"]["actual_sales"].sum()),
@@ -3178,8 +3176,9 @@ def run_what_if_projection(
     if not np.isfinite(train_min) or not np.isfinite(train_max):
         train_min = requested_price
         train_max = requested_price
-    scenario_price_for_model = float(np.clip(requested_price, train_min, train_max))
-    scenario_net_price = float(max(0.01, requested_price * (1.0 - scenario_discount)))
+    price_inputs = compute_scenario_price_inputs(requested_price=requested_price, train_min=train_min, train_max=train_max)
+    model_price = float(price_inputs["model_price"])
+    scenario_net_price = float(max(0.01, model_price * (1.0 - scenario_discount)))
 
     baseline_cost = float(current_ctx.get("cost", baseline_price_ref * CONFIG["COST_PROXY_RATIO"]))
     scenario_cost = float(scenario_overrides.get("cost", baseline_cost))
@@ -3200,7 +3199,7 @@ def run_what_if_projection(
 
     scenario_inputs = {
         "baseline_price_ref": baseline_price_ref,
-        "scenario_price": requested_price,
+        "scenario_price": model_price,
         "baseline_net_price": float(current_ctx.get("price", baseline_price_ref)) * (1.0 - float(current_ctx.get("discount", 0.0))),
         "scenario_net_price": scenario_net_price,
         "price_elasticity": float(trained_bundle.get("pooled_elasticity", CONFIG["PRIOR_ELASTICITY"])),
@@ -3254,7 +3253,11 @@ def run_what_if_projection(
     horizon_penalty = max(0.0, (len(future_dates) - 30) / 120.0)
     extreme_penalty = max(0.0, abs(float(freight_multiplier) - 1.0) + abs(float(discount_multiplier) - 1.0) + abs(float(cost_multiplier) - 1.0) - 0.25) * 0.08
     confidence_scenario = float(np.clip(base_confidence - ood_penalty - horizon_penalty - extreme_penalty, 0.05, 0.99))
-    active_path = f"{trained_bundle.get('baseline_bundle', {}).get('selected_candidate', 'price_promo_freight_baseline')}+scenario_recompute"
+    active_path = f"{trained_bundle.get('baseline_bundle', {}).get('selected_candidate', 'legacy_baseline')}+scenario_recompute"
+    model_backend = str(trained_bundle.get("baseline_bundle", {}).get("model_backend", "deterministic_fallback"))
+    backend_reason = str(trained_bundle.get("baseline_bundle", {}).get("backend_reason", "unknown"))
+    backend_warning_text = build_backend_warning(model_backend, backend_reason)
+    backend_warning = [backend_warning_text] if backend_warning_text else []
     runtime_meta = {
         "fallback_multiplier_used": bool(baseline_sim.get("fallback_multiplier_used", False)),
         "fallback_reason": str(baseline_sim.get("fallback_reason", "")),
@@ -3263,6 +3266,8 @@ def run_what_if_projection(
         "weekly_driver_mode": str(baseline_sim.get("weekly_driver_mode", "weekly_ml_core_only")),
         "baseline_has_exogenous_driver": bool(baseline_sim.get("baseline_has_exogenous_driver", True)),
         "active_path_contract": active_path,
+        "model_backend": model_backend,
+        "backend_reason": backend_reason,
     }
     scenario_engine_meta = {
         "engine": "scenario_engine_v1",
@@ -3288,17 +3293,12 @@ def run_what_if_projection(
         "uncertainty": 1.0 - confidence_scenario,
         "ood_flag": bool(not is_price_plausible(requested_price, train_min, train_max, margin=0.25)),
         "requested_price": requested_price,
-        "price_for_model": scenario_price_for_model,
+        "model_price": model_price,
+        "price_for_model": model_price,
         "current_price_raw": float(current_ctx.get("price", manual_price)),
-        "price_clipped": bool(abs(requested_price - scenario_price_for_model) > 1e-9),
-        "clip_applied": bool(abs(requested_price - scenario_price_for_model) > 1e-9),
-        "clip_reason": (
-            "price_below_train_min_weekly_baseline_clipped"
-            if requested_price < train_min
-            else "price_above_train_max_weekly_baseline_clipped"
-            if requested_price > train_max
-            else ""
-        ),
+        "price_clipped": bool(price_inputs["price_clipped"]),
+        "clip_applied": bool(price_inputs["price_clipped"]),
+        "clip_reason": str(price_inputs["clip_reason"]),
         "scenario_price_effect_source": "scenario_engine_recompute_from_baseline",
         "fallback_multiplier_used": runtime_meta["fallback_multiplier_used"],
         "fallback_reason": runtime_meta["fallback_reason"],
@@ -3309,6 +3309,8 @@ def run_what_if_projection(
         "legacy_simulation_used": False,
         "legacy_baseline_meta": runtime_meta,
         "active_path_contract": runtime_meta["active_path_contract"],
+        "model_backend": model_backend,
+        "backend_reason": backend_reason,
         "scenario_engine_meta": scenario_engine_meta,
         "applied_overrides": scenario_overrides,
         "effects": {
@@ -3320,7 +3322,9 @@ def run_what_if_projection(
         },
         "scenario_inputs_contract": {
             "base_price": float(baseline_price_ref),
-            "scenario_price": float(requested_price),
+            "scenario_price": float(model_price),
+            "requested_price": float(requested_price),
+            "model_price": float(model_price),
             "base_promo": float(current_ctx.get("promotion", 0.0)),
             "scenario_promo": float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))),
             "base_freight": float(current_ctx.get("freight_value", 0.0)),
@@ -3328,7 +3332,7 @@ def run_what_if_projection(
             "shock_multiplier": float(demand_multiplier),
         },
         "confidence_factors": scenario_result.get("confidence", {}),
-        "warnings": scenario_result.get("warnings", []),
+        "warnings": scenario_result.get("warnings", []) + backend_warning,
     }
 
 
@@ -3469,7 +3473,8 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "artifact_scope": "manual_scenario",
         "scenario_status": "executed",
         "requested_price": float(what_if_result.get("requested_price", np.nan)),
-        "modeled_price": float(what_if_result.get("price_for_model", np.nan)),
+        "model_price": float(what_if_result.get("model_price", what_if_result.get("price_for_model", np.nan))),
+        "modeled_price": float(what_if_result.get("model_price", what_if_result.get("price_for_model", np.nan))),
         "current_price_raw": float(what_if_result.get("current_price_raw", np.nan)),
         "clip_applied": bool(what_if_result.get("clip_applied", what_if_result.get("price_clipped", False))),
         "clip_reason": str(what_if_result.get("clip_reason", "")),
@@ -3497,7 +3502,9 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "scenario_inputs_contract": what_if_result.get("scenario_inputs_contract", {}),
         "applied_overrides": what_if_result.get("applied_overrides", {}),
         "scenario_forecast": manual_daily.to_dict("records"),
-        "active_path_contract": str(what_if_result.get("active_path_contract", "price_promo_freight_baseline+scenario_recompute")),
+        "active_path_contract": str(what_if_result.get("active_path_contract", "legacy_baseline+scenario_recompute")),
+        "model_backend": str(what_if_result.get("model_backend", "unknown")),
+        "backend_reason": str(what_if_result.get("backend_reason", "")),
         "learned_uplift_contract": "inactive_production_diagnostic_only",
         "scenario_driver_mode": str(what_if_result.get("scenario_driver_mode", "unknown")),
         "weekly_driver_mode": str(what_if_result.get("weekly_driver_mode", "unknown")),
@@ -3541,7 +3548,7 @@ def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str
     return {
         "data_sufficiency": sufficiency["label"],
         "data_message": sufficiency["message"],
-        "scenario_range_status": "in-range" if in_range else "out-of-range",
+        "scenario_range_status": "in_range" if in_range else "out_of_range",
         "active_calculation_mode": active_path,
         "fallback_used": bool((what_if_result or {}).get("fallback_multiplier_used", False)),
         "warnings": sufficiency.get("warnings", []) + warnings_local + list((what_if_result or {}).get("warnings", [])),
@@ -3564,6 +3571,11 @@ def build_business_report_payload(
     scenario_revenue = float(scenario_daily["revenue"].sum()) if isinstance(scenario_daily, pd.DataFrame) and len(scenario_daily) else float("nan")
     scenario_profit = float(scenario_daily["profit"].sum()) if isinstance(scenario_daily, pd.DataFrame) and len(scenario_daily) and "profit" in scenario_daily.columns else float("nan")
     margin_available = bool(results.get("cost_input_available", False))
+    run_summary_cfg = {}
+    try:
+        run_summary_cfg = json.loads(results.get("analysis_run_summary_json", b"{}").decode("utf-8")).get("config", {})
+    except Exception:
+        run_summary_cfg = {}
     return {
         "timestamp_utc": str(pd.Timestamp.utcnow()),
         "input_summary": {
@@ -3573,7 +3585,15 @@ def build_business_report_payload(
             "history_start": str(pd.to_datetime(results.get("history_daily", pd.DataFrame()).get("date"), errors="coerce").min()),
             "history_end": str(pd.to_datetime(results.get("history_daily", pd.DataFrame()).get("date"), errors="coerce").max()),
         },
-        "active_path_summary": {"active_path": trust["active_calculation_mode"], "fallback_used": trust["fallback_used"]},
+        "active_path_summary": {
+            "active_path": trust["active_calculation_mode"],
+            "fallback_used": trust["fallback_used"],
+            "selected_candidate": str(run_summary_cfg.get("selected_candidate", "")),
+            "selection_reason": str(run_summary_cfg.get("selection_reason", "")),
+            "model_backend": str(run_summary_cfg.get("model_backend", "")),
+            "backend_reason": str(run_summary_cfg.get("backend_reason", "")),
+            "uplift_mode": str(run_summary_cfg.get("uplift_activation_mode", "")),
+        },
         "margin_available": margin_available,
         "baseline_forecast": {
             "units": float(baseline["actual_sales"].sum()) if len(baseline) else float("nan"),
@@ -4102,7 +4122,7 @@ if st.session_state.results is not None:
         st.warning(warn_msg)
     st.markdown("### 1) Активный контракт расчета")
     st.write({
-        "active_path": scenario_summary_ui.get("active_path_contract", "price_promo_freight_baseline+scenario_recompute"),
+        "active_path": scenario_summary_ui.get("active_path_contract", "legacy_baseline+scenario_recompute"),
         "uplift_status": scenario_summary_ui.get("learned_uplift_contract", "inactive_production_diagnostic_only"),
         "scenario_mode": scenario_summary_ui.get("scenario_driver_mode", "unknown"),
         "holdout_support_status": scenario_summary_ui.get("holdout_support_status", "unknown"),
@@ -4267,7 +4287,7 @@ if st.session_state.results is not None:
                 wr = st.session_state.what_if_result
                 r["scenario_forecast"] = wr["daily"].copy()
                 r["scenario_price_requested"] = float(wr.get("requested_price", manual_price))
-                r["scenario_price_modeled"] = float(wr.get("price_for_model", manual_price))
+                r["scenario_price_modeled"] = float(wr.get("model_price", wr.get("price_for_model", manual_price)))
                 r["scenario_price"] = r["scenario_price_modeled"]
                 r["manual_scenario_summary_json"], r["manual_scenario_daily_csv"] = build_manual_scenario_artifacts(r, wr)
                 st.session_state.results = r
@@ -4307,7 +4327,7 @@ if st.session_state.results is not None:
                 f"{w.get('scenario_inputs_contract', {}).get('scenario_freight', np.nan):.2f}."
             )
             st.caption(
-                f"Requested price: {w['requested_price']:.2f} | Modeled price: {w['price_for_model']:.2f} | "
+                f"Requested price: {w['requested_price']:.2f} | Modeled price: {w.get('model_price', w.get('price_for_model', np.nan)):.2f} | "
                 f"Profit raw: {w['profit_total_raw']:.0f} | Profit adjusted: {w['profit_total_adjusted']:.0f} | "
                 f"Penalty: {w['uncertainty_penalty']:.0f}"
             )
@@ -4316,7 +4336,7 @@ if st.session_state.results is not None:
                     "clip_applied=true | "
                     f"clip_reason={w.get('clip_reason', '')} | "
                     f"requested_price={w.get('requested_price', np.nan):.2f} | "
-                    f"price_for_model={w.get('price_for_model', np.nan):.2f} | "
+                    f"price_for_model={w.get('model_price', w.get('price_for_model', np.nan)):.2f} | "
                     f"current_price_raw={w.get('current_price_raw', np.nan):.2f} | "
                     f"scenario_price_effect_source={w.get('scenario_price_effect_source', '')}"
                 )

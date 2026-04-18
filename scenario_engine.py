@@ -72,8 +72,8 @@ def run_scenario(
     promo_intensity_baseline = float(scenario_inputs.get("promo_intensity_baseline", scenario_inputs.get("promo_baseline", 0.0)))
     promo_intensity_scenario = float(scenario_inputs.get("promo_intensity_scenario", scenario_inputs.get("promo_scenario", promo_intensity_baseline)))
     promo_effect = compute_promo_effect(
-        promo_flag=max(0.0, promo_flag_scenario - promo_flag_baseline),
-        promo_share=max(0.0, promo_intensity_scenario - promo_intensity_baseline),
+        promo_flag=promo_flag_scenario - promo_flag_baseline,
+        promo_share=promo_intensity_scenario - promo_intensity_baseline,
         alpha_flag=float(scenario_inputs.get("promo_alpha_flag", DEFAULTS["promo_alpha_flag"])),
         alpha_share=float(scenario_inputs.get("promo_alpha_share", DEFAULTS["promo_alpha_share"])),
         cap=float(scenario_inputs.get("promo_cap", DEFAULTS["promo_cap"])),
