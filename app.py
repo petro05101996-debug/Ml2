@@ -3712,6 +3712,28 @@ def build_scenario_comparison_table(
     return compare_df
 
 
+def build_saved_scenario_metrics(
+    as_is_forecast: pd.DataFrame,
+    scenario_forecast: pd.DataFrame,
+) -> Dict[str, float]:
+    as_is_units = float(as_is_forecast["actual_sales"].sum())
+    as_is_revenue = float(as_is_forecast["revenue"].sum())
+    as_is_profit = float(as_is_forecast["profit"].sum()) if "profit" in as_is_forecast.columns else float("nan")
+
+    scenario_units = float(scenario_forecast["actual_sales"].sum())
+    scenario_revenue = float(scenario_forecast["revenue"].sum())
+    scenario_profit = float(scenario_forecast["profit"].sum()) if "profit" in scenario_forecast.columns else float("nan")
+
+    return {
+        "units": scenario_units,
+        "revenue": scenario_revenue,
+        "profit": scenario_profit,
+        "delta_units": scenario_units - as_is_units,
+        "delta_revenue": scenario_revenue - as_is_revenue,
+        "delta_profit": scenario_profit - as_is_profit,
+    }
+
+
 if __name__ == "__main__":
     st.set_page_config(page_title="What-if Cloud", layout="wide", page_icon="📊")
 
@@ -3731,6 +3753,8 @@ if __name__ == "__main__":
         st.session_state.sensitivity_df = None
     if "saved_scenarios" not in st.session_state:
         st.session_state.saved_scenarios = {}
+    if "compare_slot" not in st.session_state:
+        st.session_state.compare_slot = "Scenario A"
     if "active_workspace_tab" not in st.session_state:
         st.session_state.active_workspace_tab = "Дашборд"
 
@@ -3799,6 +3823,40 @@ if __name__ == "__main__":
             margin=dict(l=20, r=20, t=44, b=20),
             legend=dict(orientation="h", y=1.05, x=0),
         )
+
+    def _render_chart_legend_help(metric_name: str, unit_hint: str) -> None:
+        st.caption(
+            f"Как читать: зеленая линия — базовый прогноз (без изменений), фиолетовая — сценарий (с вашими параметрами). "
+            f"Δ показывает разницу сценарий − база по метрике «{metric_name}» ({unit_hint})."
+        )
+
+    def _render_mechanics_explainer(results: Dict[str, Any], what_if_result: Optional[Dict[str, Any]]) -> None:
+        wr = what_if_result or {}
+        contract = wr.get("scenario_inputs_contract", {}) if isinstance(wr, dict) else {}
+        model_price = wr.get("model_price", wr.get("price_for_model", results.get("current_price", "n/a")))
+        requested_price = wr.get("requested_price", results.get("current_price", "n/a"))
+        profit_raw = wr.get("profit_total_raw", "n/a")
+        profit_adjusted = wr.get("profit_total_adjusted", "n/a")
+
+        st.markdown("#### Как работает механизм расчёта")
+        st.markdown(
+            "1) **База (baseline)**: строится прогноз без ручных изменений.  \n"
+            "2) **Сценарий (what-if)**: вы меняете цену/промо/множители, система пересчитывает спрос по дням.  \n"
+            "3) **Сравнение**: показываем дельту по спросу, выручке и прибыли относительно базы."
+        )
+        st.markdown("#### Что именно система сравнивает")
+        st.markdown(
+            f"- Цена: requested `{requested_price}` → modeled `{model_price}`.  \n"
+            f"- Промо: base `{contract.get('base_promo', 'n/a')}` → scenario `{contract.get('scenario_promo', 'n/a')}`.  \n"
+            f"- Freight: base `{contract.get('base_freight', 'n/a')}` → scenario `{contract.get('scenario_freight', 'n/a')}`.  \n"
+            f"- Прибыль: raw `{profit_raw}` и adjusted `{profit_adjusted}`."
+        )
+
+    def _fmt_money(v: float) -> str:
+        return f"₽ {v:,.0f}"
+
+    def _fmt_units(v: float) -> str:
+        return f"{v:,.1f} шт."
 
 
     def render_upload_screen() -> dict[str, Any]:
@@ -3928,15 +3986,29 @@ if __name__ == "__main__":
         st.rerun()
     elif action_click == "compare":
         st.session_state.active_workspace_tab = "Сценарий"
+        st.session_state["workspace_tab_radio"] = "Сценарий"
         st.rerun()
     elif action_click == "export":
         st.session_state.active_workspace_tab = "Отчет"
+        st.session_state["workspace_tab_radio"] = "Отчет"
         st.rerun()
     elif action_click == "save":
-        st.toast("Сценарий сохранен в текущей сессии", icon="✓")
+        selected_slot = str(st.session_state.get("compare_slot", "Scenario A"))
+        if selected_slot not in ("Scenario A", "Scenario B", "Scenario C"):
+            selected_slot = "Scenario A"
+        if r.get("scenario_forecast") is None:
+            st.toast("Сначала примените сценарий, потом сохраните его в слот сравнения.", icon="⚠")
+        else:
+            st.session_state.saved_scenarios[selected_slot] = build_saved_scenario_metrics(
+                current_forecast,
+                r["scenario_forecast"],
+            )
+            st.toast(f"Сценарий сохранен в слот {selected_slot}", icon="✓")
 
     tabs = ["Дашборд", "Сценарий", "Факторы", "Диагностика", "Отчет"]
-    active_tab = render_tabs(st.session_state.active_workspace_tab, tabs)
+    if "workspace_tab_radio" not in st.session_state or st.session_state["workspace_tab_radio"] not in tabs:
+        st.session_state["workspace_tab_radio"] = st.session_state.active_workspace_tab
+    active_tab = render_tabs(st.session_state.active_workspace_tab, tabs, key="workspace_tab_radio")
     st.session_state.active_workspace_tab = active_tab
 
     base_units = float(current_forecast["actual_sales"].sum())
@@ -3947,23 +4019,27 @@ if __name__ == "__main__":
     sc_profit = float(scenario_forecast["profit"].sum()) if "profit" in scenario_forecast.columns else float("nan")
 
     if active_tab == "Дашборд":
+        st.info("На всех графиках сравнение всегда одинаковое: **База (зелёный)** против **Сценария (фиолетовый)**.")
         fig_d = go.Figure()
         fig_d.add_trace(go.Scatter(x=baseline_forecast["date"], y=baseline_forecast["actual_sales"], name="База", line=dict(color="#9DCC84", width=2)))
         fig_d.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["actual_sales"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
         fig_d.update_layout(**_plot_layout("Спрос"))
         render_chart_card("Спрос", "Горизонт · шт", fig_d, [("База", f"{base_units:,.0f}"), ("Сценарий", f"{sc_units:,.0f}"), ("Δ", f"{sc_units-base_units:+,.0f}")])
+        _render_chart_legend_help("Спрос", "шт")
 
         fig_r = go.Figure()
         fig_r.add_trace(go.Scatter(x=baseline_forecast["date"], y=baseline_forecast["revenue"], name="База", line=dict(color="#9DCC84", width=2)))
         fig_r.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["revenue"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
         fig_r.update_layout(**_plot_layout("Выручка"))
         render_chart_card("Выручка", "Горизонт · ₽", fig_r, [("База", f"₽ {base_revenue:,.0f}"), ("Сценарий", f"₽ {sc_revenue:,.0f}"), ("Δ", f"₽ {sc_revenue-base_revenue:+,.0f}")])
+        _render_chart_legend_help("Выручка", "₽")
 
         fig_p = go.Figure()
         fig_p.add_trace(go.Scatter(x=baseline_forecast["date"], y=baseline_forecast["profit"], name="База", line=dict(color="#9DCC84", width=2), fill="tozeroy"))
         fig_p.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["profit"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
         fig_p.update_layout(**_plot_layout("Прибыль"))
         render_chart_card("Прибыль", "Горизонт · ₽", fig_p, [("База", f"₽ {base_profit:,.0f}"), ("Сценарий", f"₽ {sc_profit:,.0f}"), ("Δ", f"₽ {sc_profit-base_profit:+,.0f}")])
+        _render_chart_legend_help("Прибыль", "₽")
 
         effect_pct = ((sc_units - base_units) / base_units * 100) if base_units else 0.0
         render_metric_summary_card(
@@ -3982,16 +4058,64 @@ if __name__ == "__main__":
         ])
 
     elif active_tab == "Сценарий":
+        st.info("Шаги: 1) задайте параметры, 2) нажмите «Применить сценарий», 3) смотрите дельту к базе в карточке и таблице ниже.")
         open_surface("Параметры сценария")
-        manual_price = st.number_input("Изменение цены", min_value=0.01, value=float(r["current_price"]), step=1.0, key="what_if_price")
-        discount = st.slider("Скидка", 0.0, 0.95, float(r["_trained_bundle"]["base_ctx"].get("discount", 0.0)), 0.01)
-        promo_value = st.slider("Интенсивность промо", 0.0, 1.0, float(np.clip(r["_trained_bundle"]["base_ctx"].get("promotion", 0.0), 0.0, 1.0)), 0.05)
-        freight_mult = st.slider("Шок-факторы", 0.5, 1.5, 1.0, 0.05)
-        demand_mult = st.slider("Управляемые факторы", 0.7, 1.3, 1.0, 0.05)
-        hdays = st.slider("Горизонт", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
-        c1, c2 = st.columns(2)
-        apply_btn = c1.button("Применить сценарий", type="primary", use_container_width=True)
-        reset_btn = c2.button("Сбросить сценарий", use_container_width=True)
+        st.caption("Заполните форму и нажмите кнопку внизу — расчёт применится одним шагом без промежуточных сбоев интерфейса.")
+        with st.form("scenario_inputs_form", clear_on_submit=False):
+            manual_price = st.number_input(
+                "Цена в сценарии, ₽",
+                min_value=0.01,
+                value=float(r["current_price"]),
+                step=1.0,
+                key="what_if_price",
+                help="Это цена, которую вы хотите проверить в сценарии.",
+            )
+            discount = st.slider(
+                "Скидка, доля (0–0.95)",
+                0.0,
+                0.95,
+                float(r["_trained_bundle"]["base_ctx"].get("discount", 0.0)),
+                0.01,
+                help="0.10 означает скидку 10%.",
+            )
+            promo_value = st.slider(
+                "Интенсивность промо (0–1)",
+                0.0,
+                1.0,
+                float(np.clip(r["_trained_bundle"]["base_ctx"].get("promotion", 0.0), 0.0, 1.0)),
+                0.05,
+                help="Чем выше значение, тем сильнее промо-эффект в сценарии.",
+            )
+            freight_mult = st.slider(
+                "Шок-факторы логистики, множитель",
+                0.5,
+                1.5,
+                1.0,
+                0.05,
+                help="1.10 = рост логистического фактора на 10%, 0.90 = снижение на 10%.",
+            )
+            demand_mult = st.slider(
+                "Доп. управляемый множитель спроса",
+                0.7,
+                1.3,
+                1.0,
+                0.05,
+                help="Ручная корректировка спроса поверх остальных факторов.",
+            )
+            hdays = st.slider("Горизонт, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
+            c1, c2 = st.columns(2)
+            apply_btn = c1.form_submit_button("Применить сценарий", type="primary", use_container_width=True)
+            reset_btn = c2.form_submit_button("Сбросить сценарий", use_container_width=True)
+        close_surface()
+        open_surface("Слоты сравнения")
+        st.selectbox(
+            "Куда сохранять текущий сценарий для сравнения",
+            options=["Scenario A", "Scenario B", "Scenario C"],
+            key="compare_slot",
+            help="Нажмите «Сохранить» в верхней панели, чтобы записать текущий сценарий в выбранный слот.",
+        )
+        saved_keys = ", ".join(sorted(st.session_state.saved_scenarios.keys())) if st.session_state.saved_scenarios else "пока нет"
+        st.caption(f"Сохраненные слоты: {saved_keys}.")
         close_surface()
 
         if apply_btn:
@@ -4024,16 +4148,37 @@ if __name__ == "__main__":
         margin_delta = ((sc_profit / max(sc_revenue, 1e-9)) - (base_profit / max(base_revenue, 1e-9))) * 100
 
         render_metric_summary_card("Эффект сценария", f"{demand_delta:+,.1f}", "Δ спроса", [("Δ выручки", f"₽ {revenue_delta:+,.0f}"), ("Δ прибыли", f"₽ {profit_delta:+,.0f}"), ("Δ маржи", f"{margin_delta:+.2f} п.п.")])
+        render_report_card("Ответ по сценарию простыми словами", [
+            f"Если внедрить сценарий, спрос изменится на {demand_delta:+,.1f} шт.",
+            f"Ожидаемое изменение выручки: ₽ {revenue_delta:+,.0f}.",
+            f"Ожидаемое изменение прибыли: ₽ {profit_delta:+,.0f}.",
+            "Ориентируйтесь на прибыль и предупреждения из раздела «Диагностика».",
+        ])
 
         compare_df = build_scenario_comparison_table(current_forecast, st.session_state.saved_scenarios, True)
-        render_compare_card(compare_df)
+        compare_view = compare_df.rename(
+            columns={
+                "scenario": "Сценарий",
+                "units": "Спрос, шт",
+                "revenue": "Выручка, ₽",
+                "profit": "Прибыль, ₽",
+                "delta_units": "Δ спроса",
+                "delta_revenue": "Δ выручки, ₽",
+                "delta_profit": "Δ прибыли, ₽",
+            }
+        )
+        render_compare_card(compare_view)
+        st.caption("В таблице Δ — это разница относительно строки As-is (текущая база без изменений).")
 
         open_surface("Чувствительность")
         sens = build_sensitivity_grid(r["_trained_bundle"], base_price=float(r["current_price"]), runner=run_what_if_projection).head(5)
         fig_s = px.bar(sens, x="price", y="profit_adjusted", color_discrete_sequence=["#6F70FF"])
         fig_s.update_layout(**_plot_layout("Чувствительность"))
         st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False})
+        st.caption("Этот график показывает, как меняется прибыль при нескольких соседних ценах вокруг текущей.")
         close_surface()
+        with st.expander("Как работает механизм сценария", expanded=False):
+            _render_mechanics_explainer(r, st.session_state.what_if_result)
 
     elif active_tab == "Факторы":
         factor_report = r.get("feature_report", pd.DataFrame())
@@ -4078,23 +4223,75 @@ if __name__ == "__main__":
         render_debug_expander(run_summary_ui)
 
     elif active_tab == "Отчет":
-        recommendation = "применять" if sc_profit >= base_profit else "не применять"
-        render_report_card("Результат", [f"базовый прогноз: {base_units:,.1f}", f"сценарный прогноз: {sc_units:,.1f}", f"дельта: {sc_units-base_units:+,.1f}", f"рекомендация: {recommendation}"])
+        recommendation = "Применять сценарий" if sc_profit >= base_profit else "Не применять сценарий"
+        demand_delta = sc_units - base_units
+        revenue_delta = sc_revenue - base_revenue
+        profit_delta = sc_profit - base_profit
+        base_margin = (base_profit / max(base_revenue, 1e-9)) * 100
+        scenario_margin = (sc_profit / max(sc_revenue, 1e-9)) * 100
+
+        st.markdown("### Короткий ответ")
+        if sc_profit >= base_profit:
+            st.success(
+                f"{recommendation}: прибыль выше на {_fmt_money(profit_delta)}, "
+                f"спрос меняется на {_fmt_units(demand_delta)}."
+            )
+        else:
+            st.warning(
+                f"{recommendation}: прибыль ниже на {_fmt_money(abs(profit_delta))}, "
+                f"спрос меняется на {_fmt_units(demand_delta)}."
+            )
+
+        quick_compare = pd.DataFrame(
+            [
+                {
+                    "Сценарий": "База (as-is)",
+                    "Спрос": _fmt_units(base_units),
+                    "Выручка": _fmt_money(base_revenue),
+                    "Прибыль": _fmt_money(base_profit),
+                    "Маржа": f"{base_margin:.2f}%",
+                },
+                {
+                    "Сценарий": "Ваш сценарий",
+                    "Спрос": _fmt_units(sc_units),
+                    "Выручка": _fmt_money(sc_revenue),
+                    "Прибыль": _fmt_money(sc_profit),
+                    "Маржа": f"{scenario_margin:.2f}%",
+                },
+                {
+                    "Сценарий": "Разница (сценарий - база)",
+                    "Спрос": _fmt_units(demand_delta),
+                    "Выручка": _fmt_money(revenue_delta),
+                    "Прибыль": _fmt_money(profit_delta),
+                    "Маржа": f"{(scenario_margin - base_margin):+.2f} п.п.",
+                },
+            ]
+        )
+        open_surface("Сравнение в 1 таблице")
+        st.dataframe(quick_compare, use_container_width=True, hide_index=True)
+        close_surface()
+
         wr = st.session_state.what_if_result or {}
         c = wr.get("scenario_inputs_contract", {}) if isinstance(wr, dict) else {}
-        render_report_card("Что изменилось", [
+        render_report_card("Что вы изменили", [
             f"цена: {c.get('base_price', 'n/a')} -> {c.get('scenario_price', 'n/a')}",
             f"промо: {c.get('base_promo', 'n/a')} -> {c.get('scenario_promo', 'n/a')}",
             f"шок-факторы: {c.get('base_freight', 'n/a')} -> {c.get('scenario_freight', 'n/a')}",
-            "измененные управляемые факторы: ручные параметры сценария",
+            "доп. множители: ручная настройка сценария",
         ])
-        render_report_card("Почему изменился результат", [
+        render_report_card("Почему получился такой результат", [
             "Цена изменила ожидаемый спрос.",
             "Промо повлияло на интенсивность продаж.",
             "Внешний множитель скорректировал уровень спроса.",
         ])
         trust = build_trust_block(r, st.session_state.what_if_result)
-        render_report_card("Надежность", [f"качество прогноза: {trust.get('data_sufficiency', 'n/a')}", "достаточность данных: проверена", f"уровень предупреждений: {len(trust.get('warnings', []))}"])
+        render_report_card("Надёжность результата", [f"качество прогноза: {trust.get('data_sufficiency', 'n/a')}", "достаточность данных: проверена", f"уровень предупреждений: {len(trust.get('warnings', []))}"])
+        render_report_card("Словарь (простыми словами)", [
+            "База (baseline) — прогноз без ручных изменений.",
+            "Сценарий — прогноз после изменения параметров.",
+            "Raw прибыль — сумма без дополнительных корректировок.",
+            "Adjusted прибыль — прибыль после внутренних корректировок модели.",
+        ])
 
         open_surface("Экспорт")
         has_results = st.session_state.results is not None
