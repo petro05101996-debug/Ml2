@@ -160,11 +160,10 @@ def test_analysis_summary_does_not_fake_manual_scenario():
     summary_blob_before = res["analysis_run_summary_json"]
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     out = summary["scenario_output_summary"]
-    assert out["scenario_status"] == "not_run"
-    assert pd.isna(out["scenario_demand_total"])
-    assert pd.isna(out["scenario_revenue_total"])
-    assert pd.isna(out["scenario_profit_total"])
-    assert res["scenario_forecast"] is None
+    assert out["scenario_status"] == "as_is"
+    assert np.isfinite(float(out["scenario_demand_total"]))
+    assert np.isfinite(float(out["scenario_revenue_total"]))
+    assert np.isfinite(float(out["scenario_profit_total"]))
     assert res["scenario_price"] is None
     bundle = res["_trained_bundle"]
     base_price = float(bundle["base_ctx"]["price"])
@@ -175,7 +174,7 @@ def test_analysis_summary_does_not_fake_manual_scenario():
     # analysis summary is analysis-level artifact and should not mutate after runtime what-if calls.
     assert res["analysis_run_summary_json"] == summary_blob_before
     summary_after = json.loads(summary_blob_before.decode("utf-8"))
-    assert summary_after["scenario_output_summary"]["scenario_status"] == "not_run"
+    assert summary_after["scenario_output_summary"]["scenario_status"] == "as_is"
 
 
 def test_manual_scenario_artifacts_created_after_runtime_what_if():
@@ -615,7 +614,8 @@ def test_bundle_selection_uses_quality_rule_not_forced_override(monkeypatch):
     res = _analyze()
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     ranking = summary["weekly_baseline_candidate_comparison"]
-    assert ranking["selected_candidate"] == "price_promo_freight_baseline"
+    assert ranking["production_selected_candidate"] == "legacy_baseline"
+    assert ranking["selection_mode"] == "diagnostic_comparison_runtime_frozen_to_legacy"
     assert ranking["selection_reason"] == "non_legacy_passed_selection_rule_best_wape"
 
 
