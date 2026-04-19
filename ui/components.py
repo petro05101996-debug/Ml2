@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from typing import Any, Iterable, Sequence
-
-import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -37,7 +35,7 @@ def render_top_header() -> None:
     )
 
 
-def render_object_header(object_title: str, status_text: str, scenario_id: str, horizon_text: str, last_update: str, status_color: str = "#7AD0A9") -> None:
+def render_object_header(object_title: str, status_text: str, horizon_text: str, last_update: str, status_color: str = "#7AD0A9") -> None:
     st.markdown(
         f"""
 <div class="object-header">
@@ -46,7 +44,7 @@ def render_object_header(object_title: str, status_text: str, scenario_id: str, 
     <div class="obj-badge">◉</div>
     <div>
       <div class="obj-title">{object_title}</div>
-      <div class="obj-meta"><span style="color:{status_color}">●</span> {status_text} · {scenario_id} · {horizon_text} · {last_update}</div>
+      <div class="obj-meta"><span style="color:{status_color}">●</span> {status_text} · {horizon_text} · {last_update}</div>
     </div>
   </div>
 </div>
@@ -58,10 +56,10 @@ def render_object_header(object_title: str, status_text: str, scenario_id: str, 
 def render_action_row() -> str | None:
     items = [
         ("new", "✚", "Новый сценарий"),
-        ("reset", "⟲", "Сбросить"),
-        ("compare", "⇄", "Сравнить"),
-        ("export", "⇩", "Экспорт"),
-        ("save", "✓", "Сохранить"),
+        ("reset_form", "⟲", "Сбросить форму"),
+        ("cancel_active", "⊘", "Отменить активный"),
+        ("compare", "⇄", "К сравнению"),
+        ("export", "⇩", "К отчёту и экспорту"),
     ]
     clicked: str | None = None
     cols = st.columns(5)
@@ -160,159 +158,160 @@ def render_landing_nav() -> None:
     )
 
 
-def _render_landing_demo_chart() -> None:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=["Нед 1", "Нед 2", "Нед 3", "Нед 4", "Нед 5"],
-            y=[92, 95, 89, 98, 101],
-            name="База",
-            mode="lines+markers",
-            line=dict(color="#9DCC84", width=2),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=["Нед 1", "Нед 2", "Нед 3", "Нед 4", "Нед 5"],
-            y=[92, 97, 96, 106, 112],
-            name="Сценарий",
-            mode="lines+markers",
-            line=dict(color="#6F70FF", width=2.5),
-        )
-    )
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=10, r=10, t=24, b=10),
-        legend=dict(orientation="h", y=1.12, x=0),
-        height=240,
-        title="Пример: как читать график базы и сценария",
-    )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-
-def render_hero_section() -> None:
-    st.markdown('<div class="hero-grid" style="margin-top:18px;">', unsafe_allow_html=True)
-    st.markdown('<div class="surface-card">', unsafe_allow_html=True)
-    st.markdown('<div class="eyebrow">What-if прогнозирование продаж</div>', unsafe_allow_html=True)
-    st.markdown('<div class="hero-headline">Понимайте, как цена, промо и внешние факторы меняют спрос</div>', unsafe_allow_html=True)
-    st.markdown('<div class="muted">Система быстро считает baseline и показывает эффект сценария на спрос, выручку и прибыль в понятном интерфейсе.</div>', unsafe_allow_html=True)
-    b1, b2 = st.columns(2)
-    b1.button("Попробовать", type="primary", use_container_width=True, key="landing_try")
-    b2.button("Смотреть демо", use_container_width=True, key="landing_demo")
-    st.markdown('<div class="mini divider-top">✨ Понятный прогноз. Прозрачные сценарии. Без магии и хаоса.</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+def render_landing_hero_v2() -> None:
     st.markdown(
         """
-<div class="surface-card">
-  <div class="mini">Превью продукта</div>
-  <div class="object-header" style="margin-top:8px;">
-    <div class="mini">Кофе зерновой 1 кг · SCN-014</div>
-    <div class="metric-grid" style="margin-top:10px;">
-      <div class="metric-item"><div class="mini">📈 Спрос</div><div><b>+8.4%</b></div></div>
-      <div class="metric-item"><div class="mini">💰 Выручка</div><div><b>+₽ 124k</b></div></div>
-      <div class="metric-item"><div class="mini">🏆 Прибыль</div><div><b>+₽ 48k</b></div></div>
-      <div class="metric-item"><div class="mini">📊 Маржа</div><div><b>+1.2 п.п.</b></div></div>
+<div class="hero-grid" style="margin-top:18px;">
+  <div class="surface-card">
+    <div class="eyebrow">What-if прогнозирование спроса</div>
+    <div class="hero-headline">Проверяйте, как цена, промо и внешние факторы меняют продажи</div>
+    <div class="muted">Меняйте сценарий и сразу видите влияние на спрос, выручку и прибыль — в одном понятном отчёте.</div>
+    <div class="chip-row">
+      <span class="floating-chip">Цена</span>
+      <span class="floating-chip">Промо</span>
+      <span class="floating-chip">Логистика</span>
+      <span class="floating-chip">Внешние факторы</span>
     </div>
-    <div class="mini" style="margin-top:12px;">Ниже — демонстрационный график в стиле рабочего отчета.</div>
+  </div>
+  <div class="surface-card hero-visual">
+    <div class="hero-chart-title">База vs Сценарий</div>
+    <svg viewBox="0 0 560 250" class="hero-chart-svg">
+      <polyline points="20,188 120,178 220,190 320,170 430,160 540,148" fill="none" stroke="#9DCC84" stroke-width="4"/>
+      <polyline points="20,188 120,172 220,168 320,146 430,128 540,112" fill="none" stroke="#6F70FF" stroke-width="5"/>
+    </svg>
+    <div class="floating-chip chip-a">Цена -5%</div>
+    <div class="floating-chip chip-b">Промо +20%</div>
+    <div class="floating-chip chip-c">Логистика 1.1x</div>
+    <div class="metric-float metric-a"><span>Спрос</span><b>+8.4%</b></div>
+    <div class="metric-float metric-b"><span>Выручка</span><b>+124k</b></div>
+    <div class="metric-float metric-c"><span>Прибыль</span><b>+48k</b></div>
+    <div class="report-badge">Рекомендуется к пилоту</div>
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
-    _render_landing_demo_chart()
-    st.markdown('</div>', unsafe_allow_html=True)
+    b1, b2 = st.columns(2)
+    b1.button("Перейти в приложение", type="primary", use_container_width=True, key="landing_try_v2")
+    b2.button("Посмотреть интерфейс", use_container_width=True, key="landing_demo_v2")
 
 
-def render_trust_metrics() -> None:
-    st.markdown('<div class="section-title">Метрики доверия</div>', unsafe_allow_html=True)
-    st.markdown('<div class="grid-4">', unsafe_allow_html=True)
-    cards = [
-        ("< 5 минут", "До первого what-if сценария"),
-        ("10+ факторов", "Управляемые и внешние драйверы"),
-        ("1 сценарий = 1 результат", "Без перегруженных BI-экранов"),
-        ("Для команд", "Аналитики, коммерция, продукт"),
-    ]
-    for title, sub in cards:
-        st.markdown(f'<div class="surface-card"><div class="card-title">{title}</div><div class="muted">{sub}</div></div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def render_product_features() -> None:
-    st.markdown('<div class="section-title">Что делает продукт</div>', unsafe_allow_html=True)
-    st.markdown('<div class="grid-3">', unsafe_allow_html=True)
-    cards = [
-        ("📦 Прогнозирует спрос", "Использует исторические продажи и факторы для построения базового прогноза."),
-        ("🎛️ Позволяет менять сценарии", "Цена, промо, внешние шоки и другие драйверы меняются вручную."),
-        ("✅ Показывает бизнес-эффект", "Сразу видно, как меняются спрос, выручка, прибыль и риск."),
-    ]
-    for t, d in cards:
-        st.markdown(f'<div class="surface-card"><div class="card-title">{t}</div><div class="muted">{d}</div></div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def render_how_it_works() -> None:
-    st.markdown('<div class="section-title">Как это работает</div>', unsafe_allow_html=True)
-    st.markdown('<div class="step-grid">', unsafe_allow_html=True)
-    steps = [
-        "1. Загрузите данные: история продаж, признаки и внешние факторы",
-        "2. Получите базовый прогноз",
-        "3. Измените сценарий: цена, промо, шоки, управляемые факторы",
-        "4. Сравните результат: спрос, выручка, прибыль, надежность",
-    ]
-    for s in steps:
-        st.markdown(f'<div class="surface-card">{s}</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def render_interface_preview() -> None:
-    st.markdown('<div class="section-title">Интерфейс, в котором видно главное</div><div class="muted">Никакого BI-хлама. Только сценарий, результат и понятный отчет.</div>', unsafe_allow_html=True)
-    st.markdown('<div class="surface-card" style="margin-top:12px;">🏠 Дашборд · 🧪 Сценарий · 🧩 Факторы · 🛠️ Диагностика · 📄 Отчет</div>', unsafe_allow_html=True)
-    st.markdown('<div class="surface-card">Верхний header, header объекта, action row, ключевые карточки, график и summary-блок отчета.</div>', unsafe_allow_html=True)
-
-
-def render_reliability_section() -> None:
-    st.markdown('<div class="section-title">Почему это надежно</div>', unsafe_allow_html=True)
-    st.markdown('<div class="grid-4">', unsafe_allow_html=True)
-    cards = ["Прозрачный расчет", "Сценарный подход", "Контроль качества", "Удобный отчет"]
-    desc = [
-        "Пользователь понимает, что менялось и почему изменился результат.",
-        "Сравнение базы и сценария, а не одна цифра вне контекста.",
-        "Есть отдельная диагностика и предупреждения по качеству.",
-        "Итог виден без чтения технической кухни.",
-    ]
-    for t, d in zip(cards, desc):
-        st.markdown(f'<div class="surface-card"><div class="card-title">{t}</div><div class="muted">{d}</div></div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def render_use_cases() -> None:
-    st.markdown('<div class="section-title">Кому подходит</div>', unsafe_allow_html=True)
-    st.markdown('<div class="grid-3">', unsafe_allow_html=True)
-    cases = [
-        ("Коммерческие команды", "Проверка эффекта цены и промо."),
-        ("Категорийные менеджеры", "Планирование спроса и оценка изменений факторов."),
-        ("Продуктовые и аналитические команды", "Быстрая проверка сценариев без перегруженных инструментов."),
-    ]
-    for t, d in cases:
-        st.markdown(f'<div class="surface-card"><div class="card-title">{t}</div><div class="muted">{d}</div></div>', unsafe_allow_html=True)
-    st.markdown('</div><div class="mini" style="margin-top:8px;">Подходит для B2B, e-commerce, retail, FMCG и сценарного планирования.</div>', unsafe_allow_html=True)
-
-
-def render_final_cta() -> None:
+def render_landing_proof_strip() -> None:
     st.markdown(
         """
-<div class="surface-card" style="text-align:center;">
-  <div class="section-title">Запустите первый what-if сценарий без лишнего шума</div>
-  <div class="muted">От загрузки данных до первого сценария — в одном интерфейсе.</div>
+<div class="proof-strip">
+  <div class="proof-item">⚡ Сценарий за минуты</div>
+  <div class="proof-item">🏷️ Цена / промо / факторы</div>
+  <div class="proof-item">📈 Спрос / выручка / прибыль</div>
+  <div class="proof-item">📄 Понятный итоговый отчёт</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_landing_controls_and_outputs() -> None:
+    st.markdown(
+        """
+<div class="split-showcase">
+  <div class="surface-card">
+    <div class="card-title">Что можно менять</div>
+    <ul class="landing-list">
+      <li>Цена</li>
+      <li>Скидка и промо</li>
+      <li>Логистика</li>
+      <li>Внешние факторы</li>
+      <li>Дополнительные сценарные шоки</li>
+    </ul>
+    <div class="mini-control-panel">
+      <div>Цена: <b>1290 ₽</b></div>
+      <div class="mini-slider"><span>Промо</span><div></div></div>
+      <div class="mini-slider"><span>Логистика</span><div></div></div>
+      <div class="floating-chip">Шок +5%</div>
+      <button>Применить сценарий</button>
+    </div>
+  </div>
+  <div class="surface-card">
+    <div class="card-title">Что вы получаете</div>
+    <ul class="landing-list">
+      <li>Новый прогноз спроса</li>
+      <li>Изменение выручки</li>
+      <li>Изменение прибыли</li>
+      <li>Уровень надёжности</li>
+      <li>Готовый управленческий отчёт</li>
+    </ul>
+    <div class="mini-dashboard">
+      <div class="mini-dashboard-grid">
+        <div><span>Спрос</span><b>+8.4%</b></div>
+        <div><span>Выручка</span><b>+124k</b></div>
+        <div><span>Прибыль</span><b>+48k</b></div>
+      </div>
+      <div class="report-badge">Надёжность: Средняя</div>
+    </div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_landing_pipeline() -> None:
+    st.markdown(
+        """
+<div class="section-title">Как это работает</div>
+<div class="pipeline-row">
+  <div class="pipeline-step"><span>🧾</span><b>Загрузите данные</b></div>
+  <div class="pipeline-arrow">→</div>
+  <div class="pipeline-step"><span>📈</span><b>Получите базовый прогноз</b></div>
+  <div class="pipeline-arrow">→</div>
+  <div class="pipeline-step"><span>🎛️</span><b>Измените сценарий</b></div>
+  <div class="pipeline-arrow">→</div>
+  <div class="pipeline-step"><span>✅</span><b>Сравните и примите решение</b></div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_landing_trust_v2() -> None:
+    st.markdown('<div class="section-title">Почему можно доверять</div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    c1.markdown('<div class="surface-card"><div class="card-title">Прозрачный сценарий</div><div class="muted">Видно, какие параметры попали в расчёт.</div></div>', unsafe_allow_html=True)
+    c2.markdown('<div class="surface-card"><div class="card-title">Понятный результат</div><div class="muted">Сразу видно, как меняются спрос, выручка и прибыль.</div></div>', unsafe_allow_html=True)
+    c3.markdown('<div class="surface-card"><div class="card-title">Надёжность оценки</div><div class="muted">Отчёт показывает уровень уверенности и предупреждения.</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+<div class="surface-card mini-report-preview">
+  <div class="mini">Итог отчёта</div>
+  <div class="report-badge">Рекомендуется к пилоту</div>
+  <div class="mini-dashboard-grid">
+    <div><span>Δ спроса</span><b>+8.4%</b></div>
+    <div><span>Δ выручки</span><b>+124k</b></div>
+    <div><span>Δ прибыли</span><b>+48k</b></div>
+  </div>
+  <div class="mini">Почему результат такой: цена и промо усиливают прогноз, логистика сдерживает рост.</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_landing_cta_v2() -> None:
+    st.markdown(
+        """
+<div class="surface-card" style="text-align:center; position:relative;">
+  <div class="section-title">Запустите первый сценарий за несколько минут</div>
+  <div class="muted">Загрузите данные, измените параметры и сразу получите понятный результат.</div>
+  <div class="cta-float cta-a">Scenario applied</div>
+  <div class="cta-float cta-b">Profit +48k</div>
+  <div class="cta-float cta-c">High confidence</div>
 </div>
 """,
         unsafe_allow_html=True,
     )
     c1, c2 = st.columns(2)
-    c1.button("Начать", type="primary", use_container_width=True, key="landing_cta_start")
-    c2.button("Открыть демо", use_container_width=True, key="landing_cta_demo")
+    c1.button("Перейти в приложение", type="primary", use_container_width=True, key="landing_cta_start_v2")
+    c2.button("Посмотреть интерфейс", use_container_width=True, key="landing_cta_demo_v2")
 
 
 def render_landing_footer() -> None:
