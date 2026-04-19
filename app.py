@@ -3734,6 +3734,185 @@ def build_saved_scenario_metrics(
     }
 
 
+def collect_current_form_values(manual_price: float, discount: float, promo_value: float, freight_mult: float, demand_mult: float, hdays: int) -> Dict[str, float]:
+    return {
+        "manual_price": float(manual_price),
+        "discount": float(discount),
+        "promo_value": float(promo_value),
+        "freight_mult": float(freight_mult),
+        "demand_mult": float(demand_mult),
+        "hdays": int(hdays),
+    }
+
+
+def build_applied_scenario_snapshot(
+    wr: Dict[str, Any],
+    manual_price: float,
+    discount: float,
+    promo_value: float,
+    freight_mult: float,
+    demand_mult: float,
+    hdays: int,
+) -> Dict[str, Any]:
+    return {
+        "manual_price_requested": float(manual_price),
+        "manual_price_modeled": float(wr.get("model_price", wr.get("price_for_model", manual_price))),
+        "price_clipped": bool(wr.get("price_clipped", False)),
+        "clip_reason": str(wr.get("clip_reason", "")),
+        "discount": float(discount),
+        "promo": float(promo_value),
+        "freight_mult": float(freight_mult),
+        "demand_mult": float(demand_mult),
+        "horizon_days": int(hdays),
+    }
+
+
+def get_user_scenario_status(
+    current_form: Dict[str, Any],
+    base_form: Dict[str, Any],
+    applied_snapshot: Optional[Dict[str, Any]],
+    current_status: str,
+) -> str:
+    tol = 1e-9
+
+    def _same(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        for k in a.keys():
+            av, bv = a.get(k), b.get(k)
+            if isinstance(av, (float, int)) or isinstance(bv, (float, int)):
+                if not np.isclose(float(av), float(bv), atol=tol):
+                    return False
+            elif av != bv:
+                return False
+        return True
+
+    if applied_snapshot is None:
+        return "as_is" if _same(current_form, base_form) else "dirty"
+    applied_form = {
+        "manual_price": float(applied_snapshot.get("manual_price_requested", base_form["manual_price"])),
+        "discount": float(applied_snapshot.get("discount", base_form["discount"])),
+        "promo_value": float(applied_snapshot.get("promo", base_form["promo_value"])),
+        "freight_mult": float(applied_snapshot.get("freight_mult", base_form["freight_mult"])),
+        "demand_mult": float(applied_snapshot.get("demand_mult", base_form["demand_mult"])),
+        "hdays": int(applied_snapshot.get("horizon_days", base_form["hdays"])),
+    }
+    if _same(current_form, applied_form):
+        return "saved" if current_status == "saved" else "applied"
+    return "dirty"
+
+
+def render_scenario_status_banner(status: str, snapshot: Optional[Dict[str, Any]] = None, last_saved_slot: Optional[str] = None) -> None:
+    if status == "as_is":
+        st.info("Сейчас показана база без изменений. Сценарий ещё не применён.")
+    elif status == "dirty":
+        st.warning("Вы изменили параметры, но ещё не применили сценарий. Цифры ниже относятся к последнему применённому состоянию.")
+    elif status == "saved":
+        slot = last_saved_slot or "Scenario A"
+        st.success(f"Сценарий применён и сохранён в слот {slot}.")
+    elif status == "applied":
+        st.success("Сценарий применён. Ниже показан результат именно для этих параметров.")
+    else:
+        st.info("Состояние сценария не определено.")
+
+
+def render_applied_scenario_block(snapshot: Optional[Dict[str, Any]]) -> None:
+    if not snapshot:
+        return
+    open_surface("Применённый сценарий")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Цена (запрошенная)", f"{float(snapshot.get('manual_price_requested', 0.0)):.2f} ₽")
+    c1.metric("Скидка", f"{float(snapshot.get('discount', 0.0)):.0%}")
+    c1.metric("Промо", f"{float(snapshot.get('promo', 0.0)):.0%}")
+    c2.metric("Цена (модель)", f"{float(snapshot.get('manual_price_modeled', 0.0)):.2f} ₽")
+    c2.metric("Логистика", f"{float(snapshot.get('freight_mult', 1.0)):.2f}x")
+    c2.metric("Доп. множитель спроса", f"{float(snapshot.get('demand_mult', 1.0)):.2f}x")
+    clip_text = "Цена ограничена" if bool(snapshot.get("price_clipped", False)) else "Без ограничений"
+    c3.metric("Ограничение цены", clip_text)
+    c3.metric("Горизонт", f"{int(snapshot.get('horizon_days', 0))} дн.")
+    if bool(snapshot.get("price_clipped", False)):
+        st.warning(f"Введённая цена была скорректирована моделью: {snapshot.get('clip_reason', 'ограничение диапазона')}")
+    close_surface()
+
+
+def reset_scenario_ui_state_to_base(results: Dict[str, Any], clear_saved_slot: bool = True) -> Dict[str, Any]:
+    results["scenario_forecast"] = None
+    results["scenario_price_requested"] = float(results.get("current_price", 0.0))
+    results["scenario_price_modeled"] = float(results.get("current_price", 0.0))
+    results["scenario_price"] = float(results.get("current_price", 0.0))
+    results["manual_scenario_summary_json"] = b"{}"
+    results["manual_scenario_daily_csv"] = b""
+    st.session_state.what_if_result = None
+    st.session_state.applied_scenario_snapshot = None
+    st.session_state.scenario_ui_status = "as_is"
+    if clear_saved_slot:
+        st.session_state.last_saved_slot = None
+    base_ctx = results.get("_trained_bundle", {}).get("base_ctx", {})
+    st.session_state["what_if_price"] = float(results.get("current_price", 0.0))
+    st.session_state["what_if_discount"] = float(base_ctx.get("discount", 0.0))
+    st.session_state["what_if_promo"] = float(np.clip(base_ctx.get("promotion", 0.0), 0.0, 1.0))
+    st.session_state["what_if_freight_mult"] = 1.0
+    st.session_state["what_if_demand_mult"] = 1.0
+    st.session_state["what_if_hdays"] = int(CONFIG["HORIZON_DAYS_DEFAULT"])
+    st.session_state.form_last_values = collect_current_form_values(
+        st.session_state["what_if_price"],
+        st.session_state["what_if_discount"],
+        st.session_state["what_if_promo"],
+        st.session_state["what_if_freight_mult"],
+        st.session_state["what_if_demand_mult"],
+        st.session_state["what_if_hdays"],
+    )
+    return results
+
+
+def build_user_friendly_comparison_table(
+    as_is_forecast: pd.DataFrame,
+    current_scenario_forecast: Optional[pd.DataFrame],
+    saved_scenarios: Dict[str, Dict[str, Any]],
+    show_margin: bool = True,
+) -> pd.DataFrame:
+    as_is_units = float(as_is_forecast["actual_sales"].sum())
+    as_is_revenue = float(as_is_forecast["revenue"].sum())
+    as_is_profit = float(as_is_forecast["profit"].sum()) if "profit" in as_is_forecast.columns else float("nan")
+
+    def _row(name: str, units: float, revenue: float, profit: float) -> Dict[str, Any]:
+        margin = (profit / max(revenue, 1e-9)) * 100 if np.isfinite(profit) else np.nan
+        return {
+            "Сценарий": name,
+            "Спрос": units,
+            "Выручка": revenue,
+            "Прибыль": profit,
+            "Маржа": margin if show_margin else np.nan,
+            "Δ спроса": units - as_is_units,
+            "Δ выручки": revenue - as_is_revenue,
+            "Δ прибыли": profit - as_is_profit if np.isfinite(profit) and np.isfinite(as_is_profit) else np.nan,
+        }
+
+    rows: List[Dict[str, Any]] = [_row("База (as-is)", as_is_units, as_is_revenue, as_is_profit)]
+    if current_scenario_forecast is not None and len(current_scenario_forecast):
+        rows.append(
+            _row(
+                "Текущий сценарий",
+                float(current_scenario_forecast["actual_sales"].sum()),
+                float(current_scenario_forecast["revenue"].sum()),
+                float(current_scenario_forecast["profit"].sum()) if "profit" in current_scenario_forecast.columns else float("nan"),
+            )
+        )
+    for slot in ["Scenario A", "Scenario B", "Scenario C"]:
+        if slot in saved_scenarios:
+            s = saved_scenarios[slot]
+            rows.append(_row(slot, float(s.get("units", 0.0)), float(s.get("revenue", 0.0)), float(s.get("profit", np.nan))))
+    return pd.DataFrame(rows)
+
+
+def build_user_recommendation(scenario_applied: bool, profit_delta: float, warnings_count: int, confidence_label: str) -> str:
+    if not scenario_applied:
+        return "Сценарий ещё не применён"
+    if profit_delta < 0:
+        return "Не рекомендуется"
+    if warnings_count > 0 or confidence_label in ("Средняя", "Низкая"):
+        return "Требует дополнительной проверки"
+    return "Рекомендуется к пилоту"
+
+
 if __name__ == "__main__":
     st.set_page_config(page_title="What-if Cloud", layout="wide", page_icon="📊")
 
@@ -3757,6 +3936,14 @@ if __name__ == "__main__":
         st.session_state.compare_slot = "Scenario A"
     if "active_workspace_tab" not in st.session_state:
         st.session_state.active_workspace_tab = "Дашборд"
+    if "scenario_ui_status" not in st.session_state:
+        st.session_state.scenario_ui_status = "as_is"
+    if "applied_scenario_snapshot" not in st.session_state:
+        st.session_state.applied_scenario_snapshot = None
+    if "form_last_values" not in st.session_state:
+        st.session_state.form_last_values = None
+    if "last_saved_slot" not in st.session_state:
+        st.session_state.last_saved_slot = None
 
     apply_theme()
 
@@ -3767,26 +3954,22 @@ if __name__ == "__main__":
     if query_page == "landing":
         from ui.components import (
             render_landing_nav,
-            render_hero_section,
-            render_trust_metrics,
-            render_product_features,
-            render_how_it_works,
-            render_interface_preview,
-            render_reliability_section,
-            render_use_cases,
-            render_final_cta,
+            render_landing_hero_v2,
+            render_landing_proof_strip,
+            render_landing_controls_and_outputs,
+            render_landing_pipeline,
+            render_landing_trust_v2,
+            render_landing_cta_v2,
             render_landing_footer,
         )
 
         render_landing_nav()
-        render_hero_section()
-        render_trust_metrics()
-        render_product_features()
-        render_how_it_works()
-        render_interface_preview()
-        render_reliability_section()
-        render_use_cases()
-        render_final_cta()
+        render_landing_hero_v2()
+        render_landing_proof_strip()
+        render_landing_controls_and_outputs()
+        render_landing_pipeline()
+        render_landing_trust_v2()
+        render_landing_cta_v2()
         render_landing_footer()
         if st.button("Перейти в приложение", type="primary", use_container_width=True, key="to_app"):
             st.query_params["page"] = "app"
@@ -3974,31 +4157,45 @@ if __name__ == "__main__":
     history_daily = r["history_daily"]
     current_forecast = r["as_is_forecast"]
     baseline_forecast = r["neutral_baseline_forecast"]
-    scenario_forecast = r["scenario_forecast"] if r["scenario_forecast"] is not None else current_forecast
+    has_applied_scenario = r.get("scenario_forecast") is not None and st.session_state.what_if_result is not None
+    scenario_forecast = r["scenario_forecast"] if has_applied_scenario else current_forecast
     last_update = pd.Timestamp.utcnow().strftime("%d.%m.%Y")
-    scenario_id = "SCN-014"
-    status_text = "Рассчитано"
-    status_color = "#7AD0A9"
+    ui_status = st.session_state.get("scenario_ui_status", "as_is")
+    status_map = {
+        "as_is": ("База без изменений", "#8FA3B8"),
+        "dirty": ("Есть неприменённые изменения", "#F6C177"),
+        "applied": ("Сценарий применён", "#7AD0A9"),
+        "saved": (f"Сценарий сохранён в {st.session_state.get('last_saved_slot', 'слот')}", "#7AD0A9"),
+    }
+    status_text, status_color = status_map.get(ui_status, ("База без изменений", "#8FA3B8"))
 
     render_object_header(
         object_title=str(st.session_state.get("selected_sku_for_results", "SKU")),
         status_text=status_text,
-        scenario_id=scenario_id,
         horizon_text=f"{len(current_forecast)} дней",
         last_update=last_update,
         status_color=status_color,
     )
     action_click = render_action_row()
     if action_click == "new":
-        st.session_state.what_if_result = None
-        r["scenario_forecast"] = None
+        r = reset_scenario_ui_state_to_base(r, clear_saved_slot=True)
         st.session_state.results = r
         st.toast("Создан новый сценарий", icon="✚")
         st.rerun()
-    elif action_click == "reset":
-        st.session_state.results = None
-        st.session_state.what_if_result = None
-        st.toast("Состояние сброшено", icon="⟲")
+    elif action_click == "reset_form":
+        base_ctx = r.get("_trained_bundle", {}).get("base_ctx", {})
+        st.session_state["what_if_price"] = float(r.get("current_price", 0.0))
+        st.session_state["what_if_discount"] = float(base_ctx.get("discount", 0.0))
+        st.session_state["what_if_promo"] = float(np.clip(base_ctx.get("promotion", 0.0), 0.0, 1.0))
+        st.session_state["what_if_freight_mult"] = 1.0
+        st.session_state["what_if_demand_mult"] = 1.0
+        st.session_state["what_if_hdays"] = int(CONFIG["HORIZON_DAYS_DEFAULT"])
+        st.toast("Форма сброшена к базовым значениям", icon="⟲")
+        st.rerun()
+    elif action_click == "cancel_active":
+        r = reset_scenario_ui_state_to_base(r, clear_saved_slot=False)
+        st.session_state.results = r
+        st.toast("Активный сценарий отменён", icon="⊘")
         st.rerun()
     elif action_click == "compare":
         st.session_state.active_workspace_tab = "Сценарий"
@@ -4008,18 +4205,6 @@ if __name__ == "__main__":
         st.session_state.active_workspace_tab = "Отчет"
         st.session_state["workspace_tab_radio"] = "Отчет"
         st.rerun()
-    elif action_click == "save":
-        selected_slot = str(st.session_state.get("compare_slot", "Scenario A"))
-        if selected_slot not in ("Scenario A", "Scenario B", "Scenario C"):
-            selected_slot = "Scenario A"
-        if r.get("scenario_forecast") is None:
-            st.toast("Сначала примените сценарий, потом сохраните его в слот сравнения.", icon="⚠")
-        else:
-            st.session_state.saved_scenarios[selected_slot] = build_saved_scenario_metrics(
-                current_forecast,
-                r["scenario_forecast"],
-            )
-            st.toast(f"Сценарий сохранен в слот {selected_slot}", icon="✓")
 
     tabs = ["Дашборд", "Сценарий", "Факторы", "Диагностика", "Отчет"]
     if "workspace_tab_radio" not in st.session_state or st.session_state["workspace_tab_radio"] not in tabs:
@@ -4074,91 +4259,71 @@ if __name__ == "__main__":
         ])
 
     elif active_tab == "Сценарий":
-        st.info("Понятный поток: задайте параметры сценария → нажмите «Применить сценарий» → смотрите итог в блоке «Эффект сценария».")
-        open_surface("Как пользоваться what-if доской")
-        st.markdown(
-            "1. **Задайте новую цену и промо-параметры** (слева).  \n"
-            "2. **Проверьте внешние множители** — логистика и ручной множитель спроса (справа).  \n"
-            "3. Нажмите **«Применить сценарий»** и сравните результат с базой по Δ прибыли и Δ выручки."
-        )
-        st.caption("Совет: начните с небольших изменений (±5–10%), чтобы увидеть стабильную реакцию модели.")
-        close_surface()
-
-        open_surface("Текущая база (с чем сравниваем)")
         base_ctx = r["_trained_bundle"]["base_ctx"]
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("Базовая цена", f"{float(r.get('current_price', 0.0)):.2f} ₽")
-        b2.metric("Базовая скидка", f"{float(base_ctx.get('discount', 0.0)):.0%}")
-        b3.metric("Базовое промо", f"{float(np.clip(base_ctx.get('promotion', 0.0), 0.0, 1.0)):.0%}")
-        b4.metric("Горизонт по умолчанию", f"{int(CONFIG['HORIZON_DAYS_DEFAULT'])} дн.")
-        close_surface()
+        base_form = collect_current_form_values(
+            float(r.get("current_price", 0.0)),
+            float(base_ctx.get("discount", 0.0)),
+            float(np.clip(base_ctx.get("promotion", 0.0), 0.0, 1.0)),
+            1.0,
+            1.0,
+            int(CONFIG["HORIZON_DAYS_DEFAULT"]),
+        )
+        for key, val in {
+            "what_if_price": base_form["manual_price"],
+            "what_if_discount": base_form["discount"],
+            "what_if_promo": base_form["promo_value"],
+            "what_if_freight_mult": base_form["freight_mult"],
+            "what_if_demand_mult": base_form["demand_mult"],
+            "what_if_hdays": base_form["hdays"],
+        }.items():
+            if key not in st.session_state:
+                st.session_state[key] = val
+
+        current_form = collect_current_form_values(
+            st.session_state["what_if_price"],
+            st.session_state["what_if_discount"],
+            st.session_state["what_if_promo"],
+            st.session_state["what_if_freight_mult"],
+            st.session_state["what_if_demand_mult"],
+            st.session_state["what_if_hdays"],
+        )
+        st.session_state.form_last_values = current_form
+        st.session_state.scenario_ui_status = get_user_scenario_status(
+            current_form,
+            base_form,
+            st.session_state.applied_scenario_snapshot,
+            st.session_state.get("scenario_ui_status", "as_is"),
+        )
+        render_scenario_status_banner(
+            st.session_state.scenario_ui_status,
+            st.session_state.applied_scenario_snapshot,
+            st.session_state.last_saved_slot,
+        )
 
         open_surface("Форма сценария")
-        st.caption("Все изменения применяются только после нажатия кнопки «Применить сценарий».")
-        with st.form("scenario_inputs_form", clear_on_submit=False):
-            p1, p2 = st.columns(2)
-            with p1:
-                manual_price = st.number_input(
-                    "1) Цена в сценарии, ₽",
-                    min_value=0.01,
-                    value=float(r["current_price"]),
-                    step=1.0,
-                    key="what_if_price",
-                    help="Новая цена, которую хотите проверить.",
-                )
-                discount = st.slider(
-                    "2) Скидка (0–0.95)",
-                    0.0,
-                    0.95,
-                    float(r["_trained_bundle"]["base_ctx"].get("discount", 0.0)),
-                    0.01,
-                    help="0.10 = скидка 10%.",
-                )
-                promo_value = st.slider(
-                    "3) Интенсивность промо (0–1)",
-                    0.0,
-                    1.0,
-                    float(np.clip(r["_trained_bundle"]["base_ctx"].get("promotion", 0.0), 0.0, 1.0)),
-                    0.05,
-                    help="Чем выше, тем сильнее эффект промо.",
-                )
-            with p2:
-                freight_mult = st.slider(
-                    "4) Логистика, множитель",
-                    0.5,
-                    1.5,
-                    1.0,
-                    0.05,
-                    help="1.10 = рост влияния логистики на 10%.",
-                )
-                demand_mult = st.slider(
-                    "5) Ручной множитель спроса",
-                    0.7,
-                    1.3,
-                    1.0,
-                    0.05,
-                    help="Дополнительная корректировка поверх остальных факторов.",
-                )
-                hdays = st.slider("6) Горизонт, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
-            st.markdown(
-                f"**Предпросмотр параметров:** цена `{manual_price:.2f}` ₽, скидка `{discount:.0%}`, "
-                f"промо `{promo_value:.0%}`, логистика `{freight_mult:.2f}x`, спрос `{demand_mult:.2f}x`, горизонт `{hdays}` дн."
-            )
-            if abs(float(manual_price) - float(r["current_price"])) / max(float(r["current_price"]), 1e-9) > 0.30:
-                st.warning("Цена отличается от текущей более чем на 30%. Результат может быть менее стабильным для интерпретации.")
-            c1, c2 = st.columns(2)
-            apply_btn = c1.form_submit_button("Применить сценарий", type="primary", use_container_width=True)
-            reset_btn = c2.form_submit_button("Сбросить сценарий", use_container_width=True)
-        close_surface()
-        open_surface("Слоты сравнения")
-        st.selectbox(
-            "Куда сохранять текущий сценарий для сравнения",
-            options=["Scenario A", "Scenario B", "Scenario C"],
-            key="compare_slot",
-            help="Нажмите «Сохранить» в верхней панели, чтобы записать текущий сценарий в выбранный слот.",
-        )
-        saved_keys = ", ".join(sorted(st.session_state.saved_scenarios.keys())) if st.session_state.saved_scenarios else "пока нет"
-        st.caption(f"Сохраненные слоты: {saved_keys}.")
+        st.markdown("#### Блок 1. Цена и промо")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            manual_price = st.number_input("Цена, ₽", min_value=0.01, step=1.0, key="what_if_price")
+        with c2:
+            discount = st.slider("Скидка", 0.0, 0.95, key="what_if_discount", step=0.01)
+        with c3:
+            promo_value = st.slider("Промо", 0.0, 1.0, key="what_if_promo", step=0.05)
+        st.markdown("#### Блок 2. Внешние условия")
+        c4, c5 = st.columns(2)
+        with c4:
+            freight_mult = st.slider("Логистика, множитель", 0.5, 1.5, key="what_if_freight_mult", step=0.05)
+        with c5:
+            demand_mult = st.slider("Ручной множитель спроса", 0.7, 1.3, key="what_if_demand_mult", step=0.05)
+        st.markdown("#### Блок 3. Горизонт")
+        hdays = st.slider("Горизонт, дней", 7, 90, key="what_if_hdays", step=1)
+
+        p1, p2 = st.columns(2)
+        p1.markdown(f"- Цена: **{manual_price:.2f} ₽**\n- Скидка: **{discount:.0%}**\n- Промо: **{promo_value:.0%}**")
+        p2.markdown(f"- Логистика: **{freight_mult:.2f}x**\n- Доп. множитель спроса: **{demand_mult:.2f}x**\n- Горизонт: **{hdays} дней**")
+        if abs(float(manual_price) - float(r["current_price"])) / max(float(r["current_price"]), 1e-9) > 0.30:
+            st.warning("Цена отличается от текущей более чем на 30%. Результат может быть менее стабильным для интерпретации.")
+        apply_btn = st.button("Применить сценарий", type="primary", use_container_width=True)
         close_surface()
 
         if apply_btn:
@@ -4176,42 +4341,66 @@ if __name__ == "__main__":
             r["scenario_price_modeled"] = float(wr.get("model_price", wr.get("price_for_model", manual_price)))
             r["scenario_price"] = r["scenario_price_modeled"]
             r["manual_scenario_summary_json"], r["manual_scenario_daily_csv"] = build_manual_scenario_artifacts(r, wr)
+            st.session_state.applied_scenario_snapshot = build_applied_scenario_snapshot(
+                wr,
+                manual_price,
+                discount,
+                promo_value,
+                freight_mult,
+                demand_mult,
+                hdays,
+            )
+            st.session_state.scenario_ui_status = "applied"
             st.session_state.results = r
             st.rerun()
-        if reset_btn:
-            st.session_state.what_if_result = None
-            r["scenario_forecast"] = None
-            st.session_state.results = r
+
+        open_surface("Слоты сравнения")
+        selected_slot = st.selectbox(
+            "Куда сохранить текущий сценарий",
+            options=["Scenario A", "Scenario B", "Scenario C"],
+            key="compare_slot",
+        )
+        save_to_slot_btn = st.button("Сохранить в слот", use_container_width=True, disabled=r.get("scenario_forecast") is None)
+        if save_to_slot_btn and r.get("scenario_forecast") is not None:
+            st.session_state.saved_scenarios[selected_slot] = build_saved_scenario_metrics(current_forecast, r["scenario_forecast"])
+            st.session_state.last_saved_slot = selected_slot
+            st.session_state.scenario_ui_status = "saved"
+            st.toast(f"Сценарий сохранён в слот {selected_slot}", icon="✓")
             st.rerun()
+        saved_keys = ", ".join(sorted(st.session_state.saved_scenarios.keys())) if st.session_state.saved_scenarios else "пока нет"
+        st.caption(f"Сохраненные слоты: {saved_keys}.")
+        close_surface()
+
+        render_applied_scenario_block(st.session_state.applied_scenario_snapshot)
 
         wr = st.session_state.what_if_result
-        demand_delta = (float(wr["demand_total"]) - base_units) if wr is not None else sc_units - base_units
-        revenue_delta = (float(wr["revenue_total"]) - base_revenue) if wr is not None else sc_revenue - base_revenue
-        profit_delta = (float(wr["profit_total_adjusted"]) - base_profit) if wr is not None else sc_profit - base_profit
-        margin_delta = ((sc_profit / max(sc_revenue, 1e-9)) - (base_profit / max(base_revenue, 1e-9))) * 100
-
-        render_metric_summary_card("Эффект сценария", f"{demand_delta:+,.1f}", "Δ спроса", [("Δ выручки", f"₽ {revenue_delta:+,.0f}"), ("Δ прибыли", f"₽ {profit_delta:+,.0f}"), ("Δ маржи", f"{margin_delta:+.2f} п.п.")])
-        render_report_card("Ответ по сценарию простыми словами", [
-            f"Если внедрить сценарий, спрос изменится на {demand_delta:+,.1f} шт.",
-            f"Ожидаемое изменение выручки: ₽ {revenue_delta:+,.0f}.",
-            f"Ожидаемое изменение прибыли: ₽ {profit_delta:+,.0f}.",
-            "Ориентируйтесь на прибыль и предупреждения из раздела «Диагностика».",
-        ])
-
-        compare_df = build_scenario_comparison_table(current_forecast, st.session_state.saved_scenarios, True)
-        compare_view = compare_df.rename(
-            columns={
-                "scenario": "Сценарий",
-                "units": "Спрос, шт",
-                "revenue": "Выручка, ₽",
-                "profit": "Прибыль, ₽",
-                "delta_units": "Δ спроса",
-                "delta_revenue": "Δ выручки, ₽",
-                "delta_profit": "Δ прибыли, ₽",
-            }
+        if wr is None:
+            st.info("Сценарий ещё не применён. Чтобы увидеть эффект, задайте параметры и нажмите «Применить сценарий».")
+            demand_delta = revenue_delta = profit_delta = margin_delta = 0.0
+        else:
+            demand_delta = float(wr.get("demand_total", sc_units)) - base_units
+            revenue_delta = float(wr.get("revenue_total", sc_revenue)) - base_revenue
+            profit_delta = float(wr.get("profit_total_adjusted", sc_profit)) - base_profit
+            scenario_margin = (float(wr.get("profit_total_adjusted", sc_profit)) / max(float(wr.get("revenue_total", sc_revenue)), 1e-9)) * 100
+            base_margin = (base_profit / max(base_revenue, 1e-9)) * 100
+            margin_delta = scenario_margin - base_margin
+        render_metric_summary_card(
+            "Что изменится относительно текущего плана",
+            f"{demand_delta:+,.1f} шт.",
+            "Изменение спроса",
+            [("Выручка", f"₽ {revenue_delta:+,.0f}"), ("Прибыль", f"₽ {profit_delta:+,.0f}"), ("Маржа", f"{margin_delta:+.2f} п.п.")],
         )
-        render_compare_card(compare_view)
-        st.caption("В таблице Δ — это разница относительно строки As-is (текущая база без изменений).")
+        if wr is not None:
+            render_report_card("Эффект сценария простыми словами", [
+                f"При текущих настройках сценарий меняет спрос на {demand_delta:+,.1f} шт. относительно текущего плана.",
+                f"Ожидаемая выручка меняется на ₽ {revenue_delta:+,.0f}.",
+                f"Ожидаемая прибыль меняется на ₽ {profit_delta:+,.0f}.",
+                "Это базовая оценка, её нужно интерпретировать вместе с уровнем надёжности.",
+            ])
+
+        compare_df = build_user_friendly_comparison_table(current_forecast, r.get("scenario_forecast"), st.session_state.saved_scenarios, True)
+        render_compare_card(compare_df)
+        st.caption("В таблице всегда есть база и текущий сценарий (если он применён), даже без сохранения в слот.")
 
         open_surface("Чувствительность")
         sens = build_sensitivity_grid(r["_trained_bundle"], base_price=float(r["current_price"]), runner=run_what_if_projection).head(5)
@@ -4266,95 +4455,103 @@ if __name__ == "__main__":
         render_debug_expander(run_summary_ui)
 
     elif active_tab == "Отчет":
-        recommendation = "Применять сценарий" if sc_profit >= base_profit else "Не применять сценарий"
-        demand_delta = sc_units - base_units
-        revenue_delta = sc_revenue - base_revenue
-        profit_delta = sc_profit - base_profit
-        base_margin = (base_profit / max(base_revenue, 1e-9)) * 100
-        scenario_margin = (sc_profit / max(sc_revenue, 1e-9)) * 100
-
         st.markdown("### Отчёт в 1 экране")
-        st.caption("Ниже — готовая управленческая выжимка: решение, цифры, объяснение и экспорт.")
+        wr = st.session_state.what_if_result or {}
+        scenario_applied = wr != {} and r.get("scenario_forecast") is not None
         trust = build_trust_block(r, st.session_state.what_if_result)
         warnings_count = len(trust.get("warnings", []))
         confidence_label = "Высокая" if str(trust.get("data_sufficiency", "")).lower() == "enough" and warnings_count == 0 else ("Средняя" if warnings_count <= 2 else "Низкая")
-        if sc_profit >= base_profit:
-            st.success(
-                f"{recommendation}: прибыль выше на {_fmt_money(profit_delta)}, "
-                f"спрос меняется на {_fmt_units(demand_delta)}."
-            )
+        demand_delta = sc_units - base_units if scenario_applied else np.nan
+        revenue_delta = sc_revenue - base_revenue if scenario_applied else np.nan
+        profit_delta = sc_profit - base_profit if scenario_applied else np.nan
+        recommendation = build_user_recommendation(scenario_applied, float(profit_delta) if np.isfinite(profit_delta) else 0.0, warnings_count, confidence_label)
+
+        if not scenario_applied:
+            st.info("Сценарий ещё не применён. Сейчас отчёт показывает только текущий базовый план.")
+        elif recommendation == "Рекомендуется к пилоту":
+            st.success("Рекомендуется к пилоту: сценарий повышает прибыль и не имеет критичных сигналов риска.")
+        elif recommendation == "Не рекомендуется":
+            st.error("Не рекомендуется: сценарий снижает прибыль относительно текущего плана.")
         else:
-            st.warning(
-                f"{recommendation}: прибыль ниже на {_fmt_money(abs(profit_delta))}, "
-                f"спрос меняется на {_fmt_units(demand_delta)}."
-            )
+            st.warning("Требует дополнительной проверки: эффект не отрицательный, но есть ограничения по надёжности/предупреждениям.")
 
-        quick_compare = pd.DataFrame(
-            [
-                {
-                    "Сценарий": "База (as-is)",
-                    "Спрос": _fmt_units(base_units),
-                    "Выручка": _fmt_money(base_revenue),
-                    "Прибыль": _fmt_money(base_profit),
-                    "Маржа": f"{base_margin:.2f}%",
-                },
-                {
-                    "Сценарий": "Ваш сценарий",
-                    "Спрос": _fmt_units(sc_units),
-                    "Выручка": _fmt_money(sc_revenue),
-                    "Прибыль": _fmt_money(sc_profit),
-                    "Маржа": f"{scenario_margin:.2f}%",
-                },
-                {
-                    "Сценарий": "Разница (сценарий - база)",
-                    "Спрос": _fmt_units(demand_delta),
-                    "Выручка": _fmt_money(revenue_delta),
-                    "Прибыль": _fmt_money(profit_delta),
-                    "Маржа": f"{(scenario_margin - base_margin):+.2f} п.п.",
-                },
-            ]
-        )
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Решение", recommendation)
-        k2.metric("Δ спроса", _fmt_units(demand_delta))
-        k3.metric("Δ выручки", _fmt_money(revenue_delta))
-        k4.metric("Δ прибыли", _fmt_money(profit_delta))
-        k5, k6 = st.columns(2)
-        with k5:
-            st.metric("Надёжность оценки", confidence_label)
-        with k6:
-            st.metric("Предупреждений", str(warnings_count))
+        k1.metric("Решение", recommendation if scenario_applied else "—")
+        k2.metric("Δ спроса", _fmt_units(demand_delta) if scenario_applied else "—")
+        k3.metric("Δ выручки", _fmt_money(revenue_delta) if scenario_applied else "—")
+        k4.metric("Δ прибыли", _fmt_money(profit_delta) if scenario_applied else "—")
 
-        open_surface("Сравнение: база vs ваш сценарий")
-        st.dataframe(quick_compare, use_container_width=True, hide_index=True)
+        snapshot = st.session_state.applied_scenario_snapshot
+        open_surface("Что именно мы проверили")
+        if snapshot:
+            st.markdown(
+                f"- Текущая цена → проверяемая: **{float(r.get('current_price', 0.0)):.2f} ₽ → {float(snapshot.get('manual_price_modeled', 0.0)):.2f} ₽**\n"
+                f"- Скидка: **{float(snapshot.get('discount', 0.0)):.0%}**\n"
+                f"- Промо: **{float(snapshot.get('promo', 0.0)):.0%}**\n"
+                f"- Логистика: **{float(snapshot.get('freight_mult', 1.0)):.2f}x**\n"
+                f"- Множитель спроса: **{float(snapshot.get('demand_mult', 1.0)):.2f}x**\n"
+                f"- Горизонт: **{int(snapshot.get('horizon_days', 0))} дней**"
+            )
+            if bool(snapshot.get("price_clipped", False)):
+                st.warning("Введённая цена была скорректирована моделью.")
+        else:
+            st.info("Пока нет применённого сценария.")
         close_surface()
 
-        wr = st.session_state.what_if_result or {}
-        c = wr.get("scenario_inputs_contract", {}) if isinstance(wr, dict) else {}
-        render_report_card("1) Что вы изменили", [
-            f"цена: {c.get('base_price', 'n/a')} -> {c.get('scenario_price', 'n/a')}",
-            f"промо: {c.get('base_promo', 'n/a')} -> {c.get('scenario_promo', 'n/a')}",
-            f"шок-факторы: {c.get('base_freight', 'n/a')} -> {c.get('scenario_freight', 'n/a')}",
-            "доп. множители: ручная настройка сценария",
-        ])
-        render_report_card("2) Почему получился такой результат", [
-            "Цена изменила ожидаемый спрос.",
-            "Промо повлияло на интенсивность продаж.",
-            "Внешний множитель скорректировал уровень спроса.",
-        ])
-        render_report_card("3) Надёжность результата", [f"качество прогноза: {trust.get('data_sufficiency', 'n/a')}", "достаточность данных: проверена", f"уровень предупреждений: {len(trust.get('warnings', []))}"])
-        render_report_card("4) Словарь (простыми словами)", [
-            "База (baseline) — прогноз без ручных изменений.",
-            "Сценарий — прогноз после изменения параметров.",
-            "Raw прибыль — сумма без дополнительных корректировок.",
-            "Adjusted прибыль — прибыль после внутренних корректировок модели.",
-        ])
-        render_report_card("5) Что делать дальше (чеклист)", [
-            "Если Δ прибыли положительная и надёжность не низкая — можно брать в пилот.",
-            "Если есть предупреждения — сначала проверьте вкладку «Диагностика».",
-            "Зафиксируйте сценарий в слот и сравните с альтернативой (A/B/C).",
-            "После выбора скачайте Excel/CSV и отправьте команде.",
-        ])
+        if scenario_applied:
+            base_margin = (base_profit / max(base_revenue, 1e-9)) * 100
+            scenario_margin = (sc_profit / max(sc_revenue, 1e-9)) * 100
+            quick_compare = pd.DataFrame(
+                [
+                    {"Сценарий": "Текущий план", "Спрос": _fmt_units(base_units), "Выручка": _fmt_money(base_revenue), "Прибыль": _fmt_money(base_profit), "Маржа": f"{base_margin:.2f}%"},
+                    {"Сценарий": "Ваш сценарий", "Спрос": _fmt_units(sc_units), "Выручка": _fmt_money(sc_revenue), "Прибыль": _fmt_money(sc_profit), "Маржа": f"{scenario_margin:.2f}%"},
+                    {"Сценарий": "Разница", "Спрос": _fmt_units(demand_delta), "Выручка": _fmt_money(revenue_delta), "Прибыль": _fmt_money(profit_delta), "Маржа": f"{(scenario_margin - base_margin):+.2f} п.п."},
+                ]
+            )
+            open_surface("Что изменится относительно текущего плана")
+            st.dataframe(quick_compare, use_container_width=True, hide_index=True)
+            close_surface()
+        else:
+            st.info("Ваш сценарий пока не применён — блок сравнения появится после Apply.")
+
+        effects = wr.get("effects", {}) if isinstance(wr, dict) else {}
+        reasons: List[str] = []
+        if scenario_applied:
+            pe = float(effects.get("price_effect", 1.0))
+            pp = float(effects.get("promo_effect", 1.0))
+            fe = float(effects.get("freight_effect", 1.0))
+            se = float(effects.get("shock_multiplier_mean", 1.0))
+            reasons.append("Изменение цены снижает ожидаемый спрос." if pe < 1 else "Изменение цены повышает ожидаемый спрос.")
+            if pp > 1:
+                reasons.append("Промо поддерживает рост продаж.")
+            if fe < 1:
+                reasons.append("Условия логистики сдерживают спрос.")
+            reasons.append("Дополнительный множитель спроса усиливает прогноз." if se > 1 else "Дополнительный множитель спроса снижает прогноз.")
+            reasons.append(f"Эффект цены: {pe:.2f}x; промо: {pp:.2f}x; логистика: {fe:.2f}x; доп. множитель: {se:.2f}x.")
+        else:
+            reasons.append("Чтобы получить объяснение причин, сначала примените сценарий.")
+        render_report_card("Почему получился такой результат", reasons)
+
+        reliability_text = {
+            "Высокая": "Модель видит достаточно опоры в данных, серьёзных предупреждений нет.",
+            "Средняя": "Результат полезен как ориентир, но его лучше дополнительно проверить.",
+            "Низкая": "В данных мало опоры для такого сценария. Используйте результат осторожно.",
+        }
+        render_report_card("Надёжность оценки", [f"Уровень: {confidence_label}", reliability_text[confidence_label]] + [str(w) for w in trust.get("warnings", [])[:3]])
+
+        next_steps = [
+            "Сохраните сценарий в слот сравнения.",
+            "Сравните его с альтернативным сценарием.",
+            "Скачайте Excel/CSV и передайте результат команде.",
+        ] if scenario_applied and recommendation != "Не рекомендуется" else [
+            "Проверьте другой диапазон цены.",
+            "Снизьте масштаб изменений сценария.",
+            "Пересмотрите настройки промо и логистики.",
+        ]
+        render_report_card("Что делать дальше", next_steps)
+
+        with st.expander("Пояснение терминов", expanded=False):
+            st.markdown("- Текущий план — прогноз без ручных изменений.\n- Ваш сценарий — прогноз после нажатия «Применить сценарий».")
 
         open_surface("Экспорт")
         has_results = st.session_state.results is not None
@@ -4371,15 +4568,17 @@ if __name__ == "__main__":
             data=st.session_state.results.get("manual_scenario_daily_csv", b"") if has_results else b"",
             file_name="scenario_daily.csv",
             mime="text/csv",
-            disabled=not has_results,
+            disabled=(not has_results) or (not scenario_applied),
             use_container_width=True,
         )
+        if not scenario_applied:
+            st.caption("CSV станет доступен после применения сценария.")
         st.download_button(
             "Сводка",
             data=st.session_state.results.get("manual_scenario_summary_json", b"{}") if has_results else b"",
             file_name="summary.json",
             mime="application/json",
-            disabled=not has_results,
+            disabled=(not has_results) or (not scenario_applied),
             use_container_width=True,
         )
         close_surface()
