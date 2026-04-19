@@ -44,6 +44,14 @@ def run_scenario(
     shocks: Optional[List[Dict[str, Any]]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    def _finite_array(values: Any, default: float = 0.0) -> np.ndarray:
+        arr = np.asarray(values, dtype=float)
+        return np.nan_to_num(arr, nan=default, posinf=default, neginf=default)
+
+    def _finite_scalar(value: Any, default: float = 0.0) -> float:
+        parsed = float(value)
+        return float(parsed if np.isfinite(parsed) else default)
+
     frame = baseline_output.copy()
     metadata = metadata or {}
 
@@ -101,7 +109,7 @@ def run_scenario(
     shock_units = compute_shock_units(dates, valid_shocks)
 
     scenario_demand = baseline_units * standard_multiplier * shock_multiplier + shock_units
-    scenario_demand = np.clip(scenario_demand, 0.0, None)
+    scenario_demand = np.clip(_finite_array(scenario_demand), 0.0, None)
     available_stock = scenario_inputs.get("available_stock")
     realized = apply_stock_constraint(scenario_demand, None if available_stock is None else np.asarray(available_stock, dtype=float))
 
@@ -112,10 +120,10 @@ def run_scenario(
     baseline_freight_value = float(scenario_inputs.get("baseline_freight_value", scenario_inputs.get("freight_value", 0.0)))
     freight_value = float(scenario_inputs.get("freight_value", baseline_freight_value))
 
-    baseline_revenue = baseline_units * baseline_net_price
-    final_revenue = realized * scenario_net_price
-    baseline_margin = baseline_units * (baseline_net_price - baseline_unit_cost - baseline_freight_value)
-    final_margin = realized * (scenario_net_price - unit_cost - freight_value)
+    baseline_revenue = _finite_array(baseline_units * baseline_net_price)
+    final_revenue = _finite_array(realized * scenario_net_price)
+    baseline_margin = _finite_array(baseline_units * (baseline_net_price - baseline_unit_cost - baseline_freight_value))
+    final_margin = _finite_array(realized * (scenario_net_price - unit_cost - freight_value))
 
     promo_conf = compute_promo_confidence(int(metadata.get("promo_weeks", 0)), float(metadata.get("promo_variability", 0.0)))
     freight_conf = compute_freight_confidence(int(metadata.get("freight_changes", 0)), float(metadata.get("freight_variation", 0.0)))
@@ -128,13 +136,13 @@ def run_scenario(
 
     return build_scenario_result(
         baseline_units=baseline_units,
-        price_effect=price_effect,
-        promo_effect=promo_effect,
-        freight_effect=freight_effect,
-        stock_effect=stock_effect,
-        shock_multiplier=shock_multiplier,
-        shock_units=shock_units,
-        final_units=realized,
+        price_effect=_finite_scalar(price_effect, default=1.0),
+        promo_effect=_finite_scalar(promo_effect, default=1.0),
+        freight_effect=_finite_scalar(freight_effect, default=1.0),
+        stock_effect=_finite_scalar(stock_effect, default=1.0),
+        shock_multiplier=_finite_array(shock_multiplier, default=1.0),
+        shock_units=_finite_array(shock_units, default=0.0),
+        final_units=_finite_array(np.clip(realized, 0.0, None), default=0.0),
         baseline_revenue=baseline_revenue,
         final_revenue=final_revenue,
         baseline_margin=baseline_margin,

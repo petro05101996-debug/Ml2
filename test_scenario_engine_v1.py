@@ -48,6 +48,42 @@ def test_price_monotonicity():
     assert down["final_units"].sum() > up["final_units"].sum()
 
 
+def test_promo_decrease_lowers_units_and_promo_increase_raises_units():
+    base = _baseline(days=3, units=100.0)
+    common = {
+        "baseline_price_ref": 100.0,
+        "scenario_price": 100.0,
+        "freight_ref": 0.0,
+        "freight_scenario": 0.0,
+        "scenario_net_price": 100.0,
+        "unit_cost": 65.0,
+        "freight_value": 0.0,
+    }
+    promo_down = run_scenario(
+        base,
+        {
+            **common,
+            "promo_flag_baseline": 1.0,
+            "promo_flag_scenario": 0.0,
+            "promo_intensity_baseline": 1.0,
+            "promo_intensity_scenario": 0.0,
+        },
+    )
+    promo_up = run_scenario(
+        base,
+        {
+            **common,
+            "promo_flag_baseline": 0.0,
+            "promo_flag_scenario": 1.0,
+            "promo_intensity_baseline": 0.0,
+            "promo_intensity_scenario": 1.0,
+        },
+    )
+    baseline_total = float(np.sum(base["baseline_units"]))
+    assert float(np.sum(promo_down["final_units"])) < baseline_total
+    assert float(np.sum(promo_up["final_units"])) > baseline_total
+
+
 def test_shock_multiplier_and_units_applied():
     out = run_scenario(
         baseline_output=_baseline(days=3, units=10.0),

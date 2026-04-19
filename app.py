@@ -1500,16 +1500,14 @@ def decide_uplift_activation(
 
 def resolve_final_active_path(
     selected_forecaster: str,
-    selected_candidate: str,
-    uplift_activation: Dict[str, Any],
-    fallback_multiplier_used: bool,
+    production_selected_candidate: str,
 ) -> str:
-    _ = uplift_activation
-    if selected_forecaster != "weekly_model":
-        return f"{selected_forecaster}+emergency_fallback"
-    if fallback_multiplier_used:
-        return f"{selected_candidate}+emergency_fallback"
-    return f"{selected_candidate}+scenario_recompute"
+    if selected_forecaster == "weekly_model":
+        candidate = str(production_selected_candidate or "legacy_baseline")
+        return f"{candidate}+scenario_recompute"
+    if selected_forecaster in {"naive_lag1w", "naive_ma4w"}:
+        return f"{selected_forecaster}+scenario_recompute"
+    return "deterministic_fallback+scenario_recompute"
 
 
 def allocate_weekly_to_daily(weekly_forecast: pd.DataFrame, daily_history: pd.DataFrame, future_daily_context: pd.DataFrame) -> pd.DataFrame:
@@ -2146,10 +2144,11 @@ def run_full_pricing_analysis_universal(
             std_ratio_floor=0.02,
             std_ratio_cap=0.80,
         )
-        selected_candidate_name = str(selection_result["selected_candidate_name"])
-        selected_bundle = selection_result["selected_bundle"]
+        diagnostic_selected_candidate_name = str(selection_result["selected_candidate_name"])
         weekly_baseline_candidate_comparison = selection_result["comparison_payload"]
-        if selected_bundle is not None:
+        selected_candidate_name = "legacy_baseline"
+        selected_bundle = next((row for row in bundle_results if str(row.get("name")) == selected_candidate_name), None)
+        if selected_bundle is not None and selected_candidate_name in bundle_models:
             weekly_model = bundle_models[selected_candidate_name]
             baseline_feature_names = bundle_features_selected[selected_candidate_name]
             test_pred_weekly = bundle_pred_frames[selected_candidate_name]
@@ -2162,6 +2161,9 @@ def run_full_pricing_analysis_universal(
                 baseline_feature_names,
                 seasonal_anchor_weight=seasonal_anchor_weight_train,
             )
+        weekly_baseline_candidate_comparison["production_selected_candidate"] = "legacy_baseline"
+        weekly_baseline_candidate_comparison["diagnostic_selected_candidate"] = diagnostic_selected_candidate_name
+        weekly_baseline_candidate_comparison["selection_mode"] = "diagnostic_comparison_runtime_frozen_to_legacy"
         amplitude_calibrator_info = select_amplitude_calibrator_from_train_backtest(
             train_weekly,
             baseline_feature_names,
@@ -2521,8 +2523,8 @@ def run_full_pricing_analysis_universal(
         warnings.append(f"Высокий holdout WAPE: {float(wape_val):.1f}%")
     if not model_enabled:
         warnings.append(f"Weekly ML не прошла benchmark gate, используем {selected_forecaster}.")
-    elif shape_quality_low:
-        warnings.append("shape_quality_low: corr_final/std_ratio_final ниже целевых порогов, но weekly_model оставлена из-за лучшего WAPE.")
+    elif shape_quality_low or (np.isfinite(std_ratio_final) and float(std_ratio_final) < 0.5):
+        warnings.append("Forecast shape is flatter than actual demand; use scenario results as directional, not exact.")
     if uplift_enabled_holdout and not uplift_keep:
         warnings.append(f"Learned uplift откатили: {str(uplift_gate_reason) or 'uplift_gate_failed'}.")
     if not use_weekly_ml:
@@ -2872,9 +2874,7 @@ def run_full_pricing_analysis_universal(
     }
     final_active_path = resolve_final_active_path(
         selected_forecaster=selected_forecaster,
-        selected_candidate=selected_candidate_name,
-        uplift_activation=uplift_activation,
-        fallback_multiplier_used=bool(as_is_sim.get("fallback_multiplier_used", False)),
+        production_selected_candidate=selected_candidate_name,
     )
     run_summary = {
             "config": {
@@ -2916,6 +2916,8 @@ def run_full_pricing_analysis_universal(
             "uplift_holdout_keep": bool(uplift_keep),
             "uplift_activation_mode": LEARNED_UPLIFT_MODE,
             "uplift_activation": uplift_activation,
+            "uplift_mode": "diagnostic_only",
+            "uplift_used_in_production": False,
             "quality_improvement_expected": False,
             "quality_improvement_expectation_reason": "diagnostic_only_modes_active_path_frozen",
             "final_active_path": final_active_path,
@@ -2937,6 +2939,10 @@ def run_full_pricing_analysis_universal(
             "shape_quality_low": bool(shape_quality_low),
             "selected_forecaster": selected_forecaster,
             "selected_candidate": selected_candidate_name,
+            "production_selected_candidate": "legacy_baseline",
+            "diagnostic_selected_candidate": str(weekly_baseline_candidate_comparison.get("selected_candidate", selected_candidate_name)),
+            "selection_mode": "diagnostic_comparison_runtime_frozen_to_legacy",
+            "production_selection_reason": "v1_contract_runtime_frozen_to_legacy",
             "selection_reason": str(weekly_baseline_candidate_comparison.get("selection_reason", "")),
             "model_backend": backend_status["model_backend"],
             "backend_reason": backend_status["backend_reason"],
@@ -2991,10 +2997,12 @@ def run_full_pricing_analysis_universal(
         "scenario_inputs": {"as_is": {"price": float(base_ctx.get("price")), "discount": float(base_ctx.get("discount", 0.0))}, "neutral_baseline": neutral_overrides},
         "scenario_output_summary": {
             "artifact_scope": "analysis_only",
-            "scenario_status": "not_run" if scenario_sim is None else "computed",
-            "scenario_reason": "manual_what_if_not_executed" if scenario_sim is None else "",
+            "scenario_status": "as_is" if scenario_sim is None else "computed",
+            "scenario_reason": "" if scenario_sim is None else "",
             "active_path_contract": final_active_path,
             "learned_uplift_contract": "inactive_production_diagnostic_only",
+            "uplift_mode": "diagnostic_only",
+            "uplift_used_in_production": False,
             "scenario_driver_mode": str(as_is_sim.get("scenario_driver_mode", "unknown")),
             "weekly_driver_mode": str(as_is_sim.get("weekly_driver_mode", "naive_core_only")),
             "fallback_multiplier_used": bool(as_is_sim.get("fallback_multiplier_used", False)),
@@ -3008,13 +3016,13 @@ def run_full_pricing_analysis_universal(
             "scenario_sensitivity_status": "computed",
             "baseline_demand_total": float(baseline_sim["daily"]["actual_sales"].sum()),
             "as_is_demand_total": float(as_is_sim["daily"]["actual_sales"].sum()),
-            "scenario_demand_total": float(scenario_sim["daily"]["actual_sales"].sum()) if scenario_sim else float("nan"),
+            "scenario_demand_total": float(scenario_sim["daily"]["actual_sales"].sum()) if scenario_sim else float(as_is_sim["daily"]["actual_sales"].sum()),
             "baseline_revenue_total": float(baseline_sim["daily"]["revenue"].sum()),
             "as_is_revenue_total": float(as_is_sim["daily"]["revenue"].sum()),
-            "scenario_revenue_total": float(scenario_sim["daily"]["revenue"].sum()) if scenario_sim else float("nan"),
+            "scenario_revenue_total": float(scenario_sim["daily"]["revenue"].sum()) if scenario_sim else float(as_is_sim["daily"]["revenue"].sum()),
             "baseline_profit_total": float(baseline_sim["daily"]["profit"].sum()),
             "as_is_profit_total": float(as_is_sim["daily"]["profit"].sum()),
-            "scenario_profit_total": float(scenario_sim["daily"]["profit"].sum()) if scenario_sim else float("nan"),
+            "scenario_profit_total": float(scenario_sim["daily"]["profit"].sum()) if scenario_sim else float(as_is_sim["daily"]["profit"].sum()),
             "corr_final": float(np.corrcoef(holdout_predictions["actual_sales"], holdout_predictions["final_pred_sales"])[0, 1]) if len(holdout_predictions) > 1 else float("nan"),
             "std_ratio_final": float(np.std(holdout_predictions["final_pred_sales"], ddof=0) / max(np.std(holdout_predictions["actual_sales"], ddof=0), 1e-9)) if len(holdout_predictions) > 1 else float("nan"),
             "corr_baseline": float(corr_baseline),
@@ -3217,6 +3225,21 @@ def run_what_if_projection(
         "unit_cost": scenario_cost,
         "available_stock": stock_series,
     }
+    promo_base = float(current_ctx.get("promotion", 0.0))
+    promo_scenario = float(scenario_overrides.get("promotion", promo_base))
+    manual_shock_multiplier = float(scenario_overrides.get("manual_shock_multiplier", 1.0))
+    has_explicit_shocks = bool(len(shocks))
+    scenario_changed = bool(
+        abs(requested_price - baseline_price_ref) > 1e-9
+        or abs(scenario_discount - baseline_discount) > 1e-9
+        or abs(scenario_freight - baseline_freight) > 1e-9
+        or abs(scenario_cost - baseline_cost) > 1e-9
+        or abs(promo_scenario - promo_base) > 1e-9
+        or abs(manual_shock_multiplier - 1.0) > 1e-9
+        or has_explicit_shocks
+        or abs(float(scenario_overrides.get("stock_cap", 0.0))) > 1e-9
+    )
+    scenario_status = "computed" if scenario_changed else "as_is"
     baseline_for_scenario = pd.DataFrame(
         {
             "date": pd.to_datetime(daily["date"]) if "date" in daily.columns else pd.Series(dtype="datetime64[ns]"),
@@ -3253,7 +3276,11 @@ def run_what_if_projection(
     horizon_penalty = max(0.0, (len(future_dates) - 30) / 120.0)
     extreme_penalty = max(0.0, abs(float(freight_multiplier) - 1.0) + abs(float(discount_multiplier) - 1.0) + abs(float(cost_multiplier) - 1.0) - 0.25) * 0.08
     confidence_scenario = float(np.clip(base_confidence - ood_penalty - horizon_penalty - extreme_penalty, 0.05, 0.99))
-    active_path = f"{trained_bundle.get('baseline_bundle', {}).get('selected_candidate', 'legacy_baseline')}+scenario_recompute"
+    baseline_bundle_meta = trained_bundle.get("baseline_bundle", {})
+    active_path = resolve_final_active_path(
+        selected_forecaster=str(baseline_bundle_meta.get("selected_forecaster", "weekly_model")),
+        production_selected_candidate=str(baseline_bundle_meta.get("selected_candidate", "legacy_baseline")),
+    )
     model_backend = str(trained_bundle.get("baseline_bundle", {}).get("model_backend", "deterministic_fallback"))
     backend_reason = str(trained_bundle.get("baseline_bundle", {}).get("backend_reason", "unknown"))
     backend_warning_text = build_backend_warning(model_backend, backend_reason)
@@ -3303,6 +3330,9 @@ def run_what_if_projection(
         "fallback_multiplier_used": runtime_meta["fallback_multiplier_used"],
         "fallback_reason": runtime_meta["fallback_reason"],
         "learned_uplift_active": runtime_meta["learned_uplift_active"],
+        "uplift_mode": "diagnostic_only",
+        "uplift_used_in_production": False,
+        "scenario_status": scenario_status,
         "scenario_driver_mode": runtime_meta["scenario_driver_mode"],
         "weekly_driver_mode": runtime_meta["weekly_driver_mode"],
         "baseline_has_exogenous_driver": runtime_meta["baseline_has_exogenous_driver"],
@@ -3517,10 +3547,22 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
 def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     history = results.get("history_daily", pd.DataFrame())
     sufficiency = build_data_sufficiency_status(history)
-    active_path = "unknown"
+    active_path = resolve_final_active_path("weekly_model", "legacy_baseline")
+    run_summary_cfg: Dict[str, Any] = {}
+    scenario_output_summary: Dict[str, Any] = {}
     try:
         run_summary = json.loads(results.get("analysis_run_summary_json", b"{}").decode("utf-8"))
-        active_path = str(run_summary.get("config", {}).get("final_active_path", "unknown"))
+        run_summary_cfg = run_summary.get("config", {}) or {}
+        scenario_output_summary = run_summary.get("scenario_output_summary", {}) or {}
+        active_path = str(
+            run_summary_cfg.get(
+                "final_active_path",
+                resolve_final_active_path(
+                    selected_forecaster=str(run_summary_cfg.get("selected_forecaster", "weekly_model")),
+                    production_selected_candidate=str(run_summary_cfg.get("selected_candidate", "legacy_baseline")),
+                ),
+            )
+        )
     except Exception:
         pass
     scenario_contract = (what_if_result or {}).get("scenario_inputs_contract", {})
@@ -3545,6 +3587,10 @@ def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str
         if promo_max > promo_min and (sc_promo < max(0.0, promo_min - 0.10) or sc_promo > min(1.0, promo_max + 0.10)):
             warnings_local.append("promo level exceeds historical support.")
             in_range = False
+    std_ratio_final = scenario_output_summary.get("std_ratio_final", run_summary_cfg.get("std_ratio_final", float("nan")))
+    shape_quality_low = bool(run_summary_cfg.get("shape_quality_low", scenario_output_summary.get("shape_quality_low", False)))
+    if shape_quality_low or (pd.notna(std_ratio_final) and float(std_ratio_final) < 0.5):
+        warnings_local.append("Forecast shape is flatter than actual demand; use scenario results as directional, not exact.")
     return {
         "data_sufficiency": sufficiency["label"],
         "data_message": sufficiency["message"],
@@ -3560,16 +3606,32 @@ def build_business_report_payload(
     what_if_result: Optional[Dict[str, Any]] = None,
     saved_scenarios: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    def _finite(value: Any, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+            return parsed if np.isfinite(parsed) else float(default)
+        except Exception:
+            return float(default)
+
     as_is = results.get("as_is_forecast", pd.DataFrame())
     baseline = results.get("neutral_baseline_forecast", pd.DataFrame())
-    scenario_daily = (what_if_result or {}).get("daily", None)
+    scenario_daily_raw = (what_if_result or {}).get("daily", None)
+    requested_status = str((what_if_result or {}).get("scenario_status", "as_is"))
+    has_valid_computed_payload = isinstance(scenario_daily_raw, pd.DataFrame) and len(scenario_daily_raw) > 0
+    scenario_payload_missing = bool(requested_status == "computed" and not has_valid_computed_payload)
+    if requested_status == "computed" and has_valid_computed_payload:
+        scenario_daily = scenario_daily_raw
+        scenario_status = "computed"
+    else:
+        scenario_daily = as_is
+        scenario_status = "as_is"
     trust = build_trust_block(results, what_if_result)
-    as_is_units = float(as_is["actual_sales"].sum()) if len(as_is) else float("nan")
-    as_is_revenue = float(as_is["revenue"].sum()) if len(as_is) else float("nan")
-    as_is_profit = float(as_is["profit"].sum()) if len(as_is) and "profit" in as_is.columns else float("nan")
-    scenario_units = float(scenario_daily["actual_sales"].sum()) if isinstance(scenario_daily, pd.DataFrame) and len(scenario_daily) else float("nan")
-    scenario_revenue = float(scenario_daily["revenue"].sum()) if isinstance(scenario_daily, pd.DataFrame) and len(scenario_daily) else float("nan")
-    scenario_profit = float(scenario_daily["profit"].sum()) if isinstance(scenario_daily, pd.DataFrame) and len(scenario_daily) and "profit" in scenario_daily.columns else float("nan")
+    as_is_units = _finite(float(as_is["actual_sales"].sum()) if len(as_is) else 0.0)
+    as_is_revenue = _finite(float(as_is["revenue"].sum()) if len(as_is) else 0.0)
+    as_is_profit = _finite(float(as_is["profit"].sum()) if len(as_is) and "profit" in as_is.columns else 0.0)
+    scenario_units = _finite(float(scenario_daily["actual_sales"].sum()) if len(scenario_daily) else 0.0)
+    scenario_revenue = _finite(float(scenario_daily["revenue"].sum()) if len(scenario_daily) else 0.0)
+    scenario_profit = _finite(float(scenario_daily["profit"].sum()) if len(scenario_daily) and "profit" in scenario_daily.columns else 0.0)
     margin_available = bool(results.get("cost_input_available", False))
     run_summary_cfg = {}
     try:
@@ -3589,25 +3651,44 @@ def build_business_report_payload(
             "active_path": trust["active_calculation_mode"],
             "fallback_used": trust["fallback_used"],
             "selected_candidate": str(run_summary_cfg.get("selected_candidate", "")),
+            "production_selected_candidate": str(run_summary_cfg.get("production_selected_candidate", run_summary_cfg.get("selected_candidate", "legacy_baseline"))),
+            "diagnostic_selected_candidate": str(run_summary_cfg.get("diagnostic_selected_candidate", "")),
+            "selection_mode": str(run_summary_cfg.get("selection_mode", "diagnostic_comparison_runtime_frozen_to_legacy")),
+            "production_selection_reason": str(run_summary_cfg.get("production_selection_reason", "v1_contract_runtime_frozen_to_legacy")),
             "selection_reason": str(run_summary_cfg.get("selection_reason", "")),
             "model_backend": str(run_summary_cfg.get("model_backend", "")),
             "backend_reason": str(run_summary_cfg.get("backend_reason", "")),
-            "uplift_mode": str(run_summary_cfg.get("uplift_activation_mode", "")),
+            "uplift_mode": "diagnostic_only",
+            "uplift_used_in_production": False,
+            "scenario_status": scenario_status,
+            "price_clip": {
+                "requested_price": _finite((what_if_result or {}).get("requested_price", results.get("current_price", 0.0))),
+                "model_price": _finite((what_if_result or {}).get("model_price", results.get("current_price", 0.0))),
+                "price_clipped": bool((what_if_result or {}).get("price_clipped", False)),
+                "clip_reason": str((what_if_result or {}).get("clip_reason", "")),
+            },
         },
         "margin_available": margin_available,
         "baseline_forecast": {
-            "units": float(baseline["actual_sales"].sum()) if len(baseline) else float("nan"),
-            "revenue": float(baseline["revenue"].sum()) if len(baseline) else float("nan"),
-            "profit": float(baseline["profit"].sum()) if margin_available and len(baseline) and "profit" in baseline.columns else None,
+            "units": _finite(float(baseline["actual_sales"].sum()) if len(baseline) else 0.0),
+            "revenue": _finite(float(baseline["revenue"].sum()) if len(baseline) else 0.0),
+            "profit": _finite(float(baseline["profit"].sum())) if margin_available and len(baseline) and "profit" in baseline.columns else None,
         },
         "as_is_forecast": {"units": as_is_units, "revenue": as_is_revenue, "profit": as_is_profit if margin_available else None},
         "scenario_forecast": {"units": scenario_units, "revenue": scenario_revenue, "profit": scenario_profit if margin_available else None},
         "delta_vs_as_is": {
-            "units": scenario_units - as_is_units if np.isfinite(scenario_units) else None,
-            "revenue": scenario_revenue - as_is_revenue if np.isfinite(scenario_revenue) else None,
-            "profit": scenario_profit - as_is_profit if margin_available and np.isfinite(scenario_profit) and np.isfinite(as_is_profit) else None,
+            "units": _finite(scenario_units - as_is_units),
+            "revenue": _finite(scenario_revenue - as_is_revenue),
+            "profit": _finite(scenario_profit - as_is_profit) if margin_available else None,
         },
-        "warnings_reliability_notes": trust["warnings"],
+        "scenario_status": scenario_status,
+        "price_clip": {
+            "requested_price": _finite((what_if_result or {}).get("requested_price", results.get("current_price", 0.0))),
+            "model_price": _finite((what_if_result or {}).get("model_price", results.get("current_price", 0.0))),
+            "price_clipped": bool((what_if_result or {}).get("price_clipped", False)),
+            "clip_reason": str((what_if_result or {}).get("clip_reason", "")),
+        },
+        "warnings_reliability_notes": trust["warnings"] + (["scenario payload missing; fell back to as-is"] if scenario_payload_missing else []),
         "saved_scenarios": saved_scenarios or {},
     }
 
@@ -3979,14 +4060,12 @@ if ctx and ctx.get("run_requested"):
 
 if st.session_state.results is not None:
     r = st.session_state.results
-    scenario_not_run = False
     history_daily = r["history_daily"]
     current_forecast = r["as_is_forecast"]
-    if r["scenario_forecast"] is None:
-        scenario_not_run = True
-        scenario_forecast = None
-    else:
-        scenario_forecast = r["scenario_forecast"]
+    scenario_forecast = r["scenario_forecast"] if r["scenario_forecast"] is not None else current_forecast
+    scenario_status_ui = "as_is"
+    if st.session_state.what_if_result is not None:
+        scenario_status_ui = str(st.session_state.what_if_result.get("scenario_status", "computed"))
     baseline_forecast = r["neutral_baseline_forecast"]
     run_ts = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     st.markdown(
@@ -3997,8 +4076,8 @@ if st.session_state.results is not None:
       <div class="card-title">Active scenario instance</div>
       <div class="muted">SKU: {st.session_state.get("selected_sku_for_results", "n/a")} • Category: {st.session_state.get("selected_category_for_results", "n/a")}</div>
       <div class="chip-row">
-        <span class="chip active">Active path: price_promo_freight_baseline</span>
-        <span class="chip {'warn' if scenario_not_run else 'ok'}">{'Scenario not executed' if scenario_not_run else 'Scenario executed'}</span>
+        <span class="chip active">Active path: legacy_baseline+scenario_recompute</span>
+        <span class="chip {'warn' if scenario_status_ui == 'as_is' else 'ok'}">Scenario status: {scenario_status_ui}</span>
       </div>
     </div>
     <div style="text-align:right;">
@@ -4057,12 +4136,13 @@ if st.session_state.results is not None:
     contract_ui = (((run_summary_ui.get("config", {}) or {}).get("v1_contract", {})) or {})
     if contract_ui:
         st.info(
-            "Контракт v1: active path = price_promo_freight_baseline + scenario_recompute; "
+            "Контракт v1: active path = legacy_baseline+scenario_recompute; "
             "learned uplift = diagnostic only/inactive; "
+            "uplift used in production = false; "
             "price/promo/freight применяются через baseline recalc + scenario engine (без double counting)."
         )
-    if scenario_not_run:
-        st.info("Сценарий ещё не запускался")
+    if scenario_status_ui == "as_is":
+        st.info("Сценарий не изменён: используются as-is значения.")
     scenario_summary_ui = (run_summary_ui.get("scenario_output_summary", {}) or {})
     manual_summary_ui = {}
     if r.get("manual_scenario_summary_json"):
@@ -4094,7 +4174,7 @@ if st.session_state.results is not None:
         {"label": "Scenario revenue", "value": f"₽ {scenario_revenue_total:,.0f}", "delta": f"Δ ₽ {scenario_revenue_total - as_is_revenue_total:+,.0f}", "positive": scenario_revenue_total >= as_is_revenue_total},
         {"label": "Scenario delta units", "value": f"{scenario_units_total - as_is_units_total:+,.1f}", "delta": "vs as-is", "positive": (scenario_units_total - as_is_units_total) >= 0},
         {"label": "Data quality", "value": str(trust_block['data_sufficiency']).upper(), "delta": str(trust_block['scenario_range_status']), "positive": trust_block["data_sufficiency"] == "enough"},
-        {"label": "Active model path", "value": "Price+Promo+Freight", "delta": "production baseline", "positive": True},
+        {"label": "Active model path", "value": "Legacy baseline", "delta": "production baseline", "positive": True},
     ]
     if show_margin:
         kpi_items[1] = {"label": "Scenario gross profit", "value": f"₽ {scenario_profit_total:,.0f}", "delta": f"Δ ₽ {scenario_profit_total - as_is_profit_total:+,.0f}", "positive": scenario_profit_total >= as_is_profit_total}
@@ -4135,6 +4215,10 @@ if st.session_state.results is not None:
         "Std ratio": scenario_summary_ui.get("std_ratio_final"),
         "flat_or_shape_warning": scenario_summary_ui.get("shape_quality_low"),
     })
+    std_ratio_ui = scenario_summary_ui.get("std_ratio_final")
+    shape_quality_ui = bool(scenario_summary_ui.get("shape_quality_low", False))
+    if shape_quality_ui or (pd.notna(std_ratio_ui) and float(std_ratio_ui) < 0.5):
+        st.warning("Forecast shape is flatter than actual demand; use scenario results as directional, not exact.")
     st.markdown("### 3) Что влияет сейчас")
     cfa, cfb, cfc = st.columns(3)
     with cfa:
@@ -4168,8 +4252,10 @@ if st.session_state.results is not None:
             "demand": (scenario_demand_total_ui - as_is_demand_total_ui) if pd.notna(scenario_demand_total_ui) else None,
             "profit": (scenario_profit_total_ui - as_is_profit_total_ui) if pd.notna(scenario_profit_total_ui) else None,
         },
-        "scenario_status": scenario_result_ui.get("scenario_status", "not_run"),
+        "scenario_status": scenario_result_ui.get("scenario_status", "as_is"),
         "clip_warning": {
+            "requested_price": scenario_result_ui.get("requested_price"),
+            "model_price": scenario_result_ui.get("model_price"),
             "clip_applied": scenario_result_ui.get("clip_applied"),
             "clip_reason": scenario_result_ui.get("clip_reason"),
         } if scenario_result_ui else None,
