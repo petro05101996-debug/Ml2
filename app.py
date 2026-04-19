@@ -34,13 +34,6 @@ from v1_runtime_helpers import (
     select_weekly_baseline_candidate,
 )
 from what_if import build_sensitivity_grid, run_scenario_set
-from ui.components import (
-    render_action_buttons,
-    render_action_row,
-    render_chip_row,
-    render_kpi_cards,
-    render_top_header,
-)
 from ui.theme import apply_theme
 
 warnings.filterwarnings("ignore")
@@ -3719,856 +3712,416 @@ def build_scenario_comparison_table(
     return compare_df
 
 
-st.set_page_config(page_title="💰 AI What-if Engine", layout="wide", page_icon="💰")
+if __name__ == "__main__":
+    st.set_page_config(page_title="What-if Cloud", layout="wide", page_icon="📊")
 
-if "results" not in st.session_state:
-    st.session_state.results = None
-if "what_if_result" not in st.session_state:
-    st.session_state.what_if_result = None
-    st.session_state.scenario_table = None
-    st.session_state.sensitivity_df = None
-if "app_stage" not in st.session_state:
-    st.session_state.app_stage = "landing"
-if "selected_category_for_results" not in st.session_state:
-    st.session_state.selected_category_for_results = None
-if "selected_sku_for_results" not in st.session_state:
-    st.session_state.selected_sku_for_results = None
-if "scenario_table" not in st.session_state:
-    st.session_state.scenario_table = None
-if "sensitivity_df" not in st.session_state:
-    st.session_state.sensitivity_df = None
-if "saved_scenarios" not in st.session_state:
-    st.session_state.saved_scenarios = {}
-if "active_workspace_tab" not in st.session_state:
-    st.session_state.active_workspace_tab = "Dashboard"
+    if "results" not in st.session_state:
+        st.session_state.results = None
+    if "what_if_result" not in st.session_state:
+        st.session_state.what_if_result = None
+    if "app_stage" not in st.session_state:
+        st.session_state.app_stage = "upload"
+    if "selected_category_for_results" not in st.session_state:
+        st.session_state.selected_category_for_results = None
+    if "selected_sku_for_results" not in st.session_state:
+        st.session_state.selected_sku_for_results = None
+    if "scenario_table" not in st.session_state:
+        st.session_state.scenario_table = None
+    if "sensitivity_df" not in st.session_state:
+        st.session_state.sensitivity_df = None
+    if "saved_scenarios" not in st.session_state:
+        st.session_state.saved_scenarios = {}
+    if "active_workspace_tab" not in st.session_state:
+        st.session_state.active_workspace_tab = "Дашборд"
 
-PLOTLY_WORKSPACE_CONFIG = {
-    "displayModeBar": True,
-    "scrollZoom": True,
-    "doubleClick": "reset",
-    "modeBarButtonsToAdd": ["pan2d", "zoomIn2d", "zoomOut2d", "resetScale2d"],
-}
+    apply_theme()
 
-apply_theme()
-render_top_header("AI Pricing Control Panel", "Dark dashboard • Universal CSV what-if v1")
+    query_page = st.query_params.get("page", "landing")
+    if isinstance(query_page, list):
+        query_page = query_page[0]
 
+    if query_page == "landing":
+        from ui.components import (
+            render_landing_nav,
+            render_hero_section,
+            render_trust_metrics,
+            render_product_features,
+            render_how_it_works,
+            render_interface_preview,
+            render_reliability_section,
+            render_use_cases,
+            render_final_cta,
+            render_landing_footer,
+        )
 
-def _base_plotly_layout(title: str) -> Dict[str, Any]:
-    return dict(
-        title=title,
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#E7EAF2"),
-        legend=dict(orientation="h", y=1.08, x=0),
-        margin=dict(l=20, r=20, t=56, b=25),
-        transition=dict(duration=380, easing="cubic-in-out"),
+        render_landing_nav()
+        render_hero_section()
+        render_trust_metrics()
+        render_product_features()
+        render_how_it_works()
+        render_interface_preview()
+        render_reliability_section()
+        render_use_cases()
+        render_final_cta()
+        render_landing_footer()
+        if st.button("Перейти в приложение", type="primary", use_container_width=True, key="to_app"):
+            st.query_params["page"] = "app"
+            st.rerun()
+        st.stop()
+
+    from ui.components import (
+        render_top_header,
+        render_object_header,
+        render_action_row,
+        render_tabs,
+        render_chart_card,
+        render_metric_summary_card,
+        render_insight_card,
+        render_compare_card,
+        render_report_card,
+        render_warning_card,
+        render_empty_state,
+        render_debug_expander,
+        open_surface,
+        close_surface,
     )
 
-
-def _mini_sparkline(values: pd.Series, color: str = "#ff8a00") -> go.Figure:
-    y = pd.to_numeric(values, errors="coerce").ffill().fillna(0).tail(35)
-    fig = go.Figure(go.Scatter(x=list(range(len(y))), y=y, mode="lines", line=dict(color=color, width=2.3), fill="tozeroy", fillcolor="rgba(255,138,0,0.14)", hoverinfo="skip"))
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=52, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", xaxis=dict(visible=False), yaxis=dict(visible=False))
-    return fig
+    render_top_header()
 
 
-def _metric_card(title: str, value: str, delta_text: str, delta_positive: bool, spark: pd.Series, color: str) -> None:
-    cls = "kpi-pos" if delta_positive else "kpi-neg"
-    st.markdown('<div class="glass-card metric-card">', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-label">{title}</div><div class="kpi-val">{value}</div><div class="{cls}">{delta_text}</div>', unsafe_allow_html=True)
-    st.plotly_chart(_mini_sparkline(spark, color), use_container_width=True, config={"displayModeBar": False})
-    st.markdown('<div class="micro-note">Наведите на точки графика для деталей.</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    def _plot_layout(title: str) -> dict:
+        return dict(
+            title=title,
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#F4F7FB"),
+            margin=dict(l=20, r=20, t=44, b=20),
+            legend=dict(orientation="h", y=1.05, x=0),
+        )
 
 
-def render_upload_block() -> Dict[str, Any]:
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Загрузка данных</div>', unsafe_allow_html=True)
-    st.caption("Поддерживается Universal CSV/XLSX (единый контур what-if v1).")
-    load_mode = "Universal CSV"
+    def render_upload_screen() -> dict[str, Any]:
+        st.markdown('<div class="section-title">Загрузка данных</div><div class="section-subtitle">Загрузите данные, проверьте структуру и выберите объект анализа</div>', unsafe_allow_html=True)
+        left, right = st.columns([1.2, 1], gap="large")
 
-    orders_file = items_file = products_file = reviews_file = None
-    universal_file = None
+        with left:
+            open_surface("Загрузка данных")
+            universal_file = st.file_uploader("Файл транзакций (CSV/XLSX)", type=["csv", "xlsx"], key="universal_file")
+            close_surface()
 
-    universal_file = st.file_uploader("Universal transactions file", type=["csv", "xlsx"], key="universal_file")
-    st.progress(1.0 if universal_file else 0.0, text=f"Обязательные файлы: {1 if universal_file else 0}/1")
+            open_surface("Схема и валидация")
+            universal_txn = None
+            schema_valid = False
+            schema_errors: list[str] = []
+            universal_quality: dict[str, Any] = {}
+            raw_for_select = None
+            universal_mapping: dict[str, Optional[str]] = {}
 
-    raw_for_select = None
-    universal_txn = None
-    universal_quality = {}
-    schema_valid = False
-    schema_errors: List[str] = []
-    universal_mapping: Dict[str, Optional[str]] = {}
-    orders_col_map: Dict[str, Optional[str]] = {}
-    items_col_map: Dict[str, Optional[str]] = {}
-    products_col_map: Dict[str, Optional[str]] = {}
-    reviews_col_map: Dict[str, Optional[str]] = {}
-
-    if load_mode == "Universal CSV" and universal_file is not None:
-        try:
-            preview = read_uploaded_table_safely(universal_file)
-            auto_map = build_auto_mapping(list(preview.columns))
-            with st.expander("⚙️ Сопоставление колонок (каноническая схема)", expanded=True):
+            if universal_file is not None:
+                preview = read_uploaded_table_safely(universal_file)
+                auto_map = build_auto_mapping(list(preview.columns))
                 for f in CANONICAL_FIELDS:
                     choices = ["<не использовать>"] + list(preview.columns)
                     guessed = auto_map.get(f.name)
                     idx = choices.index(guessed) if guessed in choices else 0
                     selected = st.selectbox(
-                        f"{f.name} {'*' if f.required else ''} — {f.description}",
+                        f"{f.name} {'*' if f.required else ''}",
                         choices,
                         index=idx,
                         key=f"map_universal_{f.name}",
                     )
                     universal_mapping[f.name] = None if selected == "<не использовать>" else selected
-            missing_required = validate_mapping_required_columns(universal_mapping)
-            if missing_required:
-                required_hint = ", ".join(missing_required)
-                schema_errors.append(
-                    "Схема данных невалидна: отсутствует маппинг обязательных полей "
-                    f"({required_hint}). Укажите соответствующие колонки в блоке маппинга."
-                )
-                schema_errors.append(
-                    "Что можно поправить: проверьте названия обязательных полей date/product_id/price "
-                    "и перезагрузите файл при необходимости."
-                )
-            else:
-                universal_txn, universal_quality = normalize_transactions(preview, universal_mapping)
-                if universal_quality.get("errors"):
-                    schema_errors.extend(list(universal_quality["errors"]))
+                missing_required = validate_mapping_required_columns(universal_mapping)
+                if missing_required:
+                    schema_errors.append(f"Отсутствуют обязательные поля: {', '.join(missing_required)}")
                 else:
-                    schema_valid = True
-                    st.success(f"Нормализация завершена: {len(universal_txn):,} строк.")
-                    for w in universal_quality.get("warnings", []):
-                        st.warning(w)
-                    sufficiency = build_data_sufficiency_status(universal_txn)
-                    if sufficiency["status"] == "poor":
-                        st.warning(f"Data sufficiency: {sufficiency['status']} — {sufficiency['message']}")
-                    elif sufficiency["status"] == "limited":
-                        st.info(f"Data sufficiency: {sufficiency['status']} — {sufficiency['message']}")
+                    universal_txn, universal_quality = normalize_transactions(preview, universal_mapping)
+                    if universal_quality.get("errors"):
+                        schema_errors.extend(list(universal_quality["errors"]))
                     else:
-                        st.success(f"Data sufficiency: {sufficiency['status']}.")
-                    raw_for_select = universal_txn.copy().rename(columns={"category": "product_category_name", "product_id": "product_id"})
+                        schema_valid = True
+                        raw_for_select = universal_txn.copy().rename(columns={"category": "product_category_name", "product_id": "product_id"})
+                        st.success(f"Готово: {len(universal_txn):,} строк")
+                        for w in universal_quality.get("warnings", []):
+                            st.warning(w)
             for err in schema_errors:
                 st.error(err)
-        except Exception as e:
-            st.error(f"Ошибка предобработки universal CSV: {e}")
+            close_surface()
 
-    target_category, target_sku = None, None
-    if raw_for_select is not None and len(raw_for_select) > 0:
-        category_col = "product_category_name" if "product_category_name" in raw_for_select.columns else "category"
-        sku_col = "product_id"
-        categories = sorted(raw_for_select[category_col].dropna().astype(str).unique())
-        target_category = st.selectbox("Категория", categories, key="input_target_category") if categories else None
-        sku_search = st.text_input("Поиск SKU", placeholder="Введите SKU")
-        if target_category is not None:
-            skus_all = raw_for_select[raw_for_select[category_col].astype(str) == str(target_category)][sku_col].astype(str).dropna().unique().tolist()
-            skus_filtered = sorted([s for s in skus_all if sku_search.lower() in s.lower()]) if sku_search else sorted(skus_all)
-            target_sku = st.selectbox("SKU", skus_filtered, key="input_target_sku") if skus_filtered else None
-    run_requested = st.button("🚀 Запустить анализ", type="primary", use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        with right:
+            open_surface("Выбор объекта")
+            target_category, target_sku = None, None
+            if 'raw_for_select' in locals() and raw_for_select is not None and len(raw_for_select) > 0:
+                category_col = "product_category_name" if "product_category_name" in raw_for_select.columns else "category"
+                categories = sorted(raw_for_select[category_col].dropna().astype(str).unique())
+                target_category = st.selectbox("Категория", categories, key="input_target_category") if categories else None
+                if target_category is not None:
+                    sku_col = "product_id"
+                    skus = sorted(raw_for_select[raw_for_select[category_col].astype(str) == str(target_category)][sku_col].astype(str).dropna().unique())
+                    target_sku = st.selectbox("SKU", skus, key="input_target_sku") if skus else None
+            horizon_days = st.slider("Горизонт", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
+            run_requested = st.button("Запустить анализ", type="primary", use_container_width=True)
+            close_surface()
 
-    return {
-        "orders_file": orders_file,
-        "items_file": items_file,
-        "products_file": products_file,
-        "reviews_file": reviews_file,
-        "universal_file": universal_file,
-        "universal_txn": universal_txn,
-        "universal_quality": universal_quality,
-        "schema_valid": schema_valid,
-        "schema_errors": schema_errors,
-        "universal_mapping": universal_mapping,
-        "load_mode": load_mode,
-        "target_category": target_category,
-        "target_sku": target_sku,
-        "run_requested": run_requested,
-        "orders_col_map": orders_col_map,
-        "items_col_map": items_col_map,
-        "products_col_map": products_col_map,
-        "reviews_col_map": reviews_col_map,
-        "raw_for_select": raw_for_select,
-    }
+        return {
+            "universal_txn": universal_txn if 'universal_txn' in locals() else None,
+            "schema_valid": schema_valid if 'schema_valid' in locals() else False,
+            "target_category": target_category,
+            "target_sku": target_sku,
+            "run_requested": run_requested,
+            "horizon_days": horizon_days,
+        }
 
 
-ctx: Dict[str, Any] = {}
-
-if st.session_state.app_stage == "landing" and st.session_state.results is None:
-    st.markdown('<div class="mock-shell">', unsafe_allow_html=True)
-    st.markdown('<div class="mock-top"><div style="font-weight:700;">SaaS</div><div class="badge-id">0A0A12</div></div>', unsafe_allow_html=True)
-    st.markdown('<div class="hero-center"><div class="hero-title">AI What-if Engine</div><div class="hero-sub2">Сценарный прогноз спроса, выручки и прибыли на основе ML и эластичности</div></div>', unsafe_allow_html=True)
-    st.markdown('<div class="cta-glow">', unsafe_allow_html=True)
-    if st.button("▶ Перейти к загрузке данных", key="hero_start", use_container_width=False, type="primary"):
-        st.session_state.app_stage = "upload"
-        st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown(
-        """
-<div class="hero-kpis">
-  <div class="hero-kpi"><h4>🧠 Цель системы</h4><p>Построить честный what-if прогноз по выбранной серии и показать эффект сценариев на спрос, выручку и прибыль.</p></div>
-  <div class="hero-kpi"><h4>⚡ Скорость принятия решения</h4><p>Полный цикл от загрузки данных до KPI и сценарного анализа занимает несколько минут.</p></div>
-  <div class="hero-kpi"><h4>🛡️ Контроль риска</h4><p>Сценарии учитывают штрафы за нестабильность стратегии и неопределённость моделей.</p></div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown('<div class="section-title">Что делает модель</div>', unsafe_allow_html=True)
-    st.markdown(
-        """
-<div class="feature-grid">
-  <div class="fcard"><h5>🧹 Нормализация данных</h5><p>Автоматическая очистка выбросов, проверка схемы и подготовка стабильных признаков.</p></div>
-  <div class="fcard"><h5>📈 ML-прогноз спроса</h5><p>Ансамбль моделей оценивает спрос при разных ценах с учётом сезонности и лагов.</p></div>
-  <div class="fcard"><h5>🎯 Сценарная прибыль</h5><p>Оценка прибыльности заданных сценариев и контроль волатильности.</p></div>
-  <div class="fcard"><h5>🧪 What-if сценарии</h5><p>Сравнение гипотез в реальном времени без переобучения модели.</p></div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown('<div class="section-title" style="margin-top:14px;">Ключевые преимущества</div>', unsafe_allow_html=True)
-    st.markdown(
-        """
-<div class="feature-grid">
-  <div class="fcard"><h5>💸 Эффект сценария</h5><p>Сценарные параметры оцениваются на основе прогнозируемого спроса и ценовой эластичности.</p></div>
-  <div class="fcard"><h5>🧭 Прозрачные решения</h5><p>Все KPI, графики и отчёт доступны в одном интерфейсе без ручной сборки аналитики.</p></div>
-  <div class="fcard"><h5>📦 Готовый отчёт</h5><p>Excel-выгрузка содержит прогнозы, эластичность, метрики качества и кривую прибыли.</p></div>
-  <div class="fcard"><h5>🚀 Быстрое внедрение</h5><p>Поддержка разных входных схем CSV и ручного маппинга колонок без доработок кода.</p></div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div class="section-title" style="margin-top:16px;">Этапы работы модели</div>', unsafe_allow_html=True)
-    st.markdown(
-        """
-<div class="stage-row">
-  <div class="stage-item"><div class="stage-dot">1</div><span>Загрузка CSV</span></div>
-  <div class="stage-item"><div class="stage-dot">2</div><span>Валидация данных</span></div>
-  <div class="stage-item"><div class="stage-dot">3</div><span>Обучение ML</span></div>
-  <div class="stage-item"><div class="stage-dot">4</div><span>Сценарный расчёт</span></div>
-  <div class="stage-item"><div class="stage-dot">5</div><span>What-if анализ</span></div>
-  <div class="stage-item"><div class="stage-dot">6</div><span>Экспорт отчёта</span></div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        """
-<div class="deliverables-grid">
-  <div>
-    <div class="section-title">Используемые технологии</div>
-    <div class="tech-list">
-      <span class="tech-pill">🐍 Python 3</span><span class="tech-pill">🧠 CatBoost</span><span class="tech-pill">🌲 RandomForest</span><span class="tech-pill">📉 Ridge/Huber</span><span class="tech-pill">📊 Plotly</span><span class="tech-pill">🖥️ Streamlit</span>
-    </div>
-  </div>
-  <div>
-    <div class="section-title">Что вы получите после анализа</div>
-    <div class="deliver-item"><h5>1) Базовый и as-is прогноз</h5><p>Чёткое разделение нейтрального baseline и текущего сценария управления.</p></div>
-    <div class="deliver-item"><h5>2) Прогноз спроса</h5><p>Динамика спроса и фактических продаж с учётом ограничений и сценарных overrides.</p></div>
-    <div class="deliver-item"><h5>3) Эластичность и риск</h5><p>Помесячная чувствительность спроса к цене и комментарии для интерпретации.</p></div>
-  </div>
-</div>
-<div class="guide-box">
-  <ol>
-    <li>Загрузите Universal CSV c транзакциями.</li>
-    <li>Проверьте маппинг колонок в блоке «Сопоставление колонок (каноническая схема)».</li>
-    <li>Выберите категорию и SKU, затем нажмите «🚀 Запустить анализ».</li>
-  </ol>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    ctx = render_upload_block()
-else:
-    left_toolbar, right_toolbar = st.columns([1, 1])
-    with left_toolbar:
-        if st.button("🔄 Новая загрузка", use_container_width=True):
-            st.session_state.results = None
-            st.session_state.what_if_result = None
-            st.session_state.scenario_table = None
-            st.session_state.sensitivity_df = None
-            st.session_state.saved_scenarios = {}
-            st.session_state.app_stage = "landing"
-            st.rerun()
-    with right_toolbar:
-        has_results = st.session_state.results is not None
-        st.download_button("📥 Скачать полный Excel-отчёт", data=st.session_state.results["excel_buffer"] if has_results else b"", file_name=f"pricing_report_{st.session_state.get('selected_sku_for_results', 'report')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, disabled=not has_results)
-        if has_results:
-            report_payload = build_business_report_payload(
-                st.session_state.results,
-                st.session_state.what_if_result,
-                st.session_state.saved_scenarios,
-            )
-            st.download_button(
-                "📄 business_ready_report.json",
-                data=json.dumps(report_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-                file_name="business_ready_report.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-            st.caption("initial analysis artifacts")
-            st.download_button("🧾 analysis_run_summary.json", data=st.session_state.results.get("analysis_run_summary_json", b""), file_name="analysis_run_summary.json", mime="application/json", use_container_width=True)
-            st.download_button("📈 holdout_predictions.csv", data=st.session_state.results.get("holdout_predictions_csv", b""), file_name="holdout_predictions.csv", mime="text/csv", use_container_width=True)
-            st.download_button("🧭 holdout_weekly_diagnostics.csv", data=st.session_state.results.get("holdout_weekly_diagnostics_csv", b""), file_name="holdout_weekly_diagnostics.csv", mime="text/csv", use_container_width=True)
-            st.download_button("🧬 uplift_debug_report.csv", data=st.session_state.results.get("uplift_debug_report_csv", b""), file_name="uplift_debug_report.csv", mime="text/csv", use_container_width=True)
-            st.download_button("🛰️ uplift_holdout_trace.csv", data=st.session_state.results.get("uplift_holdout_trace_csv", b""), file_name="uplift_holdout_trace.csv", mime="text/csv", use_container_width=True)
-            st.download_button("🧪 analysis_baseline_vs_as_is.csv", data=st.session_state.results.get("analysis_baseline_vs_as_is_csv", b""), file_name="analysis_baseline_vs_as_is.csv", mime="text/csv", use_container_width=True)
-            st.download_button("🧩 feature_report.csv", data=st.session_state.results.get("feature_report_csv", b""), file_name="feature_report.csv", mime="text/csv", use_container_width=True)
-            if st.session_state.results.get("manual_scenario_summary_json") is not None:
-                st.caption("manual scenario artifacts")
-                st.download_button("🧾 manual_scenario_summary.json", data=st.session_state.results.get("manual_scenario_summary_json", b""), file_name="manual_scenario_summary.json", mime="application/json", use_container_width=True)
-                st.download_button("🧪 manual_scenario_daily.csv", data=st.session_state.results.get("manual_scenario_daily_csv", b""), file_name="manual_scenario_daily.csv", mime="text/csv", use_container_width=True)
-
+    ctx = {}
     if st.session_state.results is None:
-        ctx = render_upload_block()
+        ctx = render_upload_screen()
+        if ctx.get("run_requested"):
+            if ctx.get("universal_txn") is None or not ctx.get("schema_valid"):
+                st.error("Схема невалидна. Исправьте ошибки и повторите запуск.")
+            elif ctx.get("target_category") is None or ctx.get("target_sku") is None:
+                st.error("Выберите категорию и SKU для анализа.")
+            else:
+                with st.spinner("Выполняется расчет..."):
+                    results = run_full_pricing_analysis_universal(
+                        ctx["universal_txn"],
+                        ctx["target_category"],
+                        ctx["target_sku"],
+                    )
+                    st.session_state.results = copy.deepcopy(results)
+                    st.session_state.selected_category_for_results = ctx["target_category"]
+                    st.session_state.selected_sku_for_results = ctx["target_sku"]
+                    st.session_state.app_stage = "dashboard"
+                    st.rerun()
+        st.stop()
 
-if ctx and ctx.get("run_requested"):
-    load_mode = ctx.get("load_mode", "Universal CSV")
-    orders_file = ctx.get("orders_file")
-    items_file = ctx.get("items_file")
-    products_file = ctx.get("products_file")
-    reviews_file = ctx.get("reviews_file")
-    target_category = ctx["target_category"]
-    target_sku = ctx["target_sku"]
-    if load_mode == "Universal CSV" and ctx.get("universal_txn") is None:
-        st.error("Загрузите и сопоставьте universal CSV/XLSX.")
-    elif load_mode == "Universal CSV" and not bool(ctx.get("schema_valid", False)):
-        st.error("Схема данных невалидна. Исправьте ошибки маппинга/обязательных полей и запустите снова.")
-    elif target_category is None or target_sku is None:
-        st.error("Выберите категорию и SKU для анализа.")
-    else:
-        with st.spinner("Модель обучается…"):
-            try:
-                results = run_full_pricing_analysis_universal(
-                    ctx["universal_txn"],
-                    target_category,
-                    target_sku,
-                )
-                st.session_state.results = copy.deepcopy(results)
-                st.session_state.selected_category_for_results = target_category
-                st.session_state.selected_sku_for_results = target_sku
-                st.session_state.what_if_result = None
-                st.session_state.scenario_table = None
-                st.session_state.sensitivity_df = None
-                st.session_state.saved_scenarios = {}
-                st.session_state.app_stage = "dashboard"
-                st.rerun()
-            except Exception as e:
-                st.error(f"Ошибка анализа: {e}")
-
-if st.session_state.results is not None:
     r = st.session_state.results
     history_daily = r["history_daily"]
     current_forecast = r["as_is_forecast"]
-    scenario_forecast = r["scenario_forecast"] if r["scenario_forecast"] is not None else current_forecast
-    scenario_status_ui = "as_is"
-    if st.session_state.what_if_result is not None:
-        scenario_status_ui = str(st.session_state.what_if_result.get("scenario_status", "computed"))
     baseline_forecast = r["neutral_baseline_forecast"]
-    run_ts = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    st.markdown(
-        f"""
-<div class="cloud-card elevated">
-  <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;">
-    <div>
-      <div class="card-title">Active scenario instance</div>
-      <div class="muted">SKU: {st.session_state.get("selected_sku_for_results", "n/a")} • Category: {st.session_state.get("selected_category_for_results", "n/a")}</div>
-      <div class="chip-row">
-        <span class="chip active">Active path: legacy_baseline+scenario_recompute</span>
-        <span class="chip {'warn' if scenario_status_ui == 'as_is' else 'ok'}">Scenario status: {scenario_status_ui}</span>
-      </div>
-    </div>
-    <div style="text-align:right;">
-      <div class="muted">Run metadata</div>
-      <div style="font-size:1.05rem;font-weight:700;">{run_ts}</div>
-      <div class="muted">Confidence advisory only</div>
-    </div>
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
+    scenario_forecast = r["scenario_forecast"] if r["scenario_forecast"] is not None else current_forecast
+    last_update = pd.Timestamp.utcnow().strftime("%d.%m.%Y")
+    scenario_id = "SCN-014"
+    status_text = "Рассчитано"
+    status_color = "#7AD0A9"
+
+    render_object_header(
+        object_title=str(st.session_state.get("selected_sku_for_results", "SKU")),
+        status_text=status_text,
+        scenario_id=scenario_id,
+        horizon_text=f"{len(current_forecast)} дней",
+        last_update=last_update,
+        status_color=status_color,
     )
-    render_action_row(
-        [
-            ("↻", "Recalculate"),
-            ("⇄", "Compare scenarios"),
-            ("⇩", "Export report"),
-            ("⟲", "Reset scenario"),
-            ("◉", "Open diagnostics"),
-        ]
-    )
-    action_clicked = render_action_buttons(
-        [
-            ("recalculate", "↻", "Recalculate"),
-            ("compare", "⇄", "Compare"),
-            ("export", "⇩", "Export"),
-            ("reset", "⟲", "Reset"),
-            ("diagnostics", "◉", "Diagnostics"),
-        ]
-    )
-    if action_clicked == "recalculate":
-        st.toast("Измените параметры сценария и нажмите «Пересчитать сценарий».", icon="↻")
-    elif action_clicked == "compare":
-        st.session_state.active_workspace_tab = "Scenario"
-        st.toast("Открыт раздел сравнения сценариев.", icon="⇄")
-    elif action_clicked == "export":
-        st.session_state.active_workspace_tab = "Report"
-        st.toast("Откройте вкладку Report для выгрузки артефактов.", icon="⇩")
-    elif action_clicked == "diagnostics":
-        st.session_state.active_workspace_tab = "Diagnostics"
-        st.toast("Открыт раздел диагностики.", icon="◉")
-    elif action_clicked == "reset":
+    action_click = render_action_row()
+    if action_click == "new":
         st.session_state.what_if_result = None
-        st.session_state.scenario_table = None
-        st.session_state.sensitivity_df = None
-        st.session_state.saved_scenarios = {}
         r["scenario_forecast"] = None
         st.session_state.results = r
-        st.toast("Сценарий сброшен к as-is.", icon="⟲")
+        st.toast("Создан новый сценарий", icon="✚")
         st.rerun()
-    st.markdown('<div class="section-title">KPI и ключевой вывод</div>', unsafe_allow_html=True)
-    if r.get("warnings"):
-        for msg in r["warnings"]:
-            st.warning(msg)
-    run_summary_ui = json.loads(r.get("analysis_run_summary_json", b"{}").decode("utf-8")) if r.get("analysis_run_summary_json") else {}
-    contract_ui = (((run_summary_ui.get("config", {}) or {}).get("v1_contract", {})) or {})
-    if contract_ui:
-        st.info(
-            "Контракт v1: active path = legacy_baseline+scenario_recompute; "
-            "learned uplift = diagnostic only/inactive; "
-            "uplift used in production = false; "
-            "price/promo/freight применяются через baseline recalc + scenario engine (без double counting)."
+    elif action_click == "reset":
+        st.session_state.results = None
+        st.session_state.what_if_result = None
+        st.toast("Состояние сброшено", icon="⟲")
+        st.rerun()
+    elif action_click == "compare":
+        st.session_state.active_workspace_tab = "Сценарий"
+        st.rerun()
+    elif action_click == "export":
+        st.session_state.active_workspace_tab = "Отчет"
+        st.rerun()
+    elif action_click == "save":
+        st.toast("Сценарий сохранен в текущей сессии", icon="✓")
+
+    tabs = ["Дашборд", "Сценарий", "Факторы", "Диагностика", "Отчет"]
+    active_tab = render_tabs(st.session_state.active_workspace_tab, tabs)
+    st.session_state.active_workspace_tab = active_tab
+
+    base_units = float(current_forecast["actual_sales"].sum())
+    base_revenue = float(current_forecast["revenue"].sum())
+    base_profit = float(current_forecast["profit"].sum()) if "profit" in current_forecast.columns else float("nan")
+    sc_units = float(scenario_forecast["actual_sales"].sum())
+    sc_revenue = float(scenario_forecast["revenue"].sum())
+    sc_profit = float(scenario_forecast["profit"].sum()) if "profit" in scenario_forecast.columns else float("nan")
+
+    if active_tab == "Дашборд":
+        fig_d = go.Figure()
+        fig_d.add_trace(go.Scatter(x=baseline_forecast["date"], y=baseline_forecast["actual_sales"], name="База", line=dict(color="#9DCC84", width=2)))
+        fig_d.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["actual_sales"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
+        fig_d.update_layout(**_plot_layout("Спрос"))
+        render_chart_card("Спрос", "Горизонт · шт", fig_d, [("База", f"{base_units:,.0f}"), ("Сценарий", f"{sc_units:,.0f}"), ("Δ", f"{sc_units-base_units:+,.0f}")])
+
+        fig_r = go.Figure()
+        fig_r.add_trace(go.Scatter(x=baseline_forecast["date"], y=baseline_forecast["revenue"], name="База", line=dict(color="#9DCC84", width=2)))
+        fig_r.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["revenue"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
+        fig_r.update_layout(**_plot_layout("Выручка"))
+        render_chart_card("Выручка", "Горизонт · ₽", fig_r, [("База", f"₽ {base_revenue:,.0f}"), ("Сценарий", f"₽ {sc_revenue:,.0f}"), ("Δ", f"₽ {sc_revenue-base_revenue:+,.0f}")])
+
+        fig_p = go.Figure()
+        fig_p.add_trace(go.Scatter(x=baseline_forecast["date"], y=baseline_forecast["profit"], name="База", line=dict(color="#9DCC84", width=2), fill="tozeroy"))
+        fig_p.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["profit"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
+        fig_p.update_layout(**_plot_layout("Прибыль"))
+        render_chart_card("Прибыль", "Горизонт · ₽", fig_p, [("База", f"₽ {base_profit:,.0f}"), ("Сценарий", f"₽ {sc_profit:,.0f}"), ("Δ", f"₽ {sc_profit-base_profit:+,.0f}")])
+
+        effect_pct = ((sc_units - base_units) / base_units * 100) if base_units else 0.0
+        render_metric_summary_card(
+            "Итог сценария",
+            f"{effect_pct:+.1f}%",
+            "Изменение спроса к базе",
+            [("База", f"{base_units:,.0f}"), ("Сценарий", f"{sc_units:,.0f}"), ("Δ", f"{sc_units-base_units:+,.0f}")],
         )
-    if scenario_status_ui == "as_is":
-        st.info("Сценарий не изменён: используются as-is значения.")
-    scenario_summary_ui = (run_summary_ui.get("scenario_output_summary", {}) or {})
-    manual_summary_ui = {}
-    if r.get("manual_scenario_summary_json"):
-        try:
-            manual_summary_ui = json.loads(r["manual_scenario_summary_json"].decode("utf-8"))
-        except Exception:
-            manual_summary_ui = {}
-    scenario_result_ui = manual_summary_ui if str(manual_summary_ui.get("scenario_status", "")) == "executed" else scenario_summary_ui
-    factor_contract_ui = ((run_summary_ui.get("config", {}) or {}).get("factor_contract", {}) or {})
-    st.markdown(
-        "This is a transparent what-if forecasting and decision-support tool. "
-        "It estimates scenario impact from historical patterns and selected factors; "
-        "it is not a fully autonomous pricing AI."
-    )
-    trust_block = build_trust_block(r, st.session_state.what_if_result)
-    baseline_units_total = float(baseline_forecast["actual_sales"].sum())
-    baseline_revenue_total = float(baseline_forecast["revenue"].sum())
-    baseline_profit_total = float(baseline_forecast["profit"].sum()) if "profit" in baseline_forecast.columns else float("nan")
-    as_is_units_total = float(current_forecast["actual_sales"].sum())
-    as_is_revenue_total = float(current_forecast["revenue"].sum())
-    as_is_profit_total = float(current_forecast["profit"].sum()) if "profit" in current_forecast.columns else float("nan")
-    scenario_live = st.session_state.what_if_result
-    scenario_units_total = float(scenario_live["demand_total"]) if scenario_live else as_is_units_total
-    scenario_revenue_total = float(scenario_live["revenue_total"]) if scenario_live else as_is_revenue_total
-    scenario_profit_total = float(scenario_live["profit_total_adjusted"]) if scenario_live else as_is_profit_total
-    show_margin = bool(r.get("cost_input_available", False))
-    kpi_items = [
-        {"label": "Active forecast (units)", "value": f"{scenario_units_total:,.1f}", "delta": f"as-is: {as_is_units_total:,.1f}", "positive": True},
-        {"label": "Scenario revenue", "value": f"₽ {scenario_revenue_total:,.0f}", "delta": f"Δ ₽ {scenario_revenue_total - as_is_revenue_total:+,.0f}", "positive": scenario_revenue_total >= as_is_revenue_total},
-        {"label": "Scenario delta units", "value": f"{scenario_units_total - as_is_units_total:+,.1f}", "delta": "vs as-is", "positive": (scenario_units_total - as_is_units_total) >= 0},
-        {"label": "Data quality", "value": str(trust_block['data_sufficiency']).upper(), "delta": str(trust_block['scenario_range_status']), "positive": trust_block["data_sufficiency"] == "enough"},
-        {"label": "Active model path", "value": "Legacy baseline", "delta": "production baseline", "positive": True},
-    ]
-    if show_margin:
-        kpi_items[1] = {"label": "Scenario gross profit", "value": f"₽ {scenario_profit_total:,.0f}", "delta": f"Δ ₽ {scenario_profit_total - as_is_profit_total:+,.0f}", "positive": scenario_profit_total >= as_is_profit_total}
-    render_kpi_cards(kpi_items)
-    if not show_margin:
-        st.info("Margin/profit unavailable: required cost fields missing.")
-    st.markdown("#### Quality / trust")
-    render_chip_row(
-        [
-            (f"Data: {trust_block['data_sufficiency']}", "ok" if trust_block["data_sufficiency"] == "enough" else "warn"),
-            (f"Range: {trust_block['scenario_range_status']}", "ok" if trust_block["scenario_range_status"] == "in_range" else "warn"),
-            (f"Fallback: {trust_block['fallback_used']}", "warn" if trust_block["fallback_used"] else "ok"),
-            (f"Mode: {trust_block['active_calculation_mode']}", "active"),
-        ]
-    )
-    st.write(
-        {
-            "data_sufficiency": trust_block["data_sufficiency"],
-            "scenario_range_status": trust_block["scenario_range_status"],
-            "active_calculation_mode": trust_block["active_calculation_mode"],
-            "fallback_used": trust_block["fallback_used"],
-        }
-    )
-    for warn_msg in trust_block.get("warnings", []):
-        st.warning(warn_msg)
-    st.markdown("### 1) Активный контракт расчета")
-    st.write({
-        "active_path": scenario_summary_ui.get("active_path_contract", "legacy_baseline+scenario_recompute"),
-        "uplift_status": scenario_summary_ui.get("learned_uplift_contract", "inactive_production_diagnostic_only"),
-        "scenario_mode": scenario_summary_ui.get("scenario_driver_mode", "unknown"),
-        "holdout_support_status": scenario_summary_ui.get("holdout_support_status", "unknown"),
-    })
-    st.markdown("### 2) Качество holdout")
-    st.write({
-        "WAPE": scenario_summary_ui.get("wape_final"),
-        "MAPE": scenario_summary_ui.get("mape_final"),
-        "Corr": scenario_summary_ui.get("corr_final"),
-        "Std ratio": scenario_summary_ui.get("std_ratio_final"),
-        "flat_or_shape_warning": scenario_summary_ui.get("shape_quality_low"),
-    })
-    std_ratio_ui = scenario_summary_ui.get("std_ratio_final")
-    shape_quality_ui = bool(scenario_summary_ui.get("shape_quality_low", False))
-    if shape_quality_ui or (pd.notna(std_ratio_ui) and float(std_ratio_ui) < 0.5):
-        st.warning("Forecast shape is flatter than actual demand; use scenario results as directional, not exact.")
-    st.markdown("### 3) Что влияет сейчас")
-    cfa, cfb, cfc = st.columns(3)
-    with cfa:
-        st.caption("Active model")
-        st.write(factor_contract_ui.get("active_model_factors", []))
-    with cfb:
-        st.caption("Scenario layer")
-        st.write(factor_contract_ui.get("scenario_only_factors", []))
-    with cfc:
-        st.caption("Attempted, but disabled by gate")
-        st.write(factor_contract_ui.get("attempted_but_disabled_factors", []))
-    st.markdown("### 4) Сценарный результат")
-    scenario_demand_total_ui = scenario_result_ui.get("scenario_demand_total", float("nan"))
-    scenario_revenue_total_ui = scenario_result_ui.get("scenario_revenue_total", float("nan"))
-    scenario_profit_total_ui = scenario_result_ui.get("scenario_profit_total", float("nan"))
-    as_is_demand_total_ui = float(current_forecast["actual_sales"].sum()) if current_forecast is not None else float("nan")
-    as_is_revenue_total_ui = float(current_forecast["revenue"].sum()) if current_forecast is not None else float("nan")
-    as_is_profit_total_ui = float(current_forecast["profit"].sum()) if current_forecast is not None else float("nan")
-    st.write({
-        "as_is_totals": {
-            "demand": as_is_demand_total_ui,
-            "revenue": as_is_revenue_total_ui,
-            "profit": as_is_profit_total_ui,
-        },
-        "scenario_totals": {
-            "demand": scenario_demand_total_ui,
-            "revenue": scenario_revenue_total_ui,
-            "profit": scenario_profit_total_ui,
-        },
-        "delta_vs_as_is": {
-            "demand": (scenario_demand_total_ui - as_is_demand_total_ui) if pd.notna(scenario_demand_total_ui) else None,
-            "profit": (scenario_profit_total_ui - as_is_profit_total_ui) if pd.notna(scenario_profit_total_ui) else None,
-        },
-        "scenario_status": scenario_result_ui.get("scenario_status", "as_is"),
-        "clip_warning": {
-            "requested_price": scenario_result_ui.get("requested_price"),
-            "model_price": scenario_result_ui.get("model_price"),
-            "clip_applied": scenario_result_ui.get("clip_applied"),
-            "clip_reason": scenario_result_ui.get("clip_reason"),
-        } if scenario_result_ui else None,
-    })
-    st.markdown('<div class="micro-note">Цель интерфейса — показать baseline/as-is и эффект what-if сценариев без ложной оптимизационной ветки.</div>', unsafe_allow_html=True)
-    k1, k2, k3, k4 = st.columns(4)
-    current_price = float(r["current_price"])
-    raw_scenario_price = r.get("scenario_price_modeled", r.get("scenario_price"))
-    scenario_price_display = float(raw_scenario_price) if raw_scenario_price is not None and np.isfinite(raw_scenario_price) else float(r.get("current_price", 0.0))
-    delta_pct = ((scenario_price_display - current_price) / current_price * 100) if current_price else 0.0
 
-    with k1: _metric_card("Текущая цена", f"₽ {current_price:,.2f}", "База", True, history_daily["price"], "#FF8A00")
-    with k2: _metric_card("Сценарная цена", f"₽ {scenario_price_display:,.2f}", f"{delta_pct:+.2f}%", delta_pct >= 0, (scenario_forecast["actual_sales"] if scenario_forecast is not None else current_forecast["actual_sales"]), "#00D4FF")
-    with k3:
-        _metric_card(
-            "Текущая прибыль (as-is)",
-            f"₽ {float(r['current_profit']):,.0f}",
-            "без оптимизатора",
-            True,
-            current_forecast["profit"],
-            "#E400FF",
-        )
-    with k4:
-        elast = list(r["elasticity_map"].values())[-1] if len(r["elasticity_map"]) else np.nan
-        _metric_card("Эластичность", f"{elast:.2f}" if np.isfinite(elast) else "n/a", "последний месяц", True, history_daily["sales"], "#FFFFFF")
+        recommendation = "применять" if sc_profit >= base_profit else "не применять"
+        render_insight_card([
+            f"Спрос: {effect_pct:+.1f}%",
+            f"Выручка: ₽ {sc_revenue-base_revenue:+,.0f}",
+            f"Прибыль: ₽ {sc_profit-base_profit:+,.0f}",
+            f"Рекомендация: {recommendation}",
+        ])
 
-    left, center, right = st.columns([1.35, 1.35, 1.0], gap="large")
+    elif active_tab == "Сценарий":
+        open_surface("Параметры сценария")
+        manual_price = st.number_input("Изменение цены", min_value=0.01, value=float(r["current_price"]), step=1.0, key="what_if_price")
+        discount = st.slider("Скидка", 0.0, 0.95, float(r["_trained_bundle"]["base_ctx"].get("discount", 0.0)), 0.01)
+        promo_value = st.slider("Интенсивность промо", 0.0, 1.0, float(np.clip(r["_trained_bundle"]["base_ctx"].get("promotion", 0.0), 0.0, 1.0)), 0.05)
+        freight_mult = st.slider("Шок-факторы", 0.5, 1.5, 1.0, 0.05)
+        demand_mult = st.slider("Управляемые факторы", 0.7, 1.3, 1.0, 0.05)
+        hdays = st.slider("Горизонт", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
+        c1, c2 = st.columns(2)
+        apply_btn = c1.button("Применить сценарий", type="primary", use_container_width=True)
+        reset_btn = c2.button("Сбросить сценарий", use_container_width=True)
+        close_surface()
 
-    with left:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        fig_f = go.Figure()
-        fig_f.add_trace(go.Scatter(x=baseline_forecast["date"], y=baseline_forecast["actual_sales"], name="Neutral baseline", line=dict(color="#FFFFFF", width=2.6)))
-        fig_f.add_trace(go.Scatter(x=current_forecast["date"], y=current_forecast["actual_sales"], name="As-is", line=dict(color="#00D4FF", width=2.2)))
-        if scenario_forecast is not None:
-            fig_f.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["actual_sales"], name="Scenario", line=dict(color="#FF8A00", width=3)))
-        fig_f.update_layout(**_base_plotly_layout("Прогноз спроса на 30 дней"), dragmode="pan")
-        st.plotly_chart(fig_f, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
-        st.caption("Сравнение baseline и as-is по фактическим продажам на горизонте.")
-        if scenario_forecast is not None:
-            table = current_forecast[["date", "actual_sales"]].rename(columns={"actual_sales":"current"}).merge(scenario_forecast[["date", "actual_sales"]].rename(columns={"actual_sales":"scenario"}), on="date", how="outer")
-            table["delta_sales"] = table["scenario"] - table["current"]
-        else:
-            table = current_forecast[["date", "actual_sales"]].rename(columns={"actual_sales": "current"})
-            table["scenario"] = np.nan
-            table["delta_sales"] = np.nan
-        st.dataframe(table, use_container_width=True, height=220)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with center:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        em = pd.DataFrame(list(r["elasticity_map"].items()), columns=["month", "elasticity"])
-        elasticity_mean = float(em["elasticity"].mean()) if len(em) else np.nan
-        elasticity_zone = "эластичный спрос" if np.isfinite(elasticity_mean) and elasticity_mean <= -1 else "слабоэластичный спрос"
-        fig_e = go.Figure()
-        fig_e.add_trace(go.Bar(x=em["month"], y=em["elasticity"], name="Эластичность", marker_color="#E400FF", opacity=.58))
-        fig_e.add_trace(go.Scatter(x=em["month"], y=em["elasticity"], mode="lines+markers", name="Тренд", line=dict(color="#00D4FF", width=2.4)))
-        if np.isfinite(elasticity_mean):
-            fig_e.add_hline(y=elasticity_mean, line_dash="dot", line_color="#FFD166", annotation_text=f"Среднее: {elasticity_mean:.2f}")
-        fig_e.add_hrect(y0=-5, y1=-1, fillcolor="rgba(0,212,255,0.08)", line_width=0)
-        fig_e.add_hrect(y0=-1, y1=0, fillcolor="rgba(255,138,0,0.08)", line_width=0)
-        fig_e.update_layout(**_base_plotly_layout("Эластичность спроса по месяцам"), dragmode="pan")
-        st.plotly_chart(fig_e, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
-        st.caption(f"Интерпретация: зона [-5; -1] — эластичный спрос, зона (-1; 0] — слабоэластичный. Сейчас: {elasticity_zone}.")
-
-        st.markdown(
-            '<div class="micro-note">Ограничение v1: shape может быть плоской (shape_quality_low). '
-            'Confidence носит advisory-характер и не является гарантией.</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with right:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("### Scenario editor")
-        st.markdown('<div class="micro-note">Price / Promo / Freight / Shock factor считаются на уже обученном бандле (без переобучения).</div>', unsafe_allow_html=True)
-        st.markdown('<div class="cloud-card elevated">', unsafe_allow_html=True)
-        st.markdown("**Price**")
-        manual_price = st.number_input("Scenario value (₽)", min_value=0.01, value=float(r["current_price"]), step=1.0, key="what_if_price")
-        st.caption(f"Current value: ₽ {float(r['current_price']):,.2f}")
-        st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('<div class="cloud-card elevated">', unsafe_allow_html=True)
-        st.markdown("**Promo**")
-        promo_value = st.slider(
-            "Scenario value",
-            0.0,
-            1.0,
-            float(np.clip(r["_trained_bundle"]["base_ctx"].get("promotion", 0.0), 0.0, 1.0)),
-            0.05,
-            key="what_if_promo",
-        )
-        st.caption(f"Current value: {float(np.clip(r['_trained_bundle']['base_ctx'].get('promotion', 0.0), 0.0, 1.0)):.2f}")
-        st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('<div class="cloud-card elevated">', unsafe_allow_html=True)
-        st.markdown("**Freight**")
-        freight_mult = st.slider("Scenario multiplier", 0.5, 1.5, 1.0, 0.05, key="what_if_freight")
-        st.caption("Current value: 1.00x")
-        st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('<div class="cloud-card elevated">', unsafe_allow_html=True)
-        st.markdown("**Shock factor**")
-        demand_mult = st.slider("Scenario multiplier", 0.7, 1.3, 1.0, 0.05, key="what_if_demand")
-        st.caption("Current value: 1.00x")
-        st.markdown('</div>', unsafe_allow_html=True)
-        horizon_days = st.slider("Горизонт прогноза (дней)", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
-
-        if st.button("Пересчитать сценарий", use_container_width=True):
+        if apply_btn:
             st.session_state.what_if_result = run_what_if_projection(
                 r["_trained_bundle"],
                 manual_price=float(manual_price),
                 freight_multiplier=float(freight_mult),
                 demand_multiplier=float(demand_mult),
-                horizon_days=int(horizon_days),
-                overrides={"promotion": float(promo_value)},
+                horizon_days=int(hdays),
+                overrides={"promotion": float(promo_value), "discount": float(discount)},
             )
-            if st.session_state.what_if_result is not None:
-                wr = st.session_state.what_if_result
-                r["scenario_forecast"] = wr["daily"].copy()
-                r["scenario_price_requested"] = float(wr.get("requested_price", manual_price))
-                r["scenario_price_modeled"] = float(wr.get("model_price", wr.get("price_for_model", manual_price)))
-                r["scenario_price"] = r["scenario_price_modeled"]
-                r["manual_scenario_summary_json"], r["manual_scenario_daily_csv"] = build_manual_scenario_artifacts(r, wr)
-                st.session_state.results = r
-                st.rerun()
-
-        if st.session_state.what_if_result is not None:
-            w = st.session_state.what_if_result
-            base = current_forecast[["date", "actual_sales"]].rename(columns={"actual_sales": "base"})
-            wf = w["daily"][["date", "actual_sales", "profit"]].rename(columns={"actual_sales": "what_if"})
-            wt = base.merge(wf, on="date", how="outer").sort_values("date")
-            fig_wd = go.Figure()
-            fig_wd.add_trace(go.Scatter(x=wt["date"], y=wt["base"], name="Базовый", line=dict(color="#FFFFFF", width=2)))
-            fig_wd.add_trace(go.Scatter(x=wt["date"], y=wt["what_if"], name="What-if", line=dict(color="#00D4FF", width=2.8)))
-            fig_wd.update_layout(**_base_plotly_layout("Спрос: What-if vs База"), height=260, dragmode="pan")
-            st.plotly_chart(fig_wd, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
-
-            fig_wp = px.line(wf, x="date", y="profit", template="plotly_dark")
-            fig_wp.update_traces(line_color="#FF8A00", line_width=2.8)
-            fig_wp.update_layout(**_base_plotly_layout("Прогноз прибыли"), height=240, dragmode="pan")
-            st.plotly_chart(fig_wp, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
-
-            delta_d = float(w["demand_total"] - base["base"].sum())
-            delta_p = float(w["profit_total_adjusted"] - r["current_profit"])
-            delta_r = float(w["revenue_total"] - current_forecast["revenue"].sum())
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Δ Спрос", f"{delta_d:+.1f}")
-            m2.metric("Δ Прибыль", f"₽ {delta_p:+,.0f}")
-            m3.metric("Δ Выручка", f"₽ {delta_r:+,.0f}")
-            st.markdown("**Scenario inputs summary**")
-            st.write(w.get("scenario_inputs_contract", {}))
-            st.markdown(
-                f"Изменение сценария: price {w.get('scenario_inputs_contract', {}).get('base_price', np.nan):.2f} → "
-                f"{w.get('scenario_inputs_contract', {}).get('scenario_price', np.nan):.2f}, "
-                f"promo {w.get('scenario_inputs_contract', {}).get('base_promo', np.nan):.2f} → "
-                f"{w.get('scenario_inputs_contract', {}).get('scenario_promo', np.nan):.2f}, "
-                f"freight {w.get('scenario_inputs_contract', {}).get('base_freight', np.nan):.2f} → "
-                f"{w.get('scenario_inputs_contract', {}).get('scenario_freight', np.nan):.2f}."
-            )
-            st.caption(
-                f"Requested price: {w['requested_price']:.2f} | Modeled price: {w.get('model_price', w.get('price_for_model', np.nan)):.2f} | "
-                f"Profit raw: {w['profit_total_raw']:.0f} | Profit adjusted: {w['profit_total_adjusted']:.0f} | "
-                f"Penalty: {w['uncertainty_penalty']:.0f}"
-            )
-            if w.get("ood_flag") or w.get("clip_applied") or w.get("price_clipped"):
-                st.warning(
-                    "clip_applied=true | "
-                    f"clip_reason={w.get('clip_reason', '')} | "
-                    f"requested_price={w.get('requested_price', np.nan):.2f} | "
-                    f"price_for_model={w.get('model_price', w.get('price_for_model', np.nan)):.2f} | "
-                    f"current_price_raw={w.get('current_price_raw', np.nan):.2f} | "
-                    f"scenario_price_effect_source={w.get('scenario_price_effect_source', '')}"
-                )
-            save_a, save_b, save_c = st.columns(3)
-            if save_a.button("Save as Scenario A", use_container_width=True):
-                st.session_state.saved_scenarios["Scenario A"] = {
-                    "units": float(w["demand_total"]),
-                    "revenue": float(w["revenue_total"]),
-                    "profit": float(w["profit_total_adjusted"]),
-                    "delta_units": float(w["demand_total"] - current_forecast["actual_sales"].sum()),
-                    "delta_revenue": float(w["revenue_total"] - current_forecast["revenue"].sum()),
-                    "delta_profit": float(w["profit_total_adjusted"] - current_forecast["profit"].sum()),
-                }
-            if save_b.button("Save as Scenario B", use_container_width=True):
-                st.session_state.saved_scenarios["Scenario B"] = {
-                    "units": float(w["demand_total"]),
-                    "revenue": float(w["revenue_total"]),
-                    "profit": float(w["profit_total_adjusted"]),
-                    "delta_units": float(w["demand_total"] - current_forecast["actual_sales"].sum()),
-                    "delta_revenue": float(w["revenue_total"] - current_forecast["revenue"].sum()),
-                    "delta_profit": float(w["profit_total_adjusted"] - current_forecast["profit"].sum()),
-                }
-            if save_c.button("Save as Scenario C", use_container_width=True):
-                st.session_state.saved_scenarios["Scenario C"] = {
-                    "units": float(w["demand_total"]),
-                    "revenue": float(w["revenue_total"]),
-                    "profit": float(w["profit_total_adjusted"]),
-                    "delta_units": float(w["demand_total"] - current_forecast["actual_sales"].sum()),
-                    "delta_revenue": float(w["revenue_total"] - current_forecast["revenue"].sum()),
-                    "delta_profit": float(w["profit_total_adjusted"] - current_forecast["profit"].sum()),
-                }
-            st.markdown('<div class="micro-note">Положительные дельты показывают улучшение относительно базового сценария.</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("### Scenario comparison table")
-    compare_df = build_scenario_comparison_table(current_forecast, st.session_state.saved_scenarios, show_margin)
-    st.dataframe(compare_df, use_container_width=True, height=180)
-
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.markdown("### What-if панель: baseline + 3 сценария")
-    base_price = float(r["current_price"])
-    scen_cols = st.columns(4)
-    scenario_inputs = []
-    default_names = ["Baseline", "Scenario A", "Scenario B", "Scenario C"]
-    default_price_mult = [1.0, 1.03, 0.97, 1.08]
-    for i, col in enumerate(scen_cols):
-        with col:
-            st.markdown(f"**{default_names[i]}**")
-            p = st.number_input(f"Price x{i}", value=base_price * default_price_mult[i], min_value=0.01, step=0.1, key=f"sc_price_{i}")
-            d = st.slider(f"Demand x{i}", 0.7, 1.3, 1.0, 0.05, key=f"sc_demand_{i}")
-            f = st.slider(f"Freight x{i}", 0.5, 1.5, 1.0, 0.05, key=f"sc_freight_{i}")
-            c = st.slider(f"Cost x{i}", 0.7, 1.3, 1.0, 0.05, key=f"sc_cost_{i}")
-            h = st.slider(f"Horizon x{i}", 7, 90, 30, 1, key=f"sc_hor_{i}")
-            scenario_inputs.append({"name": default_names[i], "price": p, "demand_multiplier": d, "freight_multiplier": f, "cost_multiplier": c, "discount_multiplier": 1.0, "horizon_days": h, "overrides": {"discount_multiplier": 1.0}})
-    if st.button("Сравнить 4 сценария", use_container_width=True):
-        st.session_state.scenario_table = run_scenario_set(r["_trained_bundle"], scenario_inputs, run_what_if_projection)
-        st.session_state.sensitivity_df = build_sensitivity_grid(r["_trained_bundle"], base_price=base_price, runner=run_what_if_projection)
-    if st.session_state.get("scenario_table") is not None:
-        sc_df = st.session_state.scenario_table.copy()
-        st.dataframe(sc_df, use_container_width=True, height=210)
-        fig_sc = px.bar(sc_df, x="scenario", y=["profit", "revenue", "sales"], barmode="group", template="plotly_dark")
-        fig_sc.update_layout(**_base_plotly_layout("Сравнение сценариев"))
-        st.plotly_chart(fig_sc, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
-    if st.session_state.get("sensitivity_df") is not None:
-        sens = st.session_state.sensitivity_df.copy()
-        fig_heat = px.density_heatmap(sens, x="price", y="demand_multiplier", z="profit_adjusted", nbinsx=14, nbinsy=14, template="plotly_dark", color_continuous_scale="RdYlGn")
-        fig_heat.update_layout(**_base_plotly_layout("Sensitivity: price × demand multiplier"))
-        st.plotly_chart(fig_heat, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    selected_section = st.radio(
-        "Workspace",
-        ["Dashboard", "Scenario", "Results", "Diagnostics", "Report"],
-        index=["Dashboard", "Scenario", "Results", "Diagnostics", "Report"].index(st.session_state.get("active_workspace_tab", "Dashboard")),
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    st.session_state.active_workspace_tab = selected_section
-    if selected_section == "Dashboard":
-        fig_h = go.Figure()
-        fig_h.add_trace(go.Scatter(x=history_daily["date"], y=history_daily["sales"], name="Продажи", line=dict(color="#00D4FF", width=2.6), yaxis="y1"))
-        fig_h.add_trace(go.Scatter(x=history_daily["date"], y=history_daily["price"], name="Цена", line=dict(color="#FF8A00", width=2.2), yaxis="y2"))
-        fig_h.update_layout(**_base_plotly_layout("История продаж и цены"), yaxis=dict(title="Продажи"), yaxis2=dict(title="Цена", overlaying="y", side="right"), dragmode="pan")
-        st.plotly_chart(fig_h, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
-        st.caption("Динамика цены и объёма продаж на одной шкале времени.")
-    elif selected_section == "Scenario":
-        st.markdown("#### Scenario editor status")
-        st.markdown("Карточки и инпуты сценария расположены в блоке **What-if: ручной сценарий** выше; изменения применяются без переобучения.")
-        st.info("Используйте Price / Promo / Freight / Shock factor, затем «Пересчитать сценарий».")
-        if st.session_state.what_if_result is not None:
-            st.write(st.session_state.what_if_result.get("scenario_inputs_contract", {}))
-        else:
-            st.warning("Сценарий пока не запущен.")
-    elif selected_section == "Results":
-        scenario_table_src = scenario_forecast if scenario_forecast is not None else current_forecast.copy()
-        full_table = current_forecast[["date", "actual_sales", "revenue", "profit"]].rename(
-            columns={"actual_sales": "sales_current", "revenue": "revenue_current", "profit": "profit_current"}
-        ).merge(
-            scenario_table_src[["date", "actual_sales", "revenue", "profit"]].rename(
-                columns={"actual_sales": "sales_scenario", "revenue": "revenue_scenario", "profit": "profit_scenario"}
-            ),
-            on="date",
-            how="outer",
-        )
-        full_table["delta_sales"] = full_table["sales_scenario"] - full_table["sales_current"]
-        full_table["delta_revenue"] = full_table["revenue_scenario"] - full_table["revenue_current"]
-        full_table["delta_profit"] = full_table["profit_scenario"] - full_table["profit_current"]
-        st.dataframe(full_table, use_container_width=True, height=320)
-    elif selected_section == "Diagnostics":
-        metric_df = r["holdout_metrics"].copy()
-        st.dataframe(metric_df, use_container_width=True)
-        st.caption("MAPE/WAPE/RMSE показывают среднюю ошибку модели на отложенной выборке.")
-        if "feature_report" in r:
-            st.markdown("**Feature usage diagnostics**")
-            st.dataframe(r["feature_report"], use_container_width=True)
-            st.caption(
-                "found_in_raw — фактор был в нормализованном сыром источнике; "
-                "present_in_daily — дошёл до дневного ряда; "
-                "engineered_feature — создан внутри пайплайна; "
-                "used_in_* — фактическое использование в активной модели."
-            )
-        with st.expander("Advanced raw debug JSON"):
-            st.json(run_summary_ui)
-    elif selected_section == "Report":
-        elast_df = pd.DataFrame(list(r["elasticity_map"].items()), columns=["month", "elasticity"])
-        st.markdown("#### Report summary")
-        st.dataframe(elast_df, use_container_width=True, height=200)
-        fig_ed = px.bar(elast_df, x="month", y="elasticity", template="plotly_dark")
-        fig_ed.update_traces(marker_color="#E400FF")
-        fig_ed.update_layout(**_base_plotly_layout("Детальная эластичность"), dragmode="pan")
-        st.plotly_chart(fig_ed, use_container_width=True, config=PLOTLY_WORKSPACE_CONFIG)
-        st.caption(f"Timestamp: {run_ts}")
-
-    cta1, cta2 = st.columns(2)
-    with cta1:
-        st.markdown('<div class="big-cta"><h3>Готово к внедрению</h3></div>', unsafe_allow_html=True)
-        if st.button("✅ Применить сценарные параметры", use_container_width=True):
-            st.toast("Сценарная цена отмечена к применению", icon="🎯")
-    with cta2:
-        if st.button("🔄 Новая загрузка", use_container_width=True, key="new_upload_bottom"):
-            st.session_state.results = None
+            wr = st.session_state.what_if_result
+            r["scenario_forecast"] = wr["daily"].copy()
+            r["scenario_price_requested"] = float(wr.get("requested_price", manual_price))
+            r["scenario_price_modeled"] = float(wr.get("model_price", wr.get("price_for_model", manual_price)))
+            r["scenario_price"] = r["scenario_price_modeled"]
+            r["manual_scenario_summary_json"], r["manual_scenario_daily_csv"] = build_manual_scenario_artifacts(r, wr)
+            st.session_state.results = r
+            st.rerun()
+        if reset_btn:
             st.session_state.what_if_result = None
-            st.session_state.scenario_table = None
-            st.session_state.sensitivity_df = None
-            st.session_state.saved_scenarios = {}
-            st.session_state.app_stage = "landing"
+            r["scenario_forecast"] = None
+            st.session_state.results = r
             st.rerun()
 
-st.caption("AI What-if Engine • Streamlit • Plotly")
+        wr = st.session_state.what_if_result
+        demand_delta = (float(wr["demand_total"]) - base_units) if wr is not None else sc_units - base_units
+        revenue_delta = (float(wr["revenue_total"]) - base_revenue) if wr is not None else sc_revenue - base_revenue
+        profit_delta = (float(wr["profit_total_adjusted"]) - base_profit) if wr is not None else sc_profit - base_profit
+        margin_delta = ((sc_profit / max(sc_revenue, 1e-9)) - (base_profit / max(base_revenue, 1e-9))) * 100
+
+        render_metric_summary_card("Эффект сценария", f"{demand_delta:+,.1f}", "Δ спроса", [("Δ выручки", f"₽ {revenue_delta:+,.0f}"), ("Δ прибыли", f"₽ {profit_delta:+,.0f}"), ("Δ маржи", f"{margin_delta:+.2f} п.п.")])
+
+        compare_df = build_scenario_comparison_table(current_forecast, st.session_state.saved_scenarios, True)
+        render_compare_card(compare_df)
+
+        open_surface("Чувствительность")
+        sens = build_sensitivity_grid(r["_trained_bundle"], base_price=float(r["current_price"]), runner=run_what_if_projection).head(5)
+        fig_s = px.bar(sens, x="price", y="profit_adjusted", color_discrete_sequence=["#6F70FF"])
+        fig_s.update_layout(**_plot_layout("Чувствительность"))
+        st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False})
+        close_surface()
+
+    elif active_tab == "Факторы":
+        factor_report = r.get("feature_report", pd.DataFrame())
+        used = factor_report[factor_report.get("used_in_active_model", False) == True]["feature"].tolist() if len(factor_report) else []
+        changed = []
+        if st.session_state.what_if_result is not None:
+            c = st.session_state.what_if_result.get("scenario_inputs_contract", {})
+            for k in ["base_price", "scenario_price", "base_promo", "scenario_promo", "base_freight", "scenario_freight"]:
+                if k in c:
+                    changed.append((k, c[k]))
+
+        render_report_card("Используемые факторы", used[:12] if used else ["Факторы будут показаны после расчета"]) 
+        render_report_card("Управляемые факторы", ["цена — целевая цена", "промо — интенсивность промо", "управляемые входы — ручные множители"]) 
+        render_report_card("Внешние факторы", ["сезонность — сезонность", "внешний рынок — внешний спрос", "погода/праздники — календарные эффекты (если есть)"]) 
+        render_report_card("Изменено в сценарии", [f"{k}: {v}" for k, v in changed] if changed else ["Изменений пока нет"]) 
+
+    elif active_tab == "Диагностика":
+        holdout = r.get("holdout_metrics", pd.DataFrame())
+        c1, c2, c3, c4 = st.columns(4)
+        wape = float(holdout.get("wape", pd.Series([np.nan])).iloc[0]) if len(holdout) else np.nan
+        mape = float(holdout.get("mape", pd.Series([np.nan])).iloc[0]) if len(holdout) else np.nan
+        with c1:
+            st.metric("WAPE", f"{wape:.3f}" if np.isfinite(wape) else "n/a")
+        with c2:
+            st.metric("MAPE", f"{mape:.3f}" if np.isfinite(mape) else "n/a")
+        with c3:
+            st.metric("holdout", "ok" if len(holdout) else "n/a")
+        with c4:
+            st.metric("Качество", str(build_trust_block(r, st.session_state.what_if_result).get("data_sufficiency", "n/a")))
+
+        render_warning_card(r.get("warnings", []))
+
+        open_surface("Диагностический график")
+        fig_h = go.Figure()
+        fig_h.add_trace(go.Scatter(x=history_daily["date"], y=history_daily["sales"], name="Факт", line=dict(color="#9DCC84", width=2)))
+        fig_h.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["actual_sales"], name="Прогноз", line=dict(color="#6F70FF", width=2.4)))
+        fig_h.update_layout(**_plot_layout("Факт vs прогноз"))
+        st.plotly_chart(fig_h, use_container_width=True, config={"displayModeBar": False})
+        close_surface()
+
+        run_summary_ui = json.loads(r.get("analysis_run_summary_json", b"{}").decode("utf-8")) if r.get("analysis_run_summary_json") else {}
+        render_debug_expander(run_summary_ui)
+
+    elif active_tab == "Отчет":
+        recommendation = "применять" if sc_profit >= base_profit else "не применять"
+        render_report_card("Результат", [f"базовый прогноз: {base_units:,.1f}", f"сценарный прогноз: {sc_units:,.1f}", f"дельта: {sc_units-base_units:+,.1f}", f"рекомендация: {recommendation}"])
+        wr = st.session_state.what_if_result or {}
+        c = wr.get("scenario_inputs_contract", {}) if isinstance(wr, dict) else {}
+        render_report_card("Что изменилось", [
+            f"цена: {c.get('base_price', 'n/a')} -> {c.get('scenario_price', 'n/a')}",
+            f"промо: {c.get('base_promo', 'n/a')} -> {c.get('scenario_promo', 'n/a')}",
+            f"шок-факторы: {c.get('base_freight', 'n/a')} -> {c.get('scenario_freight', 'n/a')}",
+            "измененные управляемые факторы: ручные параметры сценария",
+        ])
+        render_report_card("Почему изменился результат", [
+            "Цена изменила ожидаемый спрос.",
+            "Промо повлияло на интенсивность продаж.",
+            "Внешний множитель скорректировал уровень спроса.",
+        ])
+        trust = build_trust_block(r, st.session_state.what_if_result)
+        render_report_card("Надежность", [f"качество прогноза: {trust.get('data_sufficiency', 'n/a')}", "достаточность данных: проверена", f"уровень предупреждений: {len(trust.get('warnings', []))}"])
+
+        open_surface("Экспорт")
+        has_results = st.session_state.results is not None
+        st.download_button(
+            "Excel",
+            data=st.session_state.results["excel_buffer"] if has_results else b"",
+            file_name=f"pricing_report_{st.session_state.get('selected_sku_for_results', 'report')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=not has_results,
+            use_container_width=True,
+        )
+        st.download_button(
+            "CSV",
+            data=st.session_state.results.get("manual_scenario_daily_csv", b"") if has_results else b"",
+            file_name="scenario_daily.csv",
+            mime="text/csv",
+            disabled=not has_results,
+            use_container_width=True,
+        )
+        st.download_button(
+            "Сводка",
+            data=st.session_state.results.get("manual_scenario_summary_json", b"{}") if has_results else b"",
+            file_name="summary.json",
+            mime="application/json",
+            disabled=not has_results,
+            use_container_width=True,
+        )
+        close_surface()
+
+    st.caption("What-if Cloud")
