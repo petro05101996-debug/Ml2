@@ -3860,15 +3860,20 @@ if __name__ == "__main__":
 
 
     def render_upload_screen() -> dict[str, Any]:
-        st.markdown('<div class="section-title">Загрузка данных</div><div class="section-subtitle">Загрузите данные, проверьте структуру и выберите объект анализа</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-title">Мастер запуска анализа</div>'
+            '<div class="section-subtitle">3 шага: загрузите файл → проверьте сопоставление колонок → выберите SKU и запустите расчёт</div>',
+            unsafe_allow_html=True,
+        )
         left, right = st.columns([1.2, 1], gap="large")
 
         with left:
-            open_surface("Загрузка данных")
-            universal_file = st.file_uploader("Файл транзакций (CSV/XLSX)", type=["csv", "xlsx"], key="universal_file")
+            open_surface("Шаг 1. Загрузка файла")
+            st.caption("Поддерживаются форматы CSV и XLSX. Загрузите выгрузку с продажами, ценой и датой.")
+            universal_file = st.file_uploader("Файл транзакций", type=["csv", "xlsx"], key="universal_file")
             close_surface()
 
-            open_surface("Схема и валидация")
+            open_surface("Шаг 2. Проверка структуры данных")
             universal_txn = None
             schema_valid = False
             schema_errors: list[str] = []
@@ -3879,17 +3884,23 @@ if __name__ == "__main__":
             if universal_file is not None:
                 preview = read_uploaded_table_safely(universal_file)
                 auto_map = build_auto_mapping(list(preview.columns))
-                for f in CANONICAL_FIELDS:
-                    choices = ["<не использовать>"] + list(preview.columns)
-                    guessed = auto_map.get(f.name)
-                    idx = choices.index(guessed) if guessed in choices else 0
-                    selected = st.selectbox(
-                        f"{f.name} {'*' if f.required else ''}",
-                        choices,
-                        index=idx,
-                        key=f"map_universal_{f.name}",
-                    )
-                    universal_mapping[f.name] = None if selected == "<не использовать>" else selected
+                required_fields = [f.name for f in CANONICAL_FIELDS if f.required]
+                optional_fields = [f.name for f in CANONICAL_FIELDS if not f.required]
+                st.markdown("**Обязательные поля:** " + ", ".join(required_fields))
+                st.markdown("**Опциональные поля:** " + ", ".join(optional_fields[:6]) + ("..." if len(optional_fields) > 6 else ""))
+                with st.expander("Настроить сопоставление колонок", expanded=True):
+                    for f in CANONICAL_FIELDS:
+                        choices = ["<не использовать>"] + list(preview.columns)
+                        guessed = auto_map.get(f.name)
+                        idx = choices.index(guessed) if guessed in choices else 0
+                        selected = st.selectbox(
+                            f"{f.name} {'*' if f.required else ''}",
+                            choices,
+                            index=idx,
+                            key=f"map_universal_{f.name}",
+                            help="* — обязательное поле для запуска расчёта.",
+                        )
+                        universal_mapping[f.name] = None if selected == "<не использовать>" else selected
                 missing_required = validate_mapping_required_columns(universal_mapping)
                 if missing_required:
                     schema_errors.append(f"Отсутствуют обязательные поля: {', '.join(missing_required)}")
@@ -3900,15 +3911,18 @@ if __name__ == "__main__":
                     else:
                         schema_valid = True
                         raw_for_select = universal_txn.copy().rename(columns={"category": "product_category_name", "product_id": "product_id"})
-                        st.success(f"Готово: {len(universal_txn):,} строк")
+                        st.success(f"✅ Данные готовы к расчёту: {len(universal_txn):,} строк после нормализации.")
                         for w in universal_quality.get("warnings", []):
                             st.warning(w)
+                        st.caption("Предпросмотр нормализованных данных:")
+                        st.dataframe(universal_txn.head(10), use_container_width=True, height=240)
             for err in schema_errors:
                 st.error(err)
             close_surface()
 
         with right:
-            open_surface("Выбор объекта")
+            open_surface("Шаг 3. Выбор объекта и запуск")
+            st.caption("Выберите категорию и SKU, для которого хотите построить сценарий.")
             target_category, target_sku = None, None
             if 'raw_for_select' in locals() and raw_for_select is not None and len(raw_for_select) > 0:
                 category_col = "product_category_name" if "product_category_name" in raw_for_select.columns else "category"
@@ -3918,7 +3932,9 @@ if __name__ == "__main__":
                     sku_col = "product_id"
                     skus = sorted(raw_for_select[raw_for_select[category_col].astype(str) == str(target_category)][sku_col].astype(str).dropna().unique())
                     target_sku = st.selectbox("SKU", skus, key="input_target_sku") if skus else None
-            horizon_days = st.slider("Горизонт", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
+            horizon_days = st.slider("Горизонт прогноза, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
+            if target_category and target_sku:
+                st.info(f"Будет рассчитан SKU: **{target_sku}** в категории **{target_category}**.")
             run_requested = st.button("Запустить анализ", type="primary", use_container_width=True)
             close_surface()
 
@@ -4058,51 +4074,78 @@ if __name__ == "__main__":
         ])
 
     elif active_tab == "Сценарий":
-        st.info("Шаги: 1) задайте параметры, 2) нажмите «Применить сценарий», 3) смотрите дельту к базе в карточке и таблице ниже.")
-        open_surface("Параметры сценария")
-        st.caption("Заполните форму и нажмите кнопку внизу — расчёт применится одним шагом без промежуточных сбоев интерфейса.")
+        st.info("Понятный поток: задайте параметры сценария → нажмите «Применить сценарий» → смотрите итог в блоке «Эффект сценария».")
+        open_surface("Как пользоваться what-if доской")
+        st.markdown(
+            "1. **Задайте новую цену и промо-параметры** (слева).  \n"
+            "2. **Проверьте внешние множители** — логистика и ручной множитель спроса (справа).  \n"
+            "3. Нажмите **«Применить сценарий»** и сравните результат с базой по Δ прибыли и Δ выручки."
+        )
+        st.caption("Совет: начните с небольших изменений (±5–10%), чтобы увидеть стабильную реакцию модели.")
+        close_surface()
+
+        open_surface("Текущая база (с чем сравниваем)")
+        base_ctx = r["_trained_bundle"]["base_ctx"]
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Базовая цена", f"{float(r.get('current_price', 0.0)):.2f} ₽")
+        b2.metric("Базовая скидка", f"{float(base_ctx.get('discount', 0.0)):.0%}")
+        b3.metric("Базовое промо", f"{float(np.clip(base_ctx.get('promotion', 0.0), 0.0, 1.0)):.0%}")
+        b4.metric("Горизонт по умолчанию", f"{int(CONFIG['HORIZON_DAYS_DEFAULT'])} дн.")
+        close_surface()
+
+        open_surface("Форма сценария")
+        st.caption("Все изменения применяются только после нажатия кнопки «Применить сценарий».")
         with st.form("scenario_inputs_form", clear_on_submit=False):
-            manual_price = st.number_input(
-                "Цена в сценарии, ₽",
-                min_value=0.01,
-                value=float(r["current_price"]),
-                step=1.0,
-                key="what_if_price",
-                help="Это цена, которую вы хотите проверить в сценарии.",
+            p1, p2 = st.columns(2)
+            with p1:
+                manual_price = st.number_input(
+                    "1) Цена в сценарии, ₽",
+                    min_value=0.01,
+                    value=float(r["current_price"]),
+                    step=1.0,
+                    key="what_if_price",
+                    help="Новая цена, которую хотите проверить.",
+                )
+                discount = st.slider(
+                    "2) Скидка (0–0.95)",
+                    0.0,
+                    0.95,
+                    float(r["_trained_bundle"]["base_ctx"].get("discount", 0.0)),
+                    0.01,
+                    help="0.10 = скидка 10%.",
+                )
+                promo_value = st.slider(
+                    "3) Интенсивность промо (0–1)",
+                    0.0,
+                    1.0,
+                    float(np.clip(r["_trained_bundle"]["base_ctx"].get("promotion", 0.0), 0.0, 1.0)),
+                    0.05,
+                    help="Чем выше, тем сильнее эффект промо.",
+                )
+            with p2:
+                freight_mult = st.slider(
+                    "4) Логистика, множитель",
+                    0.5,
+                    1.5,
+                    1.0,
+                    0.05,
+                    help="1.10 = рост влияния логистики на 10%.",
+                )
+                demand_mult = st.slider(
+                    "5) Ручной множитель спроса",
+                    0.7,
+                    1.3,
+                    1.0,
+                    0.05,
+                    help="Дополнительная корректировка поверх остальных факторов.",
+                )
+                hdays = st.slider("6) Горизонт, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
+            st.markdown(
+                f"**Предпросмотр параметров:** цена `{manual_price:.2f}` ₽, скидка `{discount:.0%}`, "
+                f"промо `{promo_value:.0%}`, логистика `{freight_mult:.2f}x`, спрос `{demand_mult:.2f}x`, горизонт `{hdays}` дн."
             )
-            discount = st.slider(
-                "Скидка, доля (0–0.95)",
-                0.0,
-                0.95,
-                float(r["_trained_bundle"]["base_ctx"].get("discount", 0.0)),
-                0.01,
-                help="0.10 означает скидку 10%.",
-            )
-            promo_value = st.slider(
-                "Интенсивность промо (0–1)",
-                0.0,
-                1.0,
-                float(np.clip(r["_trained_bundle"]["base_ctx"].get("promotion", 0.0), 0.0, 1.0)),
-                0.05,
-                help="Чем выше значение, тем сильнее промо-эффект в сценарии.",
-            )
-            freight_mult = st.slider(
-                "Шок-факторы логистики, множитель",
-                0.5,
-                1.5,
-                1.0,
-                0.05,
-                help="1.10 = рост логистического фактора на 10%, 0.90 = снижение на 10%.",
-            )
-            demand_mult = st.slider(
-                "Доп. управляемый множитель спроса",
-                0.7,
-                1.3,
-                1.0,
-                0.05,
-                help="Ручная корректировка спроса поверх остальных факторов.",
-            )
-            hdays = st.slider("Горизонт, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
+            if abs(float(manual_price) - float(r["current_price"])) / max(float(r["current_price"]), 1e-9) > 0.30:
+                st.warning("Цена отличается от текущей более чем на 30%. Результат может быть менее стабильным для интерпретации.")
             c1, c2 = st.columns(2)
             apply_btn = c1.form_submit_button("Применить сценарий", type="primary", use_container_width=True)
             reset_btn = c2.form_submit_button("Сбросить сценарий", use_container_width=True)
@@ -4230,7 +4273,11 @@ if __name__ == "__main__":
         base_margin = (base_profit / max(base_revenue, 1e-9)) * 100
         scenario_margin = (sc_profit / max(sc_revenue, 1e-9)) * 100
 
-        st.markdown("### Короткий ответ")
+        st.markdown("### Отчёт в 1 экране")
+        st.caption("Ниже — готовая управленческая выжимка: решение, цифры, объяснение и экспорт.")
+        trust = build_trust_block(r, st.session_state.what_if_result)
+        warnings_count = len(trust.get("warnings", []))
+        confidence_label = "Высокая" if str(trust.get("data_sufficiency", "")).lower() == "enough" and warnings_count == 0 else ("Средняя" if warnings_count <= 2 else "Низкая")
         if sc_profit >= base_profit:
             st.success(
                 f"{recommendation}: прибыль выше на {_fmt_money(profit_delta)}, "
@@ -4267,30 +4314,46 @@ if __name__ == "__main__":
                 },
             ]
         )
-        open_surface("Сравнение в 1 таблице")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Решение", recommendation)
+        k2.metric("Δ спроса", _fmt_units(demand_delta))
+        k3.metric("Δ выручки", _fmt_money(revenue_delta))
+        k4.metric("Δ прибыли", _fmt_money(profit_delta))
+        k5, k6 = st.columns(2)
+        with k5:
+            st.metric("Надёжность оценки", confidence_label)
+        with k6:
+            st.metric("Предупреждений", str(warnings_count))
+
+        open_surface("Сравнение: база vs ваш сценарий")
         st.dataframe(quick_compare, use_container_width=True, hide_index=True)
         close_surface()
 
         wr = st.session_state.what_if_result or {}
         c = wr.get("scenario_inputs_contract", {}) if isinstance(wr, dict) else {}
-        render_report_card("Что вы изменили", [
+        render_report_card("1) Что вы изменили", [
             f"цена: {c.get('base_price', 'n/a')} -> {c.get('scenario_price', 'n/a')}",
             f"промо: {c.get('base_promo', 'n/a')} -> {c.get('scenario_promo', 'n/a')}",
             f"шок-факторы: {c.get('base_freight', 'n/a')} -> {c.get('scenario_freight', 'n/a')}",
             "доп. множители: ручная настройка сценария",
         ])
-        render_report_card("Почему получился такой результат", [
+        render_report_card("2) Почему получился такой результат", [
             "Цена изменила ожидаемый спрос.",
             "Промо повлияло на интенсивность продаж.",
             "Внешний множитель скорректировал уровень спроса.",
         ])
-        trust = build_trust_block(r, st.session_state.what_if_result)
-        render_report_card("Надёжность результата", [f"качество прогноза: {trust.get('data_sufficiency', 'n/a')}", "достаточность данных: проверена", f"уровень предупреждений: {len(trust.get('warnings', []))}"])
-        render_report_card("Словарь (простыми словами)", [
+        render_report_card("3) Надёжность результата", [f"качество прогноза: {trust.get('data_sufficiency', 'n/a')}", "достаточность данных: проверена", f"уровень предупреждений: {len(trust.get('warnings', []))}"])
+        render_report_card("4) Словарь (простыми словами)", [
             "База (baseline) — прогноз без ручных изменений.",
             "Сценарий — прогноз после изменения параметров.",
             "Raw прибыль — сумма без дополнительных корректировок.",
             "Adjusted прибыль — прибыль после внутренних корректировок модели.",
+        ])
+        render_report_card("5) Что делать дальше (чеклист)", [
+            "Если Δ прибыли положительная и надёжность не низкая — можно брать в пилот.",
+            "Если есть предупреждения — сначала проверьте вкладку «Диагностика».",
+            "Зафиксируйте сценарий в слот и сравните с альтернативой (A/B/C).",
+            "После выбора скачайте Excel/CSV и отправьте команде.",
         ])
 
         open_surface("Экспорт")
