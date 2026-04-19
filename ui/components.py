@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Sequence
 
+import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -71,10 +72,17 @@ def render_action_row() -> str | None:
     return clicked
 
 
-def render_tabs(active_tab: str, tabs: Sequence[str]) -> str:
-    idx = tabs.index(active_tab) if active_tab in tabs else 0
-    selected = st.radio("Раздел", tabs, horizontal=True, label_visibility="collapsed", index=idx)
-    return selected
+def render_tabs(active_tab: str, tabs: Sequence[str], key: str = "workspace_tab_radio") -> str:
+    if key not in st.session_state or st.session_state.get(key) not in tabs:
+        st.session_state[key] = active_tab if active_tab in tabs else tabs[0]
+    selected = st.radio(
+        "Раздел",
+        tabs,
+        horizontal=True,
+        label_visibility="collapsed",
+        key=key,
+    )
+    return str(selected)
 
 
 def render_chart_card(title: str, subtitle: str, fig: Any, footer_values: Sequence[tuple[str, str]]) -> None:
@@ -152,6 +160,38 @@ def render_landing_nav() -> None:
     )
 
 
+def _render_landing_demo_chart() -> None:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=["Нед 1", "Нед 2", "Нед 3", "Нед 4", "Нед 5"],
+            y=[92, 95, 89, 98, 101],
+            name="База",
+            mode="lines+markers",
+            line=dict(color="#9DCC84", width=2),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=["Нед 1", "Нед 2", "Нед 3", "Нед 4", "Нед 5"],
+            y=[92, 97, 96, 106, 112],
+            name="Сценарий",
+            mode="lines+markers",
+            line=dict(color="#6F70FF", width=2.5),
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=10, t=24, b=10),
+        legend=dict(orientation="h", y=1.12, x=0),
+        height=240,
+        title="Пример: как читать график базы и сценария",
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
 def render_hero_section() -> None:
     st.markdown('<div class="hero-grid" style="margin-top:18px;">', unsafe_allow_html=True)
     st.markdown('<div class="surface-card">', unsafe_allow_html=True)
@@ -161,7 +201,7 @@ def render_hero_section() -> None:
     b1, b2 = st.columns(2)
     b1.button("Попробовать", type="primary", use_container_width=True, key="landing_try")
     b2.button("Смотреть демо", use_container_width=True, key="landing_demo")
-    st.markdown('<div class="mini divider-top">Понятный прогноз. Прозрачные сценарии. Без магии и хаоса.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mini divider-top">✨ Понятный прогноз. Прозрачные сценарии. Без магии и хаоса.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
     st.markdown(
         """
@@ -170,17 +210,18 @@ def render_hero_section() -> None:
   <div class="object-header" style="margin-top:8px;">
     <div class="mini">Кофе зерновой 1 кг · SCN-014</div>
     <div class="metric-grid" style="margin-top:10px;">
-      <div class="metric-item"><div class="mini">Спрос</div><div><b>+8.4%</b></div></div>
-      <div class="metric-item"><div class="mini">Выручка</div><div><b>+₽ 124k</b></div></div>
-      <div class="metric-item"><div class="mini">Прибыль</div><div><b>+₽ 48k</b></div></div>
-      <div class="metric-item"><div class="mini">Маржа</div><div><b>+1.2 п.п.</b></div></div>
+      <div class="metric-item"><div class="mini">📈 Спрос</div><div><b>+8.4%</b></div></div>
+      <div class="metric-item"><div class="mini">💰 Выручка</div><div><b>+₽ 124k</b></div></div>
+      <div class="metric-item"><div class="mini">🏆 Прибыль</div><div><b>+₽ 48k</b></div></div>
+      <div class="metric-item"><div class="mini">📊 Маржа</div><div><b>+1.2 п.п.</b></div></div>
     </div>
-    <div class="surface-card" style="padding:14px;margin-top:12px;">Линейный график: база и сценарий</div>
+    <div class="mini" style="margin-top:12px;">Ниже — демонстрационный график в стиле рабочего отчета.</div>
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
+    _render_landing_demo_chart()
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -202,9 +243,9 @@ def render_product_features() -> None:
     st.markdown('<div class="section-title">Что делает продукт</div>', unsafe_allow_html=True)
     st.markdown('<div class="grid-3">', unsafe_allow_html=True)
     cards = [
-        ("Прогнозирует спрос", "Использует исторические продажи и факторы для построения базового прогноза."),
-        ("Позволяет менять сценарии", "Цена, промо, внешние шоки и другие драйверы меняются вручную."),
-        ("Показывает бизнес-эффект", "Сразу видно, как меняются спрос, выручка, прибыль и риск."),
+        ("📦 Прогнозирует спрос", "Использует исторические продажи и факторы для построения базового прогноза."),
+        ("🎛️ Позволяет менять сценарии", "Цена, промо, внешние шоки и другие драйверы меняются вручную."),
+        ("✅ Показывает бизнес-эффект", "Сразу видно, как меняются спрос, выручка, прибыль и риск."),
     ]
     for t, d in cards:
         st.markdown(f'<div class="surface-card"><div class="card-title">{t}</div><div class="muted">{d}</div></div>', unsafe_allow_html=True)
@@ -227,7 +268,7 @@ def render_how_it_works() -> None:
 
 def render_interface_preview() -> None:
     st.markdown('<div class="section-title">Интерфейс, в котором видно главное</div><div class="muted">Никакого BI-хлама. Только сценарий, результат и понятный отчет.</div>', unsafe_allow_html=True)
-    st.markdown('<div class="surface-card" style="margin-top:12px;">Дашборд · Сценарий · Факторы · Диагностика · Отчет</div>', unsafe_allow_html=True)
+    st.markdown('<div class="surface-card" style="margin-top:12px;">🏠 Дашборд · 🧪 Сценарий · 🧩 Факторы · 🛠️ Диагностика · 📄 Отчет</div>', unsafe_allow_html=True)
     st.markdown('<div class="surface-card">Верхний header, header объекта, action row, ключевые карточки, график и summary-блок отчета.</div>', unsafe_allow_html=True)
 
 
