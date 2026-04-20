@@ -11,6 +11,7 @@ from scenario_engine import run_scenario
 from app import (
     build_business_report_payload,
     build_data_sufficiency_status,
+    build_excel_export_buffer,
     build_scenario_comparison_table,
     build_trust_block,
     apply_weekly_fallback_projection,
@@ -216,6 +217,30 @@ def test_manual_scenario_executes_and_populates_summary():
     assert len(summary["scenario_forecast"]) > 0
     assert np.isfinite(summary["scenario_vs_as_is_demand_pct"])
     assert np.isfinite(summary["scenario_vs_as_is_profit_pct"])
+
+
+def test_export_buffers_initialized_with_empty_manual_artifacts():
+    res = _analyze()
+    assert res["manual_scenario_summary_json"] == b"{}"
+    assert res["manual_scenario_daily_csv"] == b""
+
+
+def test_excel_export_includes_manual_scenario_sheet_when_applied():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(bundle, manual_price=base_price * 1.1)
+    res["scenario_forecast"] = wr["daily"].copy()
+    excel_blob = build_excel_export_buffer(res, wr)
+    with pd.ExcelFile(excel_blob) as xls:
+        assert "README" in xls.sheet_names
+        assert "C_export_summary" in xls.sheet_names
+        assert "B_manual_scenario" in xls.sheet_names
+        assert "D_holdout_predictions" in xls.sheet_names
+        assert "E_metrics_all" in xls.sheet_names
+        metrics_df = pd.read_excel(xls, "E_metrics_all")
+        assert "metric_name" in metrics_df.columns
+        assert (metrics_df["metric_name"].astype(str).str.contains("holdout_metrics")).any()
 
 
 def test_price_increase_above_train_max_is_not_silent():

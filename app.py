@@ -2603,13 +2603,15 @@ def run_full_pricing_analysis_universal(
         "holdout_rmse_delta": float(active_uplift_metrics["holdout_rmse"] - attempted_uplift_metrics["holdout_rmse"]) if np.isfinite(active_uplift_metrics["holdout_rmse"]) and np.isfinite(attempted_uplift_metrics["holdout_rmse"]) else float("nan"),
     }
 
-    excel_buffer = BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        daily_base.to_excel(writer, sheet_name="history", index=False)
-        baseline_sim["daily"].to_excel(writer, sheet_name="neutral_baseline", index=False)
-        as_is_sim["daily"].to_excel(writer, sheet_name="as_is", index=False)
-        pd.DataFrame([holdout_metrics]).to_excel(writer, sheet_name="metrics", index=False)
-    excel_buffer.seek(0)
+    excel_buffer = build_excel_export_buffer(
+        {
+            "history_daily": daily_base,
+            "neutral_baseline_forecast": baseline_sim["daily"],
+            "as_is_forecast": as_is_sim["daily"],
+            "holdout_metrics": pd.DataFrame([holdout_metrics]),
+            "scenario_forecast": None,
+        }
+    )
     delta_vs_as_is = {
         "demand_total": float((scenario_sim["daily"]["actual_sales"].sum() - as_is_sim["daily"]["actual_sales"].sum())) if scenario_sim else float("nan"),
         "revenue_total": float((scenario_sim["daily"]["revenue"].sum() - as_is_sim["daily"]["revenue"].sum())) if scenario_sim else float("nan"),
@@ -3083,8 +3085,8 @@ def run_full_pricing_analysis_universal(
         "uplift_debug_report_csv": uplift_debug_report.to_csv(index=False).encode("utf-8"),
         "uplift_holdout_trace_csv": uplift_holdout_trace.to_csv(index=False).encode("utf-8"),
         "analysis_baseline_vs_as_is_csv": analysis_baseline_vs_as_is.to_csv(index=False).encode("utf-8"),
-        "manual_scenario_summary_json": None,
-        "manual_scenario_daily_csv": None,
+        "manual_scenario_summary_json": b"{}",
+        "manual_scenario_daily_csv": b"",
         "feature_report_csv": feature_report.to_csv(index=False).encode("utf-8"),
         "flag": {"auto_apply": False, "reasons": {"mode": "single-core-what-if"}},
         "_trained_bundle": {
@@ -3511,6 +3513,12 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
     as_is = result_dict["as_is_forecast"].copy()
     baseline = result_dict["neutral_baseline_forecast"].copy()
     scenario = what_if_result["daily"].copy()
+    if "lost_sales" not in scenario.columns:
+        scenario["lost_sales"] = 0.0
+    if "profit" not in scenario.columns:
+        scenario["profit"] = 0.0
+    if "cost" not in scenario.columns:
+        scenario["cost"] = np.nan
     merged = (
         as_is[["date", "actual_sales", "revenue", "profit"]]
         .rename(columns={"actual_sales": "as_is_demand", "revenue": "as_is_revenue", "profit": "as_is_profit"})
@@ -3626,6 +3634,191 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "fallback_reason": str(what_if_result.get("fallback_reason", "")),
     }
     return json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"), manual_daily.to_csv(index=False).encode("utf-8")
+
+
+def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optional[Dict[str, Any]] = None) -> BytesIO:
+    history = result_dict.get("history_daily", pd.DataFrame()).copy()
+    baseline = result_dict.get("neutral_baseline_forecast", pd.DataFrame()).copy()
+    as_is = result_dict.get("as_is_forecast", pd.DataFrame()).copy()
+    scenario = result_dict.get("scenario_forecast")
+    if scenario is None and isinstance(what_if_result, dict):
+        scenario = what_if_result.get("daily")
+    scenario_df = scenario.copy() if isinstance(scenario, pd.DataFrame) else pd.DataFrame()
+    holdout_metrics = result_dict.get("holdout_metrics", pd.DataFrame())
+    if isinstance(holdout_metrics, dict):
+        holdout_metrics = pd.DataFrame([holdout_metrics])
+    if holdout_metrics is None or not isinstance(holdout_metrics, pd.DataFrame):
+        holdout_metrics = pd.DataFrame()
+
+    def _from_blob_csv(blob: Any) -> pd.DataFrame:
+        if blob is None:
+            return pd.DataFrame()
+        try:
+            if isinstance(blob, BytesIO):
+                blob.seek(0)
+                return pd.read_csv(blob)
+            if isinstance(blob, (bytes, bytearray)) and len(blob):
+                return pd.read_csv(BytesIO(blob))
+        except Exception:
+            return pd.DataFrame()
+        return pd.DataFrame()
+
+    def _json_to_df(blob: Any) -> pd.DataFrame:
+        if blob is None:
+            return pd.DataFrame()
+        try:
+            raw: Any = blob
+            if isinstance(blob, BytesIO):
+                blob.seek(0)
+                raw = blob.read()
+            if isinstance(raw, (bytes, bytearray)):
+                if not raw:
+                    return pd.DataFrame()
+                obj = json.loads(raw.decode("utf-8"))
+            elif isinstance(raw, str):
+                obj = json.loads(raw)
+            elif isinstance(raw, dict):
+                obj = raw
+            else:
+                return pd.DataFrame()
+            return pd.json_normalize(obj, sep=".")
+        except Exception:
+            return pd.DataFrame()
+
+    def _flatten_obj(prefix: str, payload: Any) -> List[Tuple[str, Any]]:
+        rows: List[Tuple[str, Any]] = []
+        if isinstance(payload, pd.DataFrame):
+            rows.append((f"{prefix}.__rows__", int(len(payload))))
+            rows.append((f"{prefix}.__cols__", ",".join([str(c) for c in payload.columns[:20]])))
+            return rows
+        if isinstance(payload, pd.Series):
+            rows.append((f"{prefix}.__len__", int(len(payload))))
+            return rows
+        if isinstance(payload, np.ndarray):
+            rows.append((f"{prefix}.__shape__", str(payload.shape)))
+            return rows
+        if isinstance(payload, dict):
+            for k, v in payload.items():
+                next_prefix = f"{prefix}.{k}" if prefix else str(k)
+                rows.extend(_flatten_obj(next_prefix, v))
+            return rows
+        if isinstance(payload, list):
+            if len(payload) > 50:
+                rows.append((f"{prefix}.__len__", int(len(payload))))
+                return rows
+            for i, v in enumerate(payload):
+                next_prefix = f"{prefix}[{i}]"
+                rows.extend(_flatten_obj(next_prefix, v))
+            return rows
+        rows.append((prefix, payload))
+        return rows
+
+    def _sum(df: pd.DataFrame, col: str) -> float:
+        if col not in df.columns or len(df) == 0:
+            return float("nan")
+        return float(pd.to_numeric(df[col], errors="coerce").fillna(0.0).sum())
+
+    export_summary = pd.DataFrame(
+        [
+            {
+                "plan": "as_is",
+                "demand_total": _sum(as_is, "actual_sales"),
+                "revenue_total": _sum(as_is, "revenue"),
+                "profit_total": _sum(as_is, "profit"),
+            },
+            {
+                "plan": "neutral_baseline",
+                "demand_total": _sum(baseline, "actual_sales"),
+                "revenue_total": _sum(baseline, "revenue"),
+                "profit_total": _sum(baseline, "profit"),
+            },
+            {
+                "plan": "manual_scenario",
+                "demand_total": _sum(scenario_df, "actual_sales"),
+                "revenue_total": _sum(scenario_df, "revenue"),
+                "profit_total": _sum(scenario_df, "profit"),
+            },
+        ]
+    )
+
+    excel_buffer = BytesIO()
+    diagnostics_holdout_predictions = _from_blob_csv(result_dict.get("holdout_predictions_csv"))
+    diagnostics_feature_report = _from_blob_csv(result_dict.get("feature_report_csv"))
+    diagnostics_baseline_vs_as_is = _from_blob_csv(result_dict.get("analysis_baseline_vs_as_is_csv"))
+    diagnostics_uplift_debug = _from_blob_csv(result_dict.get("uplift_debug_report_csv"))
+    diagnostics_uplift_trace = _from_blob_csv(result_dict.get("uplift_holdout_trace_csv"))
+    diagnostics_run_summary = _json_to_df(result_dict.get("analysis_run_summary_json"))
+    manual_summary_df = _json_to_df(result_dict.get("manual_scenario_summary_json"))
+    run_summary_obj = {}
+    manual_summary_obj = {}
+    try:
+        raw_run = result_dict.get("analysis_run_summary_json", b"{}")
+        if isinstance(raw_run, (bytes, bytearray)):
+            run_summary_obj = json.loads(raw_run.decode("utf-8"))
+    except Exception:
+        run_summary_obj = {}
+    try:
+        raw_manual = result_dict.get("manual_scenario_summary_json", b"{}")
+        if isinstance(raw_manual, (bytes, bytearray)):
+            manual_summary_obj = json.loads(raw_manual.decode("utf-8"))
+    except Exception:
+        manual_summary_obj = {}
+
+    metrics_rows: List[Dict[str, Any]] = []
+    for k, v in _flatten_obj("run_summary", run_summary_obj):
+        metrics_rows.append({"metric_group": "run_summary", "metric_name": k, "metric_value": v})
+    for k, v in _flatten_obj("manual_summary", manual_summary_obj):
+        metrics_rows.append({"metric_group": "manual_summary", "metric_name": k, "metric_value": v})
+    for k, v in _flatten_obj("quality_report", result_dict.get("quality_report", {})):
+        metrics_rows.append({"metric_group": "quality_report", "metric_name": k, "metric_value": v})
+    for k, v in _flatten_obj("holdout_metrics", result_dict.get("holdout_metrics", {})):
+        metrics_rows.append({"metric_group": "holdout_metrics", "metric_name": k, "metric_value": v})
+    if isinstance(what_if_result, dict):
+        for k, v in _flatten_obj("what_if_result", what_if_result):
+            metrics_rows.append({"metric_group": "what_if_result", "metric_name": k, "metric_value": v})
+
+    metrics_all = pd.DataFrame(metrics_rows)
+    if len(metrics_all):
+        metrics_all = metrics_all.drop_duplicates(subset=["metric_name", "metric_value"]).sort_values(["metric_group", "metric_name"])
+
+    report_index = pd.DataFrame(
+        [
+            {"group": "A_CORE_INPUTS", "sheet": "A_history", "description": "История продаж и факторов."},
+            {"group": "B_FORECASTS", "sheet": "B_as_is", "description": "Текущий план (без изменений)."},
+            {"group": "B_FORECASTS", "sheet": "B_neutral_baseline", "description": "Нейтральный baseline."},
+            {"group": "B_FORECASTS", "sheet": "B_manual_scenario", "description": "Ручной сценарий (если применён)."},
+            {"group": "C_SUMMARY", "sheet": "C_export_summary", "description": "Итоги по спросу/выручке/прибыли."},
+            {"group": "C_SUMMARY", "sheet": "C_manual_summary", "description": "Контракт и метаданные сценария."},
+            {"group": "D_DIAGNOSTICS", "sheet": "D_metrics", "description": "Метрики holdout."},
+            {"group": "D_DIAGNOSTICS", "sheet": "D_holdout_predictions", "description": "Дневные предсказания holdout."},
+            {"group": "D_DIAGNOSTICS", "sheet": "D_feature_report", "description": "Использование признаков."},
+            {"group": "D_DIAGNOSTICS", "sheet": "D_baseline_vs_as_is", "description": "Сравнение baseline и as-is."},
+            {"group": "D_DIAGNOSTICS", "sheet": "D_uplift_debug", "description": "Диагностика uplift."},
+            {"group": "D_DIAGNOSTICS", "sheet": "D_uplift_trace", "description": "Трассировка uplift."},
+            {"group": "D_DIAGNOSTICS", "sheet": "D_run_summary", "description": "Сводный JSON прогона (flattened)."},
+            {"group": "E_METRICS", "sheet": "E_metrics_all", "description": "Все доступные метрики для разбора (flattened)."},
+        ]
+    )
+
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        report_index.to_excel(writer, sheet_name="README", index=False)
+        history.to_excel(writer, sheet_name="A_history", index=False)
+        as_is.to_excel(writer, sheet_name="B_as_is", index=False)
+        baseline.to_excel(writer, sheet_name="B_neutral_baseline", index=False)
+        holdout_metrics.to_excel(writer, sheet_name="D_metrics", index=False)
+        export_summary.to_excel(writer, sheet_name="C_export_summary", index=False)
+        manual_summary_df.to_excel(writer, sheet_name="C_manual_summary", index=False)
+        diagnostics_holdout_predictions.to_excel(writer, sheet_name="D_holdout_predictions", index=False)
+        diagnostics_feature_report.to_excel(writer, sheet_name="D_feature_report", index=False)
+        diagnostics_baseline_vs_as_is.to_excel(writer, sheet_name="D_baseline_vs_as_is", index=False)
+        diagnostics_uplift_debug.to_excel(writer, sheet_name="D_uplift_debug", index=False)
+        diagnostics_uplift_trace.to_excel(writer, sheet_name="D_uplift_trace", index=False)
+        diagnostics_run_summary.to_excel(writer, sheet_name="D_run_summary", index=False)
+        metrics_all.to_excel(writer, sheet_name="E_metrics_all", index=False)
+        if len(scenario_df):
+            scenario_df.to_excel(writer, sheet_name="B_manual_scenario", index=False)
+    excel_buffer.seek(0)
+    return excel_buffer
 
 
 def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -4035,6 +4228,7 @@ def reset_scenario_ui_state_to_base(results: Dict[str, Any], clear_saved_slot: b
         st.session_state["what_if_demand_mult"],
         st.session_state["what_if_hdays"],
     )
+    results["excel_buffer"] = build_excel_export_buffer(results)
     return results
 
 
@@ -4151,14 +4345,14 @@ if __name__ == "__main__":
         )
 
         render_landing_nav()
-        render_landing_hero_v2()
+        hero_action = render_landing_hero_v2()
         render_landing_proof_strip()
         render_landing_controls_and_outputs()
         render_landing_pipeline()
         render_landing_trust_v2()
-        render_landing_cta_v2()
+        cta_action = render_landing_cta_v2()
         render_landing_footer()
-        if st.button("Перейти в приложение", type="primary", use_container_width=True, key="to_app"):
+        if hero_action == "app" or cta_action == "app" or st.button("Перейти в приложение", type="primary", use_container_width=True, key="to_app"):
             st.query_params["page"] = "app"
             st.rerun()
         st.stop()
@@ -4234,6 +4428,16 @@ if __name__ == "__main__":
 
     def _fmt_units(v: float) -> str:
         return f"{v:,.1f} шт."
+
+    def _download_blob(payload: Any, default: bytes) -> bytes | BytesIO:
+        if payload is None:
+            return default
+        if isinstance(payload, (bytes, bytearray, BytesIO)):
+            return payload
+        try:
+            return bytes(payload)
+        except Exception:
+            return default
 
 
     def render_upload_screen() -> dict[str, Any]:
@@ -4363,13 +4567,16 @@ if __name__ == "__main__":
     }
     status_text, status_color = status_map.get(ui_status, ("База без изменений", "#8FA3B8"))
 
-    render_object_header(
+    back_to_landing = render_object_header(
         object_title=str(st.session_state.get("selected_sku_for_results", "SKU")),
         status_text=status_text,
         horizon_text=f"{len(current_forecast)} дней",
         last_update=last_update,
         status_color=status_color,
     )
+    if back_to_landing:
+        st.query_params["page"] = "landing"
+        st.rerun()
     action_click = render_action_row()
     if action_click == "new":
         r = reset_scenario_ui_state_to_base(r, clear_saved_slot=True)
@@ -4535,6 +4742,7 @@ if __name__ == "__main__":
             r["scenario_price_modeled"] = float(wr.get("model_price", wr.get("price_for_model", manual_price)))
             r["scenario_price"] = r["scenario_price_modeled"]
             r["manual_scenario_summary_json"], r["manual_scenario_daily_csv"] = build_manual_scenario_artifacts(r, wr)
+            r["excel_buffer"] = build_excel_export_buffer(r, wr)
             st.session_state.applied_scenario_snapshot = build_applied_scenario_snapshot(
                 wr,
                 manual_price,
@@ -4751,7 +4959,7 @@ if __name__ == "__main__":
         has_results = st.session_state.results is not None
         st.download_button(
             "Excel",
-            data=st.session_state.results["excel_buffer"] if has_results else b"",
+            data=_download_blob(st.session_state.results.get("excel_buffer") if has_results else b"", b""),
             file_name=f"pricing_report_{st.session_state.get('selected_sku_for_results', 'report')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             disabled=not has_results,
@@ -4759,7 +4967,7 @@ if __name__ == "__main__":
         )
         st.download_button(
             "CSV",
-            data=st.session_state.results.get("manual_scenario_daily_csv", b"") if has_results else b"",
+            data=_download_blob(st.session_state.results.get("manual_scenario_daily_csv", b"") if has_results else b"", b""),
             file_name="scenario_daily.csv",
             mime="text/csv",
             disabled=(not has_results) or (not scenario_applied),
@@ -4769,7 +4977,7 @@ if __name__ == "__main__":
             st.caption("CSV станет доступен после применения сценария.")
         st.download_button(
             "Сводка",
-            data=st.session_state.results.get("manual_scenario_summary_json", b"{}") if has_results else b"",
+            data=_download_blob(st.session_state.results.get("manual_scenario_summary_json", b"{}") if has_results else b"", b"{}"),
             file_name="summary.json",
             mime="application/json",
             disabled=(not has_results) or (not scenario_applied),
