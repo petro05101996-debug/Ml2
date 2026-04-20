@@ -35,11 +35,17 @@ def render_top_header() -> None:
     )
 
 
-def render_object_header(object_title: str, status_text: str, horizon_text: str, last_update: str, status_color: str = "#7AD0A9") -> None:
+def render_object_header(
+    object_title: str,
+    status_text: str,
+    horizon_text: str,
+    last_update: str,
+    status_color: str = "#7AD0A9",
+) -> bool:
+    back_to_landing = st.button("← Назад", key="back_to_landing", use_container_width=False)
     st.markdown(
         f"""
 <div class="object-header">
-  <div class="mini">← Назад</div>
   <div class="object-row" style="margin-top:10px;">
     <div class="obj-badge">◉</div>
     <div>
@@ -51,6 +57,7 @@ def render_object_header(object_title: str, status_text: str, horizon_text: str,
 """,
         unsafe_allow_html=True,
     )
+    return back_to_landing
 
 
 def render_action_row() -> str | None:
@@ -158,7 +165,7 @@ def render_landing_nav() -> None:
     )
 
 
-def render_landing_hero_v2() -> None:
+def render_landing_hero_v2() -> str | None:
     st.markdown(
         """
 <div class="hero-grid" style="margin-top:18px;">
@@ -192,8 +199,11 @@ def render_landing_hero_v2() -> None:
         unsafe_allow_html=True,
     )
     b1, b2 = st.columns(2)
-    b1.button("Перейти в приложение", type="primary", use_container_width=True, key="landing_try_v2")
-    b2.button("Посмотреть интерфейс", use_container_width=True, key="landing_demo_v2")
+    if b1.button("Перейти в приложение", type="primary", use_container_width=True, key="landing_try_v2"):
+        return "app"
+    if b2.button("Посмотреть интерфейс", use_container_width=True, key="landing_demo_v2"):
+        return "app"
+    return None
 
 
 def render_landing_proof_strip() -> None:
@@ -296,7 +306,7 @@ def render_landing_trust_v2() -> None:
     )
 
 
-def render_landing_cta_v2() -> None:
+def render_landing_cta_v2() -> str | None:
     st.markdown(
         """
 <div class="surface-card" style="text-align:center; position:relative;">
@@ -310,8 +320,11 @@ def render_landing_cta_v2() -> None:
         unsafe_allow_html=True,
     )
     c1, c2 = st.columns(2)
-    c1.button("Перейти в приложение", type="primary", use_container_width=True, key="landing_cta_start_v2")
-    c2.button("Посмотреть интерфейс", use_container_width=True, key="landing_cta_demo_v2")
+    if c1.button("Перейти в приложение", type="primary", use_container_width=True, key="landing_cta_start_v2"):
+        return "app"
+    if c2.button("Посмотреть интерфейс", use_container_width=True, key="landing_cta_demo_v2"):
+        return "app"
+    return None
 
 
 def render_landing_footer() -> None:
