@@ -30,6 +30,7 @@ from scenario_engine import run_scenario
 from v1_runtime_helpers import (
     build_backend_warning,
     compute_scenario_price_inputs,
+    evaluate_net_price_support,
     get_model_backend_status,
     select_weekly_baseline_candidate,
 )
@@ -3167,6 +3168,7 @@ def run_what_if_projection(
             }
         )
 
+    current_price_raw = float(current_ctx.get("price", manual_price))
     baseline_discount = float(np.clip(current_ctx.get("discount", 0.0), 0.0, 0.95))
     scenario_discount = float(scenario_overrides.get("discount", baseline_discount))
     scenario_discount *= float(scenario_overrides.get("discount_multiplier", 1.0))
@@ -3177,8 +3179,9 @@ def run_what_if_projection(
     if not np.isfinite(train_min) or not np.isfinite(train_max):
         train_min = requested_price
         train_max = requested_price
-    price_inputs = compute_scenario_price_inputs(requested_price=requested_price, train_min=train_min, train_max=train_max)
-    model_price = float(price_inputs["model_price"])
+    clip = compute_scenario_price_inputs(requested_price=requested_price, train_min=train_min, train_max=train_max)
+    model_price = float(clip["model_price"])
+    base_net_price_ref = float(max(0.01, current_price_raw * (1.0 - baseline_discount)))
     scenario_net_price = float(max(0.01, model_price * (1.0 - scenario_discount)))
 
     baseline_cost = float(current_ctx.get("cost", baseline_price_ref * CONFIG["COST_PROXY_RATIO"]))
@@ -3198,18 +3201,43 @@ def run_what_if_projection(
     if float(scenario_overrides.get("stock_cap", 0.0)) > 0:
         stock_series = np.minimum(stock_series, float(scenario_overrides["stock_cap"]))
 
+    effective_scenario = {
+        "requested_price_gross": float(manual_price),
+        "applied_price_gross": float(model_price),
+        "current_price_gross": float(current_price_raw),
+        "current_discount": float(baseline_discount),
+        "applied_discount": float(scenario_discount),
+        "current_price_net": float(base_net_price_ref),
+        "applied_price_net": float(scenario_net_price),
+        "promotion": float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))),
+        "freight_value": float(scenario_freight),
+        "cost": float(scenario_cost),
+        "demand_multiplier": float(scenario_overrides.get("manual_shock_multiplier", 1.0)),
+        "price_clipped": bool(clip.get("price_clipped", False)),
+        "clip_reason": clip.get("clip_reason"),
+        "lower_clip": float(train_min) if np.isfinite(train_min) else None,
+        "upper_clip": float(train_max) if np.isfinite(train_max) else None,
+    }
+
     scenario_inputs = {
-        "baseline_price_ref": baseline_price_ref,
-        "scenario_price": model_price,
-        "baseline_net_price": float(current_ctx.get("price", baseline_price_ref)) * (1.0 - float(current_ctx.get("discount", 0.0))),
-        "scenario_net_price": scenario_net_price,
+        "demand_price_baseline": float(base_net_price_ref),
+        "demand_price_scenario": float(scenario_net_price),
+        "gross_price_baseline": float(current_price_raw),
+        "gross_price_scenario": float(model_price),
+        "base_price": float(base_net_price_ref),
+        "scenario_price": float(scenario_net_price),
+        "baseline_net_price": float(base_net_price_ref),
+        "scenario_net_price": float(scenario_net_price),
         "price_elasticity": float(trained_bundle.get("pooled_elasticity", CONFIG["PRIOR_ELASTICITY"])),
         "price_elasticity_prior": float(CONFIG["PRIOR_ELASTICITY"]),
         "price_cap": 0.35,
-        "promo_flag_baseline": 1.0 if float(current_ctx.get("promotion", 0.0)) > 0 else 0.0,
-        "promo_flag_scenario": 1.0 if float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))) > 0 else 0.0,
+        "promo_baseline": float(current_ctx.get("promotion", 0.0)),
+        "promo_scenario": float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))),
+        "promo_flag_baseline": float(1.0 if float(current_ctx.get("promotion", 0.0)) > 0 else 0.0),
+        "promo_flag_scenario": float(1.0 if float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))) > 0 else 0.0),
         "promo_intensity_baseline": float(current_ctx.get("promotion", 0.0)),
         "promo_intensity_scenario": float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))),
+        "freight_baseline": float(current_ctx.get("freight_value", 0.0)),
         "freight_ref": float(current_ctx.get("freight_value", 0.0)),
         "freight_scenario": scenario_freight,
         "baseline_freight_value": float(current_ctx.get("freight_value", 0.0)),
@@ -3223,7 +3251,7 @@ def run_what_if_projection(
     manual_shock_multiplier = float(scenario_overrides.get("manual_shock_multiplier", 1.0))
     has_explicit_shocks = bool(len(shocks))
     scenario_changed = bool(
-        abs(requested_price - baseline_price_ref) > 1e-9
+        abs(effective_scenario["applied_price_gross"] - effective_scenario["current_price_gross"]) > 1e-9
         or abs(scenario_discount - baseline_discount) > 1e-9
         or abs(scenario_freight - baseline_freight) > 1e-9
         or abs(scenario_cost - baseline_cost) > 1e-9
@@ -3249,10 +3277,12 @@ def run_what_if_projection(
     if len(daily):
         daily["base_pred_sales"] = np.asarray(scenario_result["baseline_units"], dtype=float)
         daily["pred_sales"] = np.asarray(scenario_result["final_units"], dtype=float)
-        daily["discount"] = scenario_discount
+        daily["price"] = float(model_price)
+        daily["discount"] = float(scenario_discount)
         daily["cost"] = scenario_cost
         daily["freight_value"] = scenario_freight
         daily["net_unit_price"] = scenario_net_price
+        daily["promotion"] = float(promo_scenario)
         daily["stock"] = stock_series
         daily["unconstrained_demand"] = daily["pred_sales"].clip(lower=0.0)
         stock_lookup = pd.to_numeric(daily.get("stock", pd.Series([np.inf] * len(daily))), errors="coerce").fillna(np.inf).values
@@ -3265,10 +3295,39 @@ def run_what_if_projection(
     revenue_total = float(daily["revenue"].sum()) if "revenue" in daily.columns else 0.0
     lost_sales_total = float(daily["lost_sales"].sum()) if "lost_sales" in daily.columns else 0.0
     base_confidence = float(trained_bundle.get("confidence", 0.6))
-    ood_penalty = 0.20 if bool(not is_price_plausible(requested_price, train_min, train_max, margin=0.25)) else 0.0
+    price_plausibility = 1.0 if is_price_plausible(effective_scenario["applied_price_gross"], train_min, train_max, margin=0.25) else 0.0
+    ood_penalty = 0.20 if not bool(price_plausibility) else 0.0
     horizon_penalty = max(0.0, (len(future_dates) - 30) / 120.0)
     extreme_penalty = max(0.0, abs(float(freight_multiplier) - 1.0) + abs(float(discount_multiplier) - 1.0) + abs(float(cost_multiplier) - 1.0) - 0.25) * 0.08
-    confidence_scenario = float(np.clip(base_confidence - ood_penalty - horizon_penalty - extreme_penalty, 0.05, 0.99))
+    history_daily = base_history.copy()
+    hist_discount = pd.to_numeric(history_daily.get("discount", pd.Series(np.zeros(len(history_daily)))), errors="coerce").fillna(0.0)
+    hist_discount = hist_discount.clip(0.0, 0.95)
+    history_daily["net_price_hist"] = pd.to_numeric(history_daily.get("price", pd.Series(np.zeros(len(history_daily)))), errors="coerce").fillna(0.0) * (1.0 - hist_discount)
+    net_support = evaluate_net_price_support(
+        history_daily["net_price_hist"] if "net_price_hist" in history_daily.columns else history_daily.get("price"),
+        float(effective_scenario["applied_price_net"]),
+    )
+    support_weight = float(scenario_result.get("confidence", {}).get("price", {}).get("score", base_confidence))
+    trend_confidence = float(np.clip(1.0 - horizon_penalty, 0.0, 1.0))
+    data_confidence = float(np.clip(base_confidence, 0.0, 1.0))
+    net_price_penalty = 0.0 if bool(net_support.get("net_price_supported", True)) else 0.18
+    discount_depth_penalty = min(0.15, max(0.0, scenario_discount - baseline_discount) * 0.5)
+    confidence_scenario = max(
+        0.05,
+        min(
+            0.98,
+            0.60 * price_plausibility
+            + 0.20 * data_confidence
+            + 0.10 * support_weight
+            + 0.10 * trend_confidence
+            - ood_penalty
+            - horizon_penalty
+            - extreme_penalty
+            - net_price_penalty
+            - discount_depth_penalty,
+        ),
+    )
+    confidence_label = "Высокая" if confidence_scenario >= 0.75 else ("Средняя" if confidence_scenario >= 0.45 else "Низкая")
     baseline_bundle_meta = trained_bundle.get("baseline_bundle", {})
     active_path = resolve_final_active_path(
         selected_forecaster=str(baseline_bundle_meta.get("selected_forecaster", "weekly_model")),
@@ -3310,15 +3369,18 @@ def run_what_if_projection(
         "confidence": confidence_scenario,
         "confidence_base": base_confidence,
         "confidence_scenario": confidence_scenario,
+        "confidence_label": confidence_label,
         "uncertainty": 1.0 - confidence_scenario,
-        "ood_flag": bool(not is_price_plausible(requested_price, train_min, train_max, margin=0.25)),
+        "ood_flag": bool(not is_price_plausible(effective_scenario["applied_price_gross"], train_min, train_max, margin=0.25)),
         "requested_price": requested_price,
         "model_price": model_price,
         "price_for_model": model_price,
-        "current_price_raw": float(current_ctx.get("price", manual_price)),
-        "price_clipped": bool(price_inputs["price_clipped"]),
-        "clip_applied": bool(price_inputs["price_clipped"]),
-        "clip_reason": str(price_inputs["clip_reason"]),
+        "current_price_raw": float(current_price_raw),
+        "price_clipped": bool(clip["price_clipped"]),
+        "clip_applied": bool(clip["price_clipped"]),
+        "clip_reason": str(clip["clip_reason"]),
+        "net_price_supported": bool(net_support.get("net_price_supported", True)),
+        "net_price_support": net_support,
         "scenario_price_effect_source": "scenario_engine_recompute_from_baseline",
         "fallback_multiplier_used": runtime_meta["fallback_multiplier_used"],
         "fallback_reason": runtime_meta["fallback_reason"],
@@ -3354,8 +3416,9 @@ def run_what_if_projection(
             "scenario_freight": float(scenario_freight),
             "shock_multiplier": float(demand_multiplier),
         },
+        "effective_scenario": effective_scenario,
         "confidence_factors": scenario_result.get("confidence", {}),
-        "warnings": scenario_result.get("warnings", []) + backend_warning,
+        "warnings": scenario_result.get("warnings", []) + backend_warning + ([str(net_support.get("net_price_warning", ""))] if net_support.get("net_price_warning") else []),
     }
 
 
@@ -3452,8 +3515,32 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         as_is[["date", "actual_sales", "revenue", "profit"]]
         .rename(columns={"actual_sales": "as_is_demand", "revenue": "as_is_revenue", "profit": "as_is_profit"})
         .merge(
-            scenario[["date", "actual_sales", "revenue", "profit", "price", "discount", "promotion", "freight_value", "lost_sales"]].rename(
-                columns={"actual_sales": "scenario_demand", "revenue": "scenario_revenue", "profit": "scenario_profit", "price": "scenario_price", "discount": "scenario_discount", "promotion": "scenario_promotion", "freight_value": "scenario_freight_value"}
+            scenario[
+                [
+                    "date",
+                    "actual_sales",
+                    "revenue",
+                    "profit",
+                    "price",
+                    "discount",
+                    "net_unit_price",
+                    "promotion",
+                    "freight_value",
+                    "cost",
+                    "lost_sales",
+                ]
+            ].rename(
+                columns={
+                    "actual_sales": "scenario_demand",
+                    "revenue": "scenario_revenue",
+                    "profit": "scenario_profit",
+                    "price": "scenario_price_gross",
+                    "discount": "scenario_discount",
+                    "net_unit_price": "scenario_price_net",
+                    "promotion": "scenario_promotion",
+                    "freight_value": "scenario_freight_value",
+                    "cost": "scenario_cost",
+                }
             ),
             on="date",
             how="outer",
@@ -3485,18 +3572,22 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
             "as_is_profit",
             "scenario_profit",
             "delta_profit",
-            "scenario_price",
+            "scenario_price_gross",
             "scenario_discount",
+            "scenario_price_net",
             "scenario_promotion",
             "scenario_freight_value",
+            "scenario_cost",
             "lost_sales",
         ]
     ].copy()
     summary = {
         "artifact_scope": "manual_scenario",
-        "scenario_status": "executed",
+        "scenario_status": what_if_result.get("scenario_status", "as_is"),
         "requested_price": float(what_if_result.get("requested_price", np.nan)),
         "model_price": float(what_if_result.get("model_price", what_if_result.get("price_for_model", np.nan))),
+        "applied_discount": float((what_if_result.get("effective_scenario", {}) or {}).get("applied_discount", np.nan)),
+        "applied_price_net": float((what_if_result.get("effective_scenario", {}) or {}).get("applied_price_net", np.nan)),
         "modeled_price": float(what_if_result.get("model_price", what_if_result.get("price_for_model", np.nan))),
         "current_price_raw": float(what_if_result.get("current_price_raw", np.nan)),
         "clip_applied": bool(what_if_result.get("clip_applied", what_if_result.get("price_clipped", False))),
@@ -3558,27 +3649,76 @@ def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str
         )
     except Exception:
         pass
-    scenario_contract = (what_if_result or {}).get("scenario_inputs_contract", {})
+    effective_scenario = (what_if_result or {}).get("effective_scenario", {})
     price_min = float(pd.to_numeric(history.get("price", pd.Series([0.0])), errors="coerce").dropna().min()) if len(history) else 0.0
     price_max = float(pd.to_numeric(history.get("price", pd.Series([0.0])), errors="coerce").dropna().max()) if len(history) else 0.0
     freight_min = float(pd.to_numeric(history.get("freight_value", pd.Series([0.0])), errors="coerce").dropna().min()) if len(history) else 0.0
     freight_max = float(pd.to_numeric(history.get("freight_value", pd.Series([0.0])), errors="coerce").dropna().max()) if len(history) else 0.0
     promo_min = float(pd.to_numeric(history.get("promotion", pd.Series([0.0])), errors="coerce").dropna().min()) if len(history) else 0.0
     promo_max = float(pd.to_numeric(history.get("promotion", pd.Series([0.0])), errors="coerce").dropna().max()) if len(history) else 0.0
+    hist_discount = pd.to_numeric(history.get("discount", pd.Series(np.zeros(len(history)))), errors="coerce").fillna(0.0).clip(0.0, 0.95)
+    hist_net = pd.to_numeric(history.get("price", pd.Series(np.zeros(len(history)))), errors="coerce").fillna(0.0) * (1.0 - hist_discount)
+    net_min = float(pd.to_numeric(hist_net, errors="coerce").dropna().min()) if len(history) else 0.0
+    net_max = float(pd.to_numeric(hist_net, errors="coerce").dropna().max()) if len(history) else 0.0
     warnings_local: List[str] = []
     in_range = True
-    if scenario_contract:
-        sc_price = float(scenario_contract.get("scenario_price", scenario_contract.get("base_price", 0.0)))
-        sc_freight = float(scenario_contract.get("scenario_freight", scenario_contract.get("base_freight", 0.0)))
-        sc_promo = float(scenario_contract.get("scenario_promo", scenario_contract.get("base_promo", 0.0)))
-        if price_max > price_min and (sc_price < price_min * 0.85 or sc_price > price_max * 1.15):
-            warnings_local.append("price change too far beyond historical range.")
-            in_range = False
-        if freight_max > freight_min and (sc_freight < max(0.0, freight_min * 0.85) or sc_freight > freight_max * 1.15):
-            warnings_local.append("freight change outside observed window.")
-            in_range = False
-        if promo_max > promo_min and (sc_promo < max(0.0, promo_min - 0.10) or sc_promo > min(1.0, promo_max + 0.10)):
-            warnings_local.append("promo level exceeds historical support.")
+    scenario_range_status: Dict[str, str] = {"price": "ok", "net_price": "ok", "promo": "ok", "freight": "ok"}
+    tol = 1e-9
+
+    def _check_range(value: Optional[float], rng_min: float, rng_max: float, key: str, flat_msg: str, out_msg: str) -> None:
+        nonlocal in_range
+        if value is None:
+            return
+        if abs(rng_max - rng_min) <= tol:
+            if abs(float(value) - rng_min) > tol:
+                scenario_range_status[key] = "warn"
+                warnings_local.append(flat_msg)
+                in_range = False
+        else:
+            lower_clip = rng_min - 0.15 * abs(rng_max - rng_min)
+            upper_clip = rng_max + 0.15 * abs(rng_max - rng_min)
+            if not (lower_clip <= float(value) <= upper_clip):
+                scenario_range_status[key] = "warn"
+                warnings_local.append(out_msg)
+                in_range = False
+
+    if effective_scenario:
+        _check_range(
+            float(effective_scenario.get("applied_price_gross", 0.0)),
+            price_min,
+            price_max,
+            "price",
+            "Цена вышла за пределы исторически наблюдаемого уровня",
+            "Изменение цены выходит далеко за пределы исторического диапазона",
+        )
+        _check_range(
+            float(effective_scenario.get("applied_price_net", 0.0)),
+            net_min,
+            net_max,
+            "net_price",
+            "Итоговая цена для клиента после скидки вышла за фиксированный исторический уровень",
+            "Итоговая цена для клиента после скидки выходит за историческую поддержку",
+        )
+        _check_range(
+            float(effective_scenario.get("promotion", 0.0)),
+            promo_min,
+            promo_max,
+            "promo",
+            "Промо вышло за пределы исторически наблюдаемого уровня",
+            "Промо выходит далеко за пределы исторического диапазона",
+        )
+        _check_range(
+            float(effective_scenario.get("freight_value", 0.0)),
+            freight_min,
+            freight_max,
+            "freight",
+            "Логистика вышла за пределы исторически наблюдаемого уровня",
+            "Логистика выходит далеко за пределы исторического диапазона",
+        )
+        net_warning = str((what_if_result or {}).get("net_price_support", {}).get("net_price_warning", ""))
+        if net_warning:
+            warnings_local.append(net_warning)
+            scenario_range_status["net_price"] = "warn"
             in_range = False
     std_ratio_final = scenario_output_summary.get("std_ratio_final", run_summary_cfg.get("std_ratio_final", float("nan")))
     shape_quality_low = bool(run_summary_cfg.get("shape_quality_low", scenario_output_summary.get("shape_quality_low", False)))
@@ -3588,6 +3728,8 @@ def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str
         "data_sufficiency": sufficiency["label"],
         "data_message": sufficiency["message"],
         "scenario_range_status": "in_range" if in_range else "out_of_range",
+        "scenario_range_details": scenario_range_status if effective_scenario else {},
+        "scenario_range_overall": "in_range" if in_range else "out_of_range",
         "active_calculation_mode": active_path,
         "fallback_used": bool((what_if_result or {}).get("fallback_multiplier_used", False)),
         "warnings": sufficiency.get("warnings", []) + warnings_local + list((what_if_result or {}).get("warnings", [])),
@@ -3619,6 +3761,8 @@ def build_business_report_payload(
         scenario_daily = as_is
         scenario_status = "as_is"
     trust = build_trust_block(results, what_if_result)
+    conf_score = _finite((what_if_result or {}).get("confidence_scenario", 0.0))
+    conf_label = str((what_if_result or {}).get("confidence_label", "Низкая"))
     as_is_units = _finite(float(as_is["actual_sales"].sum()) if len(as_is) else 0.0)
     as_is_revenue = _finite(float(as_is["revenue"].sum()) if len(as_is) else 0.0)
     as_is_profit = _finite(float(as_is["profit"].sum()) if len(as_is) and "profit" in as_is.columns else 0.0)
@@ -3660,6 +3804,14 @@ def build_business_report_payload(
                 "price_clipped": bool((what_if_result or {}).get("price_clipped", False)),
                 "clip_reason": str((what_if_result or {}).get("clip_reason", "")),
             },
+            "scenario_effective_summary": {
+                "requested_price_gross": _finite((what_if_result or {}).get("effective_scenario", {}).get("requested_price_gross", (what_if_result or {}).get("requested_price", results.get("current_price", 0.0)))),
+                "applied_price_gross": _finite((what_if_result or {}).get("effective_scenario", {}).get("applied_price_gross", (what_if_result or {}).get("model_price", results.get("current_price", 0.0)))),
+                "applied_discount": _finite((what_if_result or {}).get("effective_scenario", {}).get("applied_discount", 0.0)),
+                "applied_price_net": _finite((what_if_result or {}).get("effective_scenario", {}).get("applied_price_net", 0.0)),
+                "clip_flag": bool((what_if_result or {}).get("effective_scenario", {}).get("price_clipped", (what_if_result or {}).get("price_clipped", False))),
+                "clip_reason": str((what_if_result or {}).get("effective_scenario", {}).get("clip_reason", (what_if_result or {}).get("clip_reason", ""))),
+            },
         },
         "margin_available": margin_available,
         "baseline_forecast": {
@@ -3682,6 +3834,8 @@ def build_business_report_payload(
             "clip_reason": str((what_if_result or {}).get("clip_reason", "")),
         },
         "warnings_reliability_notes": trust["warnings"] + (["scenario payload missing; fell back to as-is"] if scenario_payload_missing else []),
+        "scenario_confidence": {"score": conf_score, "label": conf_label},
+        "data_quality": {"data_quality_label": str(trust.get("data_sufficiency", "unknown")), "data_quality_score": _finite(results.get("_trained_bundle", {}).get("confidence", 0.0))},
         "saved_scenarios": saved_scenarios or {},
     }
 
@@ -3715,7 +3869,8 @@ def build_scenario_comparison_table(
 def build_saved_scenario_metrics(
     as_is_forecast: pd.DataFrame,
     scenario_forecast: pd.DataFrame,
-) -> Dict[str, float]:
+    what_if_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     as_is_units = float(as_is_forecast["actual_sales"].sum())
     as_is_revenue = float(as_is_forecast["revenue"].sum())
     as_is_profit = float(as_is_forecast["profit"].sum()) if "profit" in as_is_forecast.columns else float("nan")
@@ -3724,6 +3879,7 @@ def build_saved_scenario_metrics(
     scenario_revenue = float(scenario_forecast["revenue"].sum())
     scenario_profit = float(scenario_forecast["profit"].sum()) if "profit" in scenario_forecast.columns else float("nan")
 
+    effective = (what_if_result or {}).get("effective_scenario", {})
     return {
         "units": scenario_units,
         "revenue": scenario_revenue,
@@ -3731,6 +3887,15 @@ def build_saved_scenario_metrics(
         "delta_units": scenario_units - as_is_units,
         "delta_revenue": scenario_revenue - as_is_revenue,
         "delta_profit": scenario_profit - as_is_profit,
+        "requested_price_gross": float(effective.get("requested_price_gross", (what_if_result or {}).get("requested_price", np.nan))),
+        "applied_price_gross": float(effective.get("applied_price_gross", (what_if_result or {}).get("model_price", np.nan))),
+        "applied_price_net": float(effective.get("applied_price_net", np.nan)),
+        "applied_discount": float(effective.get("applied_discount", np.nan)),
+        "promotion": float(effective.get("promotion", np.nan)),
+        "freight_value": float(effective.get("freight_value", np.nan)),
+        "price_clipped": bool(effective.get("price_clipped", (what_if_result or {}).get("price_clipped", False))),
+        "clip_reason": str(effective.get("clip_reason", (what_if_result or {}).get("clip_reason", ""))),
+        "confidence_label": str((what_if_result or {}).get("confidence_label", "Низкая")),
     }
 
 
@@ -3754,16 +3919,23 @@ def build_applied_scenario_snapshot(
     demand_mult: float,
     hdays: int,
 ) -> Dict[str, Any]:
+    effective = wr.get("effective_scenario", {}) if isinstance(wr, dict) else {}
     return {
         "manual_price_requested": float(manual_price),
-        "manual_price_modeled": float(wr.get("model_price", wr.get("price_for_model", manual_price))),
-        "price_clipped": bool(wr.get("price_clipped", False)),
-        "clip_reason": str(wr.get("clip_reason", "")),
-        "discount": float(discount),
-        "promo": float(promo_value),
+        "manual_price_applied": float(effective.get("applied_price_gross", wr.get("model_price", wr.get("price_for_model", manual_price)))),
+        "discount_requested": float(discount),
+        "discount_applied": float(effective.get("applied_discount", discount)),
+        "net_price_applied": float(effective.get("applied_price_net", wr.get("daily", pd.DataFrame()).get("net_unit_price", pd.Series([np.nan])).iloc[0] if isinstance(wr.get("daily", None), pd.DataFrame) and len(wr.get("daily")) else np.nan)),
+        "promo_requested": float(promo_value),
+        "promo_applied": float(effective.get("promotion", promo_value)),
+        "freight_requested_multiplier": float(freight_mult),
+        "freight_applied": float(effective.get("freight_value", np.nan)),
+        "price_clipped": bool(effective.get("price_clipped", wr.get("price_clipped", False))),
+        "clip_reason": str(effective.get("clip_reason", wr.get("clip_reason", ""))),
         "freight_mult": float(freight_mult),
         "demand_mult": float(demand_mult),
         "horizon_days": int(hdays),
+        "scenario_status": str(wr.get("scenario_status", "as_is")),
     }
 
 
@@ -3787,10 +3959,12 @@ def get_user_scenario_status(
 
     if applied_snapshot is None:
         return "as_is" if _same(current_form, base_form) else "dirty"
+    if str(applied_snapshot.get("scenario_status", "computed")) in {"as_is", "no_effect"}:
+        return "as_is" if _same(current_form, base_form) else "dirty"
     applied_form = {
         "manual_price": float(applied_snapshot.get("manual_price_requested", base_form["manual_price"])),
-        "discount": float(applied_snapshot.get("discount", base_form["discount"])),
-        "promo_value": float(applied_snapshot.get("promo", base_form["promo_value"])),
+        "discount": float(applied_snapshot.get("discount_requested", base_form["discount"])),
+        "promo_value": float(applied_snapshot.get("promo_requested", base_form["promo_value"])),
         "freight_mult": float(applied_snapshot.get("freight_mult", base_form["freight_mult"])),
         "demand_mult": float(applied_snapshot.get("demand_mult", base_form["demand_mult"])),
         "hdays": int(applied_snapshot.get("horizon_days", base_form["hdays"])),
@@ -3820,10 +3994,11 @@ def render_applied_scenario_block(snapshot: Optional[Dict[str, Any]]) -> None:
     open_surface("Применённый сценарий")
     c1, c2, c3 = st.columns(3)
     c1.metric("Цена (запрошенная)", f"{float(snapshot.get('manual_price_requested', 0.0)):.2f} ₽")
-    c1.metric("Скидка", f"{float(snapshot.get('discount', 0.0)):.0%}")
-    c1.metric("Промо", f"{float(snapshot.get('promo', 0.0)):.0%}")
-    c2.metric("Цена (модель)", f"{float(snapshot.get('manual_price_modeled', 0.0)):.2f} ₽")
-    c2.metric("Логистика", f"{float(snapshot.get('freight_mult', 1.0)):.2f}x")
+    c1.metric("Скидка (applied)", f"{float(snapshot.get('discount_applied', 0.0)):.0%}")
+    c1.metric("Промо (applied)", f"{float(snapshot.get('promo_applied', 0.0)):.0%}")
+    c2.metric("Цена (applied)", f"{float(snapshot.get('manual_price_applied', 0.0)):.2f} ₽")
+    c2.metric("Цена net (applied)", f"{float(snapshot.get('net_price_applied', 0.0)):.2f} ₽")
+    c2.metric("Логистика (applied)", f"{float(snapshot.get('freight_applied', 0.0)):.2f}")
     c2.metric("Доп. множитель спроса", f"{float(snapshot.get('demand_mult', 1.0)):.2f}x")
     clip_text = "Цена ограничена" if bool(snapshot.get("price_clipped", False)) else "Без ограничений"
     c3.metric("Ограничение цены", clip_text)
@@ -3899,7 +4074,19 @@ def build_user_friendly_comparison_table(
     for slot in ["Scenario A", "Scenario B", "Scenario C"]:
         if slot in saved_scenarios:
             s = saved_scenarios[slot]
-            rows.append(_row(slot, float(s.get("units", 0.0)), float(s.get("revenue", 0.0)), float(s.get("profit", np.nan))))
+            row = _row(slot, float(s.get("units", 0.0)), float(s.get("revenue", 0.0)), float(s.get("profit", np.nan)))
+            row.update(
+                {
+                    "Цена gross": float(s.get("applied_price_gross", np.nan)),
+                    "Цена net": float(s.get("applied_price_net", np.nan)),
+                    "Скидка": float(s.get("applied_discount", np.nan)),
+                    "Промо": float(s.get("promotion", np.nan)),
+                    "Логистика": float(s.get("freight_value", np.nan)),
+                    "Confidence": str(s.get("confidence_label", "")),
+                    "Clip": "Да" if bool(s.get("price_clipped", False)) else "Нет",
+                }
+            )
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -4015,23 +4202,30 @@ if __name__ == "__main__":
 
     def _render_mechanics_explainer(results: Dict[str, Any], what_if_result: Optional[Dict[str, Any]]) -> None:
         wr = what_if_result or {}
-        contract = wr.get("scenario_inputs_contract", {}) if isinstance(wr, dict) else {}
-        model_price = wr.get("model_price", wr.get("price_for_model", results.get("current_price", "n/a")))
-        requested_price = wr.get("requested_price", results.get("current_price", "n/a"))
+        effective = wr.get("effective_scenario", {}) if isinstance(wr, dict) else {}
+        model_price = effective.get("applied_price_gross", wr.get("model_price", wr.get("price_for_model", results.get("current_price", "n/a"))))
+        requested_price = effective.get("requested_price_gross", wr.get("requested_price", results.get("current_price", "n/a")))
         profit_raw = wr.get("profit_total_raw", "n/a")
         profit_adjusted = wr.get("profit_total_adjusted", "n/a")
+        confidence = wr.get("confidence_label", "n/a")
 
         st.markdown("#### Как работает механизм расчёта")
         st.markdown(
-            "1) **База (baseline)**: строится прогноз без ручных изменений.  \n"
-            "2) **Сценарий (what-if)**: вы меняете цену/промо/множители, система пересчитывает спрос по дням.  \n"
-            "3) **Сравнение**: показываем дельту по спросу, выручке и прибыли относительно базы."
+            "1) Пользователь задаёт **gross price**.  \n"
+            "2) Система применяет **clip** по историческому диапазону (если нужно).  \n"
+            "3) Затем применяется **discount** и формируется **effective net price**.  \n"
+            "4) Реакция спроса считается именно от **effective net price**.  \n"
+            "5) Выручка/прибыль считаются из applied gross/discount/cost/freight."
         )
         st.markdown("#### Что именно система сравнивает")
         st.markdown(
             f"- Цена: requested `{requested_price}` → modeled `{model_price}`.  \n"
-            f"- Промо: base `{contract.get('base_promo', 'n/a')}` → scenario `{contract.get('scenario_promo', 'n/a')}`.  \n"
-            f"- Freight: base `{contract.get('base_freight', 'n/a')}` → scenario `{contract.get('scenario_freight', 'n/a')}`.  \n"
+            f"- Discount (applied): `{effective.get('applied_discount', wr.get('scenario_inputs_contract', {}).get('scenario_discount', 'n/a'))}`.  \n"
+            f"- Net price (applied): `{effective.get('applied_price_net', wr.get('scenario_inputs_contract', {}).get('scenario_net_price', 'n/a'))}`.  \n"
+            f"- Промо: `{effective.get('promotion', 'n/a')}`.  \n"
+            f"- Freight: `{effective.get('freight_value', 'n/a')}`.  \n"
+            f"- Clip reason: `{effective.get('clip_reason', wr.get('clip_reason', ''))}`.  \n"
+            f"- Confidence: `{confidence}`.  \n"
             f"- Прибыль: raw `{profit_raw}` и adjusted `{profit_adjusted}`."
         )
 
@@ -4362,7 +4556,7 @@ if __name__ == "__main__":
         )
         save_to_slot_btn = st.button("Сохранить в слот", use_container_width=True, disabled=r.get("scenario_forecast") is None)
         if save_to_slot_btn and r.get("scenario_forecast") is not None:
-            st.session_state.saved_scenarios[selected_slot] = build_saved_scenario_metrics(current_forecast, r["scenario_forecast"])
+            st.session_state.saved_scenarios[selected_slot] = build_saved_scenario_metrics(current_forecast, r["scenario_forecast"], st.session_state.what_if_result)
             st.session_state.last_saved_slot = selected_slot
             st.session_state.scenario_ui_status = "saved"
             st.toast(f"Сценарий сохранён в слот {selected_slot}", icon="✓")
@@ -4460,7 +4654,7 @@ if __name__ == "__main__":
         scenario_applied = wr != {} and r.get("scenario_forecast") is not None
         trust = build_trust_block(r, st.session_state.what_if_result)
         warnings_count = len(trust.get("warnings", []))
-        confidence_label = "Высокая" if str(trust.get("data_sufficiency", "")).lower() == "enough" and warnings_count == 0 else ("Средняя" if warnings_count <= 2 else "Низкая")
+        confidence_label = str(wr.get("confidence_label", "Низкая"))
         demand_delta = sc_units - base_units if scenario_applied else np.nan
         revenue_delta = sc_revenue - base_revenue if scenario_applied else np.nan
         profit_delta = sc_profit - base_profit if scenario_applied else np.nan
@@ -4485,10 +4679,10 @@ if __name__ == "__main__":
         open_surface("Что именно мы проверили")
         if snapshot:
             st.markdown(
-                f"- Текущая цена → проверяемая: **{float(r.get('current_price', 0.0)):.2f} ₽ → {float(snapshot.get('manual_price_modeled', 0.0)):.2f} ₽**\n"
-                f"- Скидка: **{float(snapshot.get('discount', 0.0)):.0%}**\n"
-                f"- Промо: **{float(snapshot.get('promo', 0.0)):.0%}**\n"
-                f"- Логистика: **{float(snapshot.get('freight_mult', 1.0)):.2f}x**\n"
+                f"- Текущая цена → проверяемая: **{float(r.get('current_price', 0.0)):.2f} ₽ → {float(snapshot.get('manual_price_applied', 0.0)):.2f} ₽**\n"
+                f"- Скидка (applied): **{float(snapshot.get('discount_applied', 0.0)):.0%}**\n"
+                f"- Промо (applied): **{float(snapshot.get('promo_applied', 0.0)):.0%}**\n"
+                f"- Логистика (applied): **{float(snapshot.get('freight_applied', 0.0)):.2f}**\n"
                 f"- Множитель спроса: **{float(snapshot.get('demand_mult', 1.0)):.2f}x**\n"
                 f"- Горизонт: **{int(snapshot.get('horizon_days', 0))} дней**"
             )

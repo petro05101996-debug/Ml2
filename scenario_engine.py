@@ -63,8 +63,18 @@ def run_scenario(
         float(metadata.get("price_span", 0.0)),
         float(metadata.get("price_stability", 0.5)),
     )
-    reference_price = float(scenario_inputs.get("baseline_price_ref", scenario_inputs.get("current_price", 1.0)))
-    scenario_price = float(scenario_inputs.get("scenario_price", reference_price))
+    reference_price = float(
+        scenario_inputs.get(
+            "demand_price_baseline",
+            scenario_inputs.get("baseline_price_ref", scenario_inputs.get("base_price", baseline_units.mean())),
+        )
+    )
+    scenario_price = float(
+        scenario_inputs.get(
+            "demand_price_scenario",
+            scenario_inputs.get("scenario_price", scenario_inputs.get("gross_price_scenario", reference_price)),
+        )
+    )
     beta_local = float(scenario_inputs.get("price_elasticity", DEFAULTS["price_elasticity"]))
     beta_prior = float(scenario_inputs.get("price_elasticity_prior", DEFAULTS["price_elasticity_prior"]))
     beta_final = _blend_price_elasticity(beta_local, beta_prior, float(price_conf["score"]))
