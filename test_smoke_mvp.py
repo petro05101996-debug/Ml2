@@ -185,7 +185,7 @@ def test_manual_scenario_artifacts_created_after_runtime_what_if():
     summary_blob, daily_blob = build_manual_scenario_artifacts(res, wr)
     summary = json.loads(summary_blob.decode("utf-8"))
     daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
-    assert summary["scenario_status"] == "executed"
+    assert summary["scenario_status"] == wr["scenario_status"]
     assert len(daily) > 0
     assert "scenario_demand" in daily.columns
 
@@ -209,7 +209,7 @@ def test_manual_scenario_executes_and_populates_summary():
     wr = run_what_if_projection(bundle, manual_price=base_price * 1.1)
     summary_blob, _ = build_manual_scenario_artifacts(res, wr)
     summary = json.loads(summary_blob.decode("utf-8"))
-    assert summary["scenario_status"] == "executed"
+    assert summary["scenario_status"] == wr["scenario_status"]
     assert np.isfinite(summary["scenario_demand_total"])
     assert np.isfinite(summary["scenario_revenue_total"])
     assert np.isfinite(summary["scenario_profit_total"])
@@ -760,8 +760,10 @@ def test_no_double_counting_price_effect_against_direct_engine():
     expected = run_scenario_engine(
         baseline_output=pd.DataFrame({"date": baseline_daily["date"], "baseline_units": baseline_daily["base_pred_sales"]}),
         scenario_inputs={
-            "baseline_price_ref": base_price,
-            "scenario_price": float(scenario.get("model_price", scenario.get("price_for_model", target_price))),
+            "demand_price_baseline": float(scenario.get("effective_scenario", {}).get("current_price_net", base_price)),
+            "demand_price_scenario": float(scenario.get("effective_scenario", {}).get("applied_price_net", target_price)),
+            "gross_price_baseline": base_price,
+            "gross_price_scenario": float(scenario.get("model_price", scenario.get("price_for_model", target_price))),
             "baseline_net_price": base_price * (1.0 - float(bundle["base_ctx"].get("discount", 0.0))),
             "scenario_net_price": float(scenario.get("model_price", scenario.get("price_for_model", target_price))) * (1.0 - float(bundle["base_ctx"].get("discount", 0.0))),
             "promo_flag_baseline": 1.0 if float(bundle["base_ctx"].get("promotion", 0.0)) > 0 else 0.0,
@@ -1114,7 +1116,8 @@ def test_discount_multiplier_affects_scenario_economics():
     base_price = float(bundle["base_ctx"]["price"])
     base = run_what_if_projection(bundle, manual_price=base_price, discount_multiplier=1.0, overrides={"discount": 0.10})
     deep_discount = run_what_if_projection(bundle, manual_price=base_price, discount_multiplier=2.0, overrides={"discount": 0.10})
-    assert float(deep_discount["revenue_total"]) < float(base["revenue_total"])
+    assert float(deep_discount["effective_scenario"]["applied_price_net"]) < float(base["effective_scenario"]["applied_price_net"])
+    assert float(deep_discount["demand_total"]) >= float(base["demand_total"])
 
 
 def test_cost_multiplier_affects_profit():

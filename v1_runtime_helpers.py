@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 
 
 def select_weekly_baseline_candidate(
@@ -144,3 +145,37 @@ def build_backend_warning(model_backend: str, backend_reason: str) -> str:
     if str(model_backend) == "deterministic_fallback":
         return f"CatBoost недоступен: используется deterministic fallback ({backend_reason})."
     return ""
+
+
+def evaluate_net_price_support(
+    historical_net_prices: pd.Series | None,
+    applied_net_price: float,
+    tol: float = 1e-9,
+) -> Dict[str, Any]:
+    if historical_net_prices is None:
+        return {
+            "net_price_supported": True,
+            "net_price_min": None,
+            "net_price_max": None,
+            "net_price_out_of_range": False,
+            "net_price_warning": "",
+        }
+    hist = pd.to_numeric(historical_net_prices, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if hist.empty:
+        return {
+            "net_price_supported": True,
+            "net_price_min": None,
+            "net_price_max": None,
+            "net_price_out_of_range": False,
+            "net_price_warning": "",
+        }
+    np_min = float(hist.min())
+    np_max = float(hist.max())
+    out_of_range = bool(applied_net_price < np_min - tol or applied_net_price > np_max + tol)
+    return {
+        "net_price_supported": not out_of_range,
+        "net_price_min": np_min,
+        "net_price_max": np_max,
+        "net_price_out_of_range": out_of_range,
+        "net_price_warning": "Итоговая цена для клиента после скидки выходит за историческую поддержку" if out_of_range else "",
+    }

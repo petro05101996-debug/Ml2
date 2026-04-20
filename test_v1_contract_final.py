@@ -1,10 +1,17 @@
 import copy
+import io
 import json
 
 import numpy as np
+import pandas as pd
 
 from app import (
+    build_applied_scenario_snapshot,
     build_business_report_payload,
+    build_manual_scenario_artifacts,
+    build_saved_scenario_metrics,
+    build_trust_block,
+    get_user_scenario_status,
     resolve_final_active_path,
     run_full_pricing_analysis_universal,
     run_what_if_projection,
@@ -106,7 +113,7 @@ def test_business_report_scenario_status_computed_when_manual_scenario_present()
     res = _analyze_bundle()
     bundle = res["_trained_bundle"]
     base_price = float(bundle["base_ctx"]["price"])
-    scenario = run_what_if_projection(bundle, manual_price=base_price * 1.05)
+    scenario = run_what_if_projection(bundle, manual_price=base_price, overrides={"promotion": 1.0})
     payload = build_business_report_payload(res, scenario, {})
     assert payload["scenario_status"] == "computed"
 
@@ -163,3 +170,83 @@ def test_promo_down_reduces_demand():
     lower = run_what_if_projection(bundle, manual_price=base_price, overrides={"promotion": max(0.0, base_promo - 0.4)})
 
     assert float(lower["demand_total"]) <= float(higher["demand_total"])
+
+
+def test_discount_changes_demand_not_only_economics():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    low_discount = run_what_if_projection(bundle, manual_price=base_price, overrides={"discount": 0.05})
+    high_discount = run_what_if_projection(bundle, manual_price=base_price, overrides={"discount": 0.45})
+    assert not np.isclose(float(low_discount["demand_total"]), float(high_discount["demand_total"]))
+
+
+def test_net_price_support_warning_and_confidence_drop():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    base = run_what_if_projection(bundle, manual_price=base_price, overrides={"discount": 0.05})
+    deep = run_what_if_projection(bundle, manual_price=base_price, overrides={"discount": 0.95})
+    trust = build_trust_block(res, deep)
+    assert any("Итоговая цена для клиента после скидки" in str(w) for w in trust["warnings"])
+    assert float(deep["confidence_scenario"]) <= float(base["confidence_scenario"])
+
+
+def test_flat_history_warnings_price_promo_freight():
+    history = pd.DataFrame(
+        {
+            "date": pd.date_range("2025-01-01", periods=10, freq="D"),
+            "price": [100.0] * 10,
+            "discount": [0.10] * 10,
+            "promotion": [0.2] * 10,
+            "freight_value": [5.0] * 10,
+            "sales": [10.0] * 10,
+        }
+    )
+    results = {"history_daily": history, "analysis_run_summary_json": b"{}"}
+    wr = {
+        "effective_scenario": {"applied_price_gross": 120.0, "applied_price_net": 96.0, "promotion": 0.5, "freight_value": 8.0},
+        "net_price_support": {},
+    }
+    trust = build_trust_block(results, wr)
+    text = " | ".join([str(x) for x in trust["warnings"]])
+    assert "Цена вышла за пределы исторически наблюдаемого уровня" in text
+    assert "Промо вышло за пределы исторически наблюдаемого уровня" in text
+    assert "Логистика вышла за пределы исторически наблюдаемого уровня" in text
+
+
+def test_report_confidence_consistency():
+    res = _analyze_bundle()
+    payload = build_business_report_payload(res, {"confidence_scenario": 0.12, "confidence_label": "Низкая"}, {})
+    assert payload["scenario_confidence"]["label"] == "Низкая"
+
+
+def test_applied_vs_requested_after_clip_status_as_is():
+    base_form = {"manual_price": 100.0, "discount": 0.1, "promo_value": 0.2, "freight_mult": 1.0, "demand_mult": 1.0, "hdays": 30}
+    current_form = dict(base_form)
+    snapshot = {"manual_price_requested": 500.0, "manual_price_applied": 100.0, "scenario_status": "as_is"}
+    status = get_user_scenario_status(current_form, base_form, snapshot, "applied")
+    assert status == "as_is"
+
+
+def test_export_consistency_uses_applied_values():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(bundle, manual_price=base_price * 1.5, overrides={"discount": 0.33, "promotion": 0.4})
+    _, daily_blob = build_manual_scenario_artifacts(res, wr)
+    daily = pd.read_csv(io.BytesIO(daily_blob))
+    eff = wr["effective_scenario"]
+    assert np.isclose(float(daily["scenario_price_gross"].iloc[0]), float(eff["applied_price_gross"]))
+    assert np.isclose(float(daily["scenario_price_net"].iloc[0]), float(eff["applied_price_net"]))
+    assert np.isclose(float(daily["scenario_discount"].iloc[0]), float(eff["applied_discount"]))
+    assert np.isclose(float(daily["scenario_promotion"].iloc[0]), float(eff["promotion"]))
+
+
+def test_saved_scenario_snapshot_contains_effective_fields():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    wr = run_what_if_projection(bundle, manual_price=float(bundle["base_ctx"]["price"]) * 1.4)
+    saved = build_saved_scenario_metrics(res["as_is_forecast"], wr["daily"], wr)
+    for key in ["requested_price_gross", "applied_price_gross", "applied_price_net", "applied_discount", "clip_reason"]:
+        assert key in saved
