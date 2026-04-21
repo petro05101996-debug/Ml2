@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from scenario_engine import run_scenario
+from scenario_engine_enhanced import run_enhanced_scenario
 
 
 def _baseline(days: int = 7, units: float = 100.0) -> pd.DataFrame:
@@ -179,3 +180,70 @@ def test_baseline_economics_use_baseline_prices_not_scenario_prices():
     )
     assert np.allclose(out["baseline_revenue"], np.array([1000.0]))
     assert np.allclose(out["baseline_margin"], np.array([350.0]))
+
+
+def _enhanced_baseline(days: int = 5, units: float = 100.0) -> pd.DataFrame:
+    dates = pd.date_range("2025-01-01", periods=days, freq="D")
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "base_pred_sales": np.full(days, units),
+            "stock": np.full(days, 200.0),
+            "price": np.full(days, 100.0),
+            "discount": np.full(days, 0.1),
+            "promotion": np.zeros(days),
+            "cost": np.full(days, 60.0),
+            "freight_value": np.full(days, 5.0),
+            "net_unit_price": np.full(days, 90.0),
+        }
+    )
+
+
+def _run_enhanced(price: float, promo: float, freight: float, demand_mult: float = 1.0, stock_cap: float = 0.0):
+    baseline = _enhanced_baseline()
+    shocks = []
+    if demand_mult != 1.0:
+        shocks = [{"shock_name": "dm", "shock_type": "percent", "shock_value": demand_mult - 1.0, "start_date": "2025-01-01", "end_date": "2025-01-05"}]
+    return run_enhanced_scenario(
+        baseline_daily=baseline,
+        current_ctx={"price": 100.0, "discount": 0.1, "promotion": 0.0, "cost": 60.0, "freight_value": 5.0},
+        future_dates=pd.DataFrame({"date": baseline["date"]}),
+        scenario_overrides={"promotion": promo, "stock_cap": stock_cap},
+        pooled_elasticity=-1.1,
+        small_mode_info={},
+        requested_price=price,
+        model_price=price,
+        baseline_discount=0.1,
+        scenario_discount=0.1,
+        baseline_cost=60.0,
+        scenario_cost=60.0,
+        baseline_freight=5.0,
+        scenario_freight=freight,
+        shocks=shocks,
+    )
+
+
+def test_enhanced_price_monotonicity():
+    low = _run_enhanced(price=95.0, promo=0.0, freight=5.0)
+    high = _run_enhanced(price=110.0, promo=0.0, freight=5.0)
+    assert float(np.sum(low["final_units"])) >= float(np.sum(high["final_units"]))
+
+
+def test_enhanced_promo_monotonicity():
+    low = _run_enhanced(price=100.0, promo=0.0, freight=5.0)
+    high = _run_enhanced(price=100.0, promo=0.7, freight=5.0)
+    assert float(np.sum(high["final_units"])) >= float(np.sum(low["final_units"]))
+
+
+def test_enhanced_freight_monotonicity():
+    low = _run_enhanced(price=100.0, promo=0.0, freight=5.0)
+    high = _run_enhanced(price=100.0, promo=0.0, freight=9.0)
+    assert float(np.sum(high["final_units"])) <= float(np.sum(low["final_units"]))
+
+
+def test_enhanced_shock_and_stock_constraint():
+    shocked = _run_enhanced(price=100.0, promo=0.0, freight=5.0, demand_mult=1.2, stock_cap=50.0)
+    baseline = _run_enhanced(price=100.0, promo=0.0, freight=5.0, demand_mult=1.0, stock_cap=0.0)
+    assert float(np.sum(shocked["unconstrained_units"])) >= float(np.sum(baseline["unconstrained_units"]))
+    assert np.all(shocked["final_units"] <= shocked["scenario_profile"]["available_stock"].to_numpy(dtype=float) + 1e-9)
+    assert np.all(shocked["lost_sales"] >= -1e-9)
