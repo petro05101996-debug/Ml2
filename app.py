@@ -27,6 +27,7 @@ from data_adapter import (
 )
 from data_schema import CANONICAL_FIELDS, canonical_required_fields
 from scenario_engine import run_scenario
+from scenario_engine_enhanced import run_enhanced_scenario
 from v1_runtime_helpers import (
     build_backend_warning,
     compute_scenario_price_inputs,
@@ -121,6 +122,36 @@ FEATURE_STATS: Dict[str, float] = {}
 ARTIFACT_SCHEMA_VERSION = "v39.1"
 APP_GENERATION = "39"
 
+SCENARIO_CALC_MODES = {
+    "legacy_current": "Текущий режим (как сейчас)",
+    "enhanced_local_factors": "Усиленный v1 (baseline + локальные эффекты факторов)",
+}
+DEFAULT_SCENARIO_CALC_MODE = "legacy_current"
+
+
+def scenario_mode_label(mode_code: str) -> str:
+    mapping = {
+        "legacy_current": "Текущий расчёт (Legacy)",
+        "enhanced_local_factors": "Улучшенный расчёт (Enhanced Local Factors)",
+    }
+    return mapping.get(str(mode_code), str(mode_code))
+
+
+def scenario_contract_label(contract_code: str) -> str:
+    mapping = {
+        "legacy_baseline+scenario_recompute": "Legacy baseline + scenario recompute",
+        "legacy_baseline+enhanced_local_factor_layer": "Legacy baseline + local factor layer",
+    }
+    return mapping.get(str(contract_code), str(contract_code))
+
+
+def effect_source_label(effect_source: str) -> str:
+    mapping = {
+        "scenario_engine_recompute_from_baseline": "Legacy scenario effects from baseline recompute",
+        "baseline_daily_x_local_factor_layer": "Local factor layer over daily baseline",
+    }
+    return mapping.get(str(effect_source), str(effect_source))
+
 
 def robust_clean_dirty_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -140,6 +171,8 @@ def robust_clean_dirty_data(df: pd.DataFrame) -> pd.DataFrame:
 def detect_small_mode_info(df: pd.DataFrame) -> Dict[str, Any]:
     sales = pd.to_numeric(df.get("sales"), errors="coerce").fillna(0.0)
     price = pd.to_numeric(df.get("price"), errors="coerce")
+    freight = pd.to_numeric(df.get("freight_value", pd.Series(np.zeros(len(df)))), errors="coerce").fillna(0.0)
+    date_series = pd.to_datetime(df.get("date"), errors="coerce")
 
     n_days = int(len(df))
     positive_days = int((sales > 0).sum())
@@ -158,6 +191,18 @@ def detect_small_mode_info(df: pd.DataFrame) -> Dict[str, Any]:
     promotion_positive_share = float((promotion > 0).mean()) if len(promotion) else 0.0
     discount = pd.to_numeric(df.get("discount", pd.Series(np.zeros(len(df)))), errors="coerce")
     discount_unique_count = int(discount.dropna().nunique())
+    promo_weeks = 0
+    if len(df):
+        wk = pd.DataFrame({"date": date_series, "promotion": promotion}).dropna(subset=["date"])
+        if len(wk):
+            wk["week"] = wk["date"].dt.to_period("W").astype(str)
+            promo_weeks = int(wk.groupby("week")["promotion"].mean().gt(0.0).sum())
+    promo_variability = float(promotion.std(ddof=0)) if len(promotion) else 0.0
+    freight_changes = int(freight.diff().abs().gt(1e-9).sum()) if len(freight) else 0
+    freight_mean = float(np.abs(freight.mean())) if len(freight) else 0.0
+    freight_variation = float(freight.std(ddof=0) / max(freight_mean, 1e-9)) if len(freight) else 0.0
+    price_cv = float(price_non_null.std(ddof=0) / max(abs(float(price_non_null.mean())), 1e-9)) if len(price_non_null) else 0.0
+    price_stability = float(np.clip(1.0 - price_cv, 0.0, 1.0))
 
     reasons = []
     if n_days < 180:
@@ -185,6 +230,11 @@ def detect_small_mode_info(df: pd.DataFrame) -> Dict[str, Any]:
         "price_span": price_span,
         "promotion_positive_share": promotion_positive_share,
         "discount_unique_count": discount_unique_count,
+        "promo_weeks": promo_weeks,
+        "promo_variability": promo_variability,
+        "freight_changes": freight_changes,
+        "freight_variation": freight_variation,
+        "price_stability": price_stability,
     }
 
 
@@ -3103,11 +3153,12 @@ def run_full_pricing_analysis_universal(
             "ref_net_price": ref_net_price,
             "confidence": confidence,
             "small_mode": small_mode,
+            "small_mode_info": small_mode_info,
         },
     }
 
 
-def run_what_if_projection(
+def _run_what_if_projection_legacy(
     trained_bundle: Dict[str, Any],
     manual_price: float,
     freight_multiplier: float = 1.0,
@@ -3130,6 +3181,41 @@ def run_what_if_projection(
         scenario_overrides["stock_cap"] = float(stock_cap)
     if float(demand_multiplier) != 1.0:
         scenario_overrides["manual_shock_multiplier"] = float(demand_multiplier)
+    guardrail_warnings: List[str] = []
+    train_prices = pd.to_numeric(trained_bundle["daily_base"].get("price", pd.Series([manual_price])), errors="coerce").dropna()
+    train_min = float(train_prices.min()) if len(train_prices) else float(manual_price)
+    train_max = float(train_prices.max()) if len(train_prices) else float(manual_price)
+    price_lo = max(0.01, train_min * 0.90)
+    price_hi = max(price_lo, train_max * 1.10)
+
+    def _clip_path_list(path_key: str, lo: float, hi: float, label: str) -> None:
+        path = scenario_overrides.get(path_key)
+        if not isinstance(path, list):
+            return
+        changed = False
+        clipped_list = []
+        for item in path:
+            if not isinstance(item, dict):
+                clipped_list.append(item)
+                continue
+            value = float(item.get("value", 0.0))
+            clipped = float(np.clip(value, lo, hi))
+            changed = changed or (abs(clipped - value) > 1e-12)
+            cloned = dict(item)
+            cloned["value"] = clipped
+            clipped_list.append(cloned)
+        scenario_overrides[path_key] = clipped_list
+        if changed:
+            guardrail_warnings.append(f"{label} был ограничен guardrails диапазоном [{lo:.3f}, {hi:.3f}].")
+
+    _clip_path_list("price_path", price_lo, price_hi, "Price path")
+    _clip_path_list("discount_path", 0.0, 0.95, "Discount path")
+    _clip_path_list("promo_path", 0.0, 0.70, "Promo path")
+    freight_base = float(trained_bundle.get("base_ctx", {}).get("freight_value", 0.0))
+    freight_lo = max(0.0, freight_base * 0.5)
+    freight_hi = max(freight_lo + 1e-9, freight_base * 1.5 if freight_base > 0 else 1.0)
+    _clip_path_list("freight_path", freight_lo, freight_hi, "Freight path")
+    _clip_path_list("demand_multiplier_path", 0.70, 1.30, "Demand multiplier path")
 
     future_dates = trained_bundle["future_dates"]
     if horizon_days is not None:
@@ -3358,6 +3444,7 @@ def run_what_if_projection(
         "price_confidence_score": float(scenario_result.get("confidence", {}).get("price", {}).get("score", float("nan"))),
         "price_confidence_label": str(scenario_result.get("confidence", {}).get("price", {}).get("label", "unknown")),
     }
+    support_info = build_scenario_support_info(history_daily, effective_scenario, scenario_overrides)
     return {
         "daily": daily,
         "demand_total": demand_total,
@@ -3418,10 +3505,309 @@ def run_what_if_projection(
             "scenario_freight": float(scenario_freight),
             "shock_multiplier": float(demand_multiplier),
         },
+        "scenario_calc_mode_label": scenario_mode_label("legacy_current"),
+        "active_path_contract_label": scenario_contract_label(runtime_meta["active_path_contract"]),
+        "effect_source_label": effect_source_label("scenario_engine_recompute_from_baseline"),
+        "support_label": str(support_info.get("support_label", "medium")),
+        "scenario_support_info": support_info,
+        "legacy_or_enhanced_label": "legacy",
+        "applied_path_summary": {
+            "mode": scenario_mode_label("legacy_current"),
+            "segment_count": 0,
+            "price_net_min": float(effective_scenario.get("applied_price_net", np.nan)),
+            "price_net_avg": float(effective_scenario.get("applied_price_net", np.nan)),
+            "price_net_max": float(effective_scenario.get("applied_price_net", np.nan)),
+            "promo_days": 0,
+            "promo_share": float(1.0 if float(effective_scenario.get("promotion", 0.0)) > 0 else 0.0),
+            "avg_freight": float(effective_scenario.get("freight_value", 0.0)),
+            "avg_demand_multiplier": float(scenario_overrides.get("manual_shock_multiplier", 1.0)),
+            "segment_shocks": list(scenario_overrides.get("shocks", [])) if isinstance(scenario_overrides.get("shocks", []), list) else [],
+            "support_label": str(support_info.get("support_label", "unknown")),
+            "warnings": list(support_info.get("warnings", [])),
+        },
         "effective_scenario": effective_scenario,
         "confidence_factors": scenario_result.get("confidence", {}),
-        "warnings": scenario_result.get("warnings", []) + backend_warning + ([str(net_support.get("net_price_warning", ""))] if net_support.get("net_price_warning") else []),
+        "warnings": scenario_result.get("warnings", []) + backend_warning + ([str(net_support.get("net_price_warning", ""))] if net_support.get("net_price_warning") else []) + list(support_info.get("warnings", [])),
     }
+
+
+def _run_what_if_projection_enhanced(
+    trained_bundle: Dict[str, Any],
+    manual_price: float,
+    freight_multiplier: float = 1.0,
+    demand_multiplier: float = 1.0,
+    horizon_days: Optional[int] = None,
+    discount_multiplier: float = 1.0,
+    cost_multiplier: float = 1.0,
+    stock_cap: float = 0.0,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    legacy_result = _run_what_if_projection_legacy(
+        trained_bundle=trained_bundle,
+        manual_price=manual_price,
+        freight_multiplier=freight_multiplier,
+        demand_multiplier=demand_multiplier,
+        horizon_days=horizon_days,
+        discount_multiplier=discount_multiplier,
+        cost_multiplier=cost_multiplier,
+        stock_cap=stock_cap,
+        overrides=overrides,
+    )
+    scenario_overrides = dict(overrides or {})
+    scenario_overrides.setdefault("freight_multiplier", float(freight_multiplier))
+    scenario_overrides.setdefault("discount_multiplier", float(discount_multiplier))
+    scenario_overrides.setdefault("cost_multiplier", float(cost_multiplier))
+    if stock_cap:
+        scenario_overrides["stock_cap"] = float(stock_cap)
+    if float(demand_multiplier) != 1.0:
+        scenario_overrides["manual_shock_multiplier"] = float(demand_multiplier)
+    guardrail_warnings: List[str] = []
+    train_prices = pd.to_numeric(trained_bundle["daily_base"].get("price", pd.Series([manual_price])), errors="coerce").dropna()
+    train_min = float(train_prices.min()) if len(train_prices) else float(manual_price)
+    train_max = float(train_prices.max()) if len(train_prices) else float(manual_price)
+    price_lo = max(0.01, train_min * 0.90)
+    price_hi = max(price_lo, train_max * 1.10)
+
+    def _clip_path_list(path_key: str, lo: float, hi: float, label: str) -> None:
+        path = scenario_overrides.get(path_key)
+        if not isinstance(path, list):
+            return
+        changed = False
+        clipped: List[Dict[str, Any]] = []
+        for item in path:
+            if not isinstance(item, dict):
+                continue
+            value = float(item.get("value", 0.0))
+            new_value = float(np.clip(value, lo, hi))
+            changed = changed or (abs(new_value - value) > 1e-12)
+            x = dict(item)
+            x["value"] = new_value
+            clipped.append(x)
+        scenario_overrides[path_key] = clipped
+        if changed:
+            guardrail_warnings.append(f"{label} был ограничен guardrails диапазоном [{lo:.3f}, {hi:.3f}].")
+
+    _clip_path_list("price_path", price_lo, price_hi, "Price path")
+    _clip_path_list("discount_path", 0.0, 0.95, "Discount path")
+    _clip_path_list("promo_path", 0.0, 0.70, "Promo path")
+    freight_base = float(trained_bundle.get("base_ctx", {}).get("freight_value", 0.0))
+    freight_lo = max(0.0, freight_base * 0.5)
+    freight_hi = max(freight_lo + 1e-9, freight_base * 1.5 if freight_base > 0 else 1.0)
+    _clip_path_list("freight_path", freight_lo, freight_hi, "Freight path")
+    _clip_path_list("demand_multiplier_path", 0.70, 1.30, "Demand multiplier path")
+
+    base_history = trained_bundle["daily_base"].copy()
+    current_ctx = dict(trained_bundle["base_ctx"])
+    latest_row_current = dict(trained_bundle["latest_row"])
+    future_dates = trained_bundle["future_dates"]
+    if horizon_days is not None:
+        future_dates = forecast_future_dates(pd.Timestamp(base_history["date"].max()), n_days=int(horizon_days))
+    baseline_sim = simulate_horizon_profit(
+        latest_row_current,
+        float(current_ctx.get("price", manual_price)),
+        future_dates,
+        trained_bundle["baseline_bundle"],
+        trained_bundle["uplift_bundle"],
+        base_history,
+        current_ctx,
+        trained_bundle["elasticity_map"],
+        trained_bundle["pooled_elasticity"],
+        overrides={
+            "promotion": float(current_ctx.get("promotion", 0.0)),
+            "freight_multiplier": 1.0,
+            "discount_multiplier": 1.0,
+            "cost_multiplier": 1.0,
+            "manual_shock_multiplier": 1.0,
+        },
+    )
+    baseline_daily = baseline_sim["daily"].copy()
+    effective = legacy_result.get("effective_scenario", {})
+    shocks = list(scenario_overrides.get("shocks", [])) if isinstance(scenario_overrides.get("shocks", []), list) else []
+    has_demand_path = bool(scenario_overrides.get("demand_multiplier_path"))
+    if float(demand_multiplier) != 1.0 and len(future_dates) and not has_demand_path:
+        shocks.append(
+            {
+                "shock_name": "demand_multiplier",
+                "shock_type": "percent",
+                "shock_value": float(demand_multiplier) - 1.0,
+                "start_date": str(pd.to_datetime(future_dates["date"]).min().date()),
+                "end_date": str(pd.to_datetime(future_dates["date"]).max().date()),
+            }
+        )
+
+    small_mode_meta = trained_bundle.get("small_mode_info")
+    if not isinstance(small_mode_meta, dict):
+        small_mode_meta = {"small_mode": bool(trained_bundle.get("small_mode", False))}
+    enhanced = run_enhanced_scenario(
+        baseline_daily=baseline_daily,
+        current_ctx=current_ctx,
+        future_dates=future_dates,
+        scenario_overrides=scenario_overrides,
+        pooled_elasticity=float(trained_bundle.get("pooled_elasticity", CONFIG["PRIOR_ELASTICITY"])),
+        small_mode_info=dict(small_mode_meta),
+        requested_price=float(manual_price),
+        model_price=float(legacy_result.get("model_price", manual_price)),
+        baseline_discount=float(current_ctx.get("discount", 0.0)),
+        scenario_discount=float(effective.get("applied_discount", current_ctx.get("discount", 0.0))),
+        baseline_cost=float(current_ctx.get("cost", current_ctx.get("price", manual_price) * CONFIG["COST_PROXY_RATIO"])),
+        scenario_cost=float(effective.get("cost", current_ctx.get("cost", 0.0))),
+        baseline_freight=float(current_ctx.get("freight_value", 0.0)),
+        scenario_freight=float(effective.get("freight_value", current_ctx.get("freight_value", 0.0))),
+        shocks=shocks,
+    )
+    daily = baseline_daily.copy()
+    profile = enhanced["scenario_profile"]
+    daily["pred_sales"] = profile["scenario_demand_raw"].to_numpy(dtype=float)
+    daily["unconstrained_demand"] = profile["scenario_demand_raw"].to_numpy(dtype=float)
+    daily["actual_sales"] = profile["actual_sales"].to_numpy(dtype=float)
+    daily["lost_sales"] = profile["lost_sales"].to_numpy(dtype=float)
+    daily["revenue"] = profile["revenue"].to_numpy(dtype=float)
+    daily["profit"] = profile["profit"].to_numpy(dtype=float)
+    daily["price"] = profile["scenario_price_gross"].to_numpy(dtype=float)
+    daily["discount"] = profile["scenario_discount"].to_numpy(dtype=float)
+    daily["net_unit_price"] = profile["scenario_price_net"].to_numpy(dtype=float)
+    daily["promotion"] = profile["scenario_promotion"].to_numpy(dtype=float)
+    daily["freight_value"] = profile["scenario_freight_value"].to_numpy(dtype=float)
+    daily["cost"] = profile["scenario_cost"].to_numpy(dtype=float)
+    daily["stock"] = profile["available_stock"].to_numpy(dtype=float)
+
+    conf_obj = enhanced.get("confidence", {})
+    support_info = build_scenario_support_info_from_paths(base_history, profile, scenario_overrides)
+    price_score = float((conf_obj.get("price", {}) or {}).get("score", legacy_result.get("confidence", 0.5)))
+    promo_score = float((conf_obj.get("promo", {}) or {}).get("score", 0.5))
+    freight_score = float((conf_obj.get("freight", {}) or {}).get("score", 0.5))
+    if int(support_info.get("local_price_support_days", 0)) < 14:
+        price_score = min(price_score, 0.55)
+    if int(support_info.get("unique_price_points", 0)) < 4:
+        price_score = min(price_score, 0.50)
+    if int(support_info.get("price_changes", 0)) == 0:
+        price_score = min(price_score, 0.35)
+    if abs(float(effective.get("promotion", 0.0)) - float(current_ctx.get("promotion", 0.0))) > 1e-9:
+        if int(support_info.get("promo_active_days", 0)) < 14 or int(support_info.get("promo_change_days", 0)) < 6:
+            promo_score = min(promo_score, 0.45)
+    if float(support_info.get("promotion_positive_share", 0.0)) < 0.05:
+        promo_score = min(promo_score, 0.35)
+    if abs(float(effective.get("freight_value", 0.0)) - float(current_ctx.get("freight_value", 0.0))) > 1e-9:
+        if int(support_info.get("freight_change_days", 0)) < 8:
+            freight_score = min(freight_score, 0.45)
+    if float(support_info.get("freight_variation", 0.0)) < 0.02:
+        freight_score = min(freight_score, 0.35)
+    conf_score = float(
+        np.clip(
+            0.5 * price_score + 0.25 * promo_score + 0.25 * freight_score,
+            0.05,
+            0.98,
+        )
+    )
+    low_factors = int(price_score <= 0.45) + int(promo_score <= 0.45) + int(freight_score <= 0.45)
+    if low_factors >= 2:
+        conf_score = min(conf_score, 0.45)
+    if low_factors >= 3:
+        conf_score = min(conf_score, 0.35)
+    conf_label = "Высокая" if conf_score >= 0.75 else ("Средняя" if conf_score >= 0.45 else "Низкая")
+    out = dict(legacy_result)
+    out.update(
+        {
+            "daily": daily,
+            "demand_total": float(np.sum(profile["actual_sales"])),
+            "revenue_total": float(np.sum(profile["revenue"])),
+            "profit_total": float(np.sum(profile["profit"])),
+            "profit_total_raw": float(np.sum(profile["profit"])),
+            "profit_total_adjusted": float(np.sum(profile["profit"])),
+            "lost_sales_total": float(np.sum(profile["lost_sales"])),
+            "confidence": conf_score,
+            "confidence_scenario": conf_score,
+            "confidence_label": conf_label,
+            "uncertainty": 1.0 - conf_score,
+            "scenario_driver_mode": "baseline_daily_plus_local_factor_layer",
+            "active_path_contract": "legacy_baseline+enhanced_local_factor_layer",
+            "scenario_price_effect_source": "baseline_daily_x_local_factor_layer",
+            "scenario_calc_mode": "enhanced_local_factors",
+            "scenario_engine_version": "v1_enhanced_local_factors",
+            "effect_source": "baseline_daily_x_local_factor_layer",
+            "legacy_or_enhanced_label": "enhanced",
+            "scenario_calc_mode_label": scenario_mode_label("enhanced_local_factors"),
+            "active_path_contract_label": scenario_contract_label("legacy_baseline+enhanced_local_factor_layer"),
+            "effect_source_label": effect_source_label("baseline_daily_x_local_factor_layer"),
+            "support_label": str(support_info.get("support_label", "medium")),
+            "scenario_support_info": support_info,
+            "applied_path_summary": {
+                "mode": scenario_mode_label("enhanced_local_factors"),
+                "segment_count": int(support_info.get("segment_count", 0)),
+                "price_net_min": float(support_info.get("path_price_min", np.nan)),
+                "price_net_avg": float(support_info.get("path_price_avg", np.nan)),
+                "price_net_max": float(support_info.get("path_price_max", np.nan)),
+                "promo_days": int(support_info.get("path_promo_days", 0)),
+                "promo_share": float(support_info.get("path_promo_share", 0.0)),
+                "avg_freight": float(support_info.get("path_avg_freight", 0.0)),
+                "avg_demand_multiplier": float(support_info.get("path_avg_demand_multiplier", 1.0)),
+                "segment_shocks": list((scenario_overrides or {}).get("shocks", [])),
+                "support_label": str(support_info.get("support_label", "unknown")),
+                "warnings": list(support_info.get("warnings", [])) + list(guardrail_warnings),
+            },
+            "effect_breakdown": enhanced["effect_breakdown"],
+            "daily_effects_summary": profile[
+                ["date", "price_effect", "promo_effect", "freight_effect", "standard_multiplier", "shock_multiplier", "shock_units"]
+            ].to_dict("records"),
+            "warnings": list(enhanced.get("warnings", [])) + list(support_info.get("warnings", [])) + list(guardrail_warnings),
+            "confidence_factors": conf_obj,
+            "effects": {
+                "price_effect": float(np.mean(enhanced["price_effect_vector"])) if len(enhanced["price_effect_vector"]) else 1.0,
+                "promo_effect": float(np.mean(enhanced["promo_effect_vector"])) if len(enhanced["promo_effect_vector"]) else 1.0,
+                "freight_effect": float(np.mean(enhanced["freight_effect_vector"])) if len(enhanced["freight_effect_vector"]) else 1.0,
+                "stock_effect": 1.0,
+                "shock_multiplier_mean": float(np.mean(enhanced["shock_multiplier"])) if len(enhanced["shock_multiplier"]) else 1.0,
+            },
+        }
+    )
+    return out
+
+
+def run_what_if_projection(
+    trained_bundle: Dict[str, Any],
+    manual_price: float,
+    freight_multiplier: float = 1.0,
+    demand_multiplier: float = 1.0,
+    horizon_days: Optional[int] = None,
+    discount_multiplier: float = 1.0,
+    cost_multiplier: float = 1.0,
+    stock_cap: float = 0.0,
+    overrides: Optional[Dict[str, Any]] = None,
+    scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
+) -> Dict[str, Any]:
+    if scenario_calc_mode == "legacy_current":
+        result = _run_what_if_projection_legacy(
+            trained_bundle=trained_bundle,
+            manual_price=manual_price,
+            freight_multiplier=freight_multiplier,
+            demand_multiplier=demand_multiplier,
+            horizon_days=horizon_days,
+            discount_multiplier=discount_multiplier,
+            cost_multiplier=cost_multiplier,
+            stock_cap=stock_cap,
+            overrides=overrides,
+        )
+        result["scenario_calc_mode"] = "legacy_current"
+        result.setdefault("scenario_engine_version", "v1_legacy_current")
+        result.setdefault("effect_source", "scenario_engine_recompute_from_baseline")
+        result.setdefault("effect_breakdown", {})
+        result.setdefault("daily_effects_summary", [])
+        result.setdefault("legacy_or_enhanced_label", "legacy")
+        result.setdefault("scenario_calc_mode_label", scenario_mode_label("legacy_current"))
+        return result
+    if scenario_calc_mode == "enhanced_local_factors":
+        return _run_what_if_projection_enhanced(
+            trained_bundle=trained_bundle,
+            manual_price=manual_price,
+            freight_multiplier=freight_multiplier,
+            demand_multiplier=demand_multiplier,
+            horizon_days=horizon_days,
+            discount_multiplier=discount_multiplier,
+            cost_multiplier=cost_multiplier,
+            stock_cap=stock_cap,
+            overrides=overrides,
+        )
+    raise ValueError(f"Unknown scenario_calc_mode: {scenario_calc_mode}")
 
 
 def choose_uplift_features(df: pd.DataFrame, small_mode: bool, candidates: List[str]) -> Tuple[List[str], Dict[str, Any]]:
@@ -3632,6 +4018,20 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "weekly_driver_mode": str(what_if_result.get("weekly_driver_mode", "unknown")),
         "fallback_multiplier_used": bool(what_if_result.get("fallback_multiplier_used", False)),
         "fallback_reason": str(what_if_result.get("fallback_reason", "")),
+        "scenario_calc_mode": str(what_if_result.get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+        "scenario_calc_mode_label": str(what_if_result.get("scenario_calc_mode_label", scenario_mode_label(str(what_if_result.get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))))),
+        "scenario_engine_version": str(what_if_result.get("scenario_engine_version", "v1_legacy_current")),
+        "effect_source": str(what_if_result.get("effect_source", "")),
+        "effect_breakdown": what_if_result.get("effect_breakdown", {}),
+        "legacy_or_enhanced_label": "enhanced" if str(what_if_result.get("scenario_calc_mode")) == "enhanced_local_factors" else "legacy",
+        "confidence_label": str(what_if_result.get("confidence_label", "")),
+        "support_label": str(what_if_result.get("support_label", "")),
+        "warnings": list(what_if_result.get("warnings", [])),
+        "segments_summary": {
+            "path_segments_used": bool(((what_if_result.get("scenario_support_info", {}) or {})).get("path_segments_used", False)),
+            "segment_count": int(((what_if_result.get("scenario_support_info", {}) or {})).get("segment_count", 0)),
+            "has_time_varying_path": bool(((what_if_result.get("scenario_support_info", {}) or {})).get("has_time_varying_path", False)),
+        },
     }
     return json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"), manual_daily.to_csv(index=False).encode("utf-8")
 
@@ -3924,6 +4324,10 @@ def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str
         "scenario_range_details": scenario_range_status if effective_scenario else {},
         "scenario_range_overall": "in_range" if in_range else "out_of_range",
         "active_calculation_mode": active_path,
+        "scenario_mode": str((what_if_result or {}).get("scenario_calc_mode_label", scenario_mode_label((what_if_result or {}).get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)))),
+        "calculation_contract": str((what_if_result or {}).get("active_path_contract_label", scenario_contract_label((what_if_result or {}).get("active_path_contract", active_path)))),
+        "factor_source": str((what_if_result or {}).get("effect_source_label", effect_source_label((what_if_result or {}).get("effect_source", "")))),
+        "support_label": str((what_if_result or {}).get("support_label", "unknown")),
         "fallback_used": bool((what_if_result or {}).get("fallback_multiplier_used", False)),
         "warnings": sufficiency.get("warnings", []) + warnings_local + list((what_if_result or {}).get("warnings", [])),
     }
@@ -4004,6 +4408,11 @@ def build_business_report_payload(
                 "applied_price_net": _finite((what_if_result or {}).get("effective_scenario", {}).get("applied_price_net", 0.0)),
                 "clip_flag": bool((what_if_result or {}).get("effective_scenario", {}).get("price_clipped", (what_if_result or {}).get("price_clipped", False))),
                 "clip_reason": str((what_if_result or {}).get("effective_scenario", {}).get("clip_reason", (what_if_result or {}).get("clip_reason", ""))),
+                "active_scenario_calc_mode": str((what_if_result or {}).get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+                "active_scenario_calc_mode_label": str((what_if_result or {}).get("scenario_calc_mode_label", scenario_mode_label((what_if_result or {}).get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)))),
+                "active_path_contract_label": str((what_if_result or {}).get("active_path_contract_label", scenario_contract_label((what_if_result or {}).get("active_path_contract", "")))),
+                "effect_source_label": str((what_if_result or {}).get("effect_source_label", effect_source_label((what_if_result or {}).get("effect_source", "")))),
+                "support_label": str((what_if_result or {}).get("support_label", "")),
             },
         },
         "margin_available": margin_available,
@@ -4089,10 +4498,32 @@ def build_saved_scenario_metrics(
         "price_clipped": bool(effective.get("price_clipped", (what_if_result or {}).get("price_clipped", False))),
         "clip_reason": str(effective.get("clip_reason", (what_if_result or {}).get("clip_reason", ""))),
         "confidence_label": str((what_if_result or {}).get("confidence_label", "Низкая")),
+        "scenario_calc_mode": str((what_if_result or {}).get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+        "scenario_calc_mode_label": str((what_if_result or {}).get("scenario_calc_mode_label", scenario_mode_label((what_if_result or {}).get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)))),
+        "active_path_contract": str((what_if_result or {}).get("active_path_contract", "")),
+        "legacy_or_enhanced_label": str((what_if_result or {}).get("legacy_or_enhanced_label", "legacy")),
+        "effect_source": str((what_if_result or {}).get("effect_source", "")),
+        "confidence": float((what_if_result or {}).get("confidence", np.nan)),
+        "support_label": str((what_if_result or {}).get("support_label", "")),
+        "effect_breakdown": (what_if_result or {}).get("effect_breakdown", {}),
+        "warnings": list((what_if_result or {}).get("warnings", [])),
+        "segments_summary": {
+            "path_segments_used": bool(((what_if_result or {}).get("scenario_support_info", {}) or {}).get("path_segments_used", False)),
+            "segment_count": int(((what_if_result or {}).get("scenario_support_info", {}) or {}).get("segment_count", 0)),
+            "has_time_varying_path": bool(((what_if_result or {}).get("scenario_support_info", {}) or {}).get("has_time_varying_path", False)),
+        },
     }
 
 
-def collect_current_form_values(manual_price: float, discount: float, promo_value: float, freight_mult: float, demand_mult: float, hdays: int) -> Dict[str, float]:
+def collect_current_form_values(
+    manual_price: float,
+    discount: float,
+    promo_value: float,
+    freight_mult: float,
+    demand_mult: float,
+    hdays: int,
+    scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
+) -> Dict[str, Any]:
     return {
         "manual_price": float(manual_price),
         "discount": float(discount),
@@ -4100,6 +4531,7 @@ def collect_current_form_values(manual_price: float, discount: float, promo_valu
         "freight_mult": float(freight_mult),
         "demand_mult": float(demand_mult),
         "hdays": int(hdays),
+        "scenario_calc_mode": str(scenario_calc_mode),
     }
 
 
@@ -4111,6 +4543,7 @@ def build_applied_scenario_snapshot(
     freight_mult: float,
     demand_mult: float,
     hdays: int,
+    scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
 ) -> Dict[str, Any]:
     effective = wr.get("effective_scenario", {}) if isinstance(wr, dict) else {}
     return {
@@ -4129,6 +4562,16 @@ def build_applied_scenario_snapshot(
         "demand_mult": float(demand_mult),
         "horizon_days": int(hdays),
         "scenario_status": str(wr.get("scenario_status", "as_is")),
+        "scenario_calc_mode": str(wr.get("scenario_calc_mode", scenario_calc_mode)),
+        "scenario_calc_mode_label": str(wr.get("scenario_calc_mode_label", scenario_mode_label(str(wr.get("scenario_calc_mode", scenario_calc_mode))))),
+        "active_path_contract": str(wr.get("active_path_contract", "")),
+        "active_path_contract_label": str(wr.get("active_path_contract_label", scenario_contract_label(str(wr.get("active_path_contract", ""))))),
+        "confidence_label": str(wr.get("confidence_label", "")),
+        "support_label": str(wr.get("support_label", "")),
+        "warnings": list(wr.get("warnings", []))[:5],
+        "shock_count": int(len((wr.get("applied_overrides", {}) or {}).get("shocks", []))) if isinstance(wr.get("applied_overrides", {}), dict) else 0,
+        "effect_breakdown": dict(wr.get("effect_breakdown", {})),
+        "applied_path_summary": dict(wr.get("applied_path_summary", {})),
     }
 
 
@@ -4161,6 +4604,7 @@ def get_user_scenario_status(
         "freight_mult": float(applied_snapshot.get("freight_mult", base_form["freight_mult"])),
         "demand_mult": float(applied_snapshot.get("demand_mult", base_form["demand_mult"])),
         "hdays": int(applied_snapshot.get("horizon_days", base_form["hdays"])),
+        "scenario_calc_mode": str(applied_snapshot.get("scenario_calc_mode", base_form["scenario_calc_mode"])),
     }
     if _same(current_form, applied_form):
         return "saved" if current_status == "saved" else "applied"
@@ -4196,6 +4640,30 @@ def render_applied_scenario_block(snapshot: Optional[Dict[str, Any]]) -> None:
     clip_text = "Цена ограничена" if bool(snapshot.get("price_clipped", False)) else "Без ограничений"
     c3.metric("Ограничение цены", clip_text)
     c3.metric("Горизонт", f"{int(snapshot.get('horizon_days', 0))} дн.")
+    c3.metric("Режим расчёта", str(snapshot.get("scenario_calc_mode_label", scenario_mode_label(str(snapshot.get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))))))
+    st.caption(f"Контур расчёта: {snapshot.get('active_path_contract_label', scenario_contract_label(str(snapshot.get('active_path_contract', ''))))}")
+    st.caption(f"Надёжность: {snapshot.get('confidence_label', 'n/a')} · Поддержка историей: {snapshot.get('support_label', 'n/a')}")
+    if int(snapshot.get("shock_count", 0)) > 0:
+        st.caption(f"Ручных шоков: {int(snapshot.get('shock_count', 0))}")
+    if snapshot.get("effect_breakdown"):
+        eb = snapshot["effect_breakdown"]
+        st.caption(
+            f"Эффекты: цена {float(eb.get('price_effect_mean', np.nan)):.3f}, "
+            f"промо {float(eb.get('promo_effect_mean', np.nan)):.3f}, "
+            f"фрахт {float(eb.get('freight_effect_mean', np.nan)):.3f}"
+        )
+    if snapshot.get("applied_path_summary"):
+        aps = snapshot["applied_path_summary"]
+        st.caption(
+            f"Applied path: сегментов {int(aps.get('segment_count', 0))}, "
+            f"net price min/avg/max {float(aps.get('price_net_min', np.nan)):.2f}/"
+            f"{float(aps.get('price_net_avg', np.nan)):.2f}/"
+            f"{float(aps.get('price_net_max', np.nan)):.2f}, "
+            f"promo share {float(aps.get('promo_share', 0.0)):.0%}, "
+            f"avg freight {float(aps.get('avg_freight', 0.0)):.2f}"
+        )
+    for w in list(snapshot.get("warnings", []))[:3]:
+        st.warning(str(w))
     if bool(snapshot.get("price_clipped", False)):
         st.warning(f"Введённая цена была скорректирована моделью: {snapshot.get('clip_reason', 'ограничение диапазона')}")
     close_surface()
@@ -4220,6 +4688,8 @@ def reset_scenario_ui_state_to_base(results: Dict[str, Any], clear_saved_slot: b
     st.session_state["what_if_freight_mult"] = 1.0
     st.session_state["what_if_demand_mult"] = 1.0
     st.session_state["what_if_hdays"] = int(CONFIG["HORIZON_DAYS_DEFAULT"])
+    st.session_state["what_if_calc_mode"] = DEFAULT_SCENARIO_CALC_MODE
+    st.session_state["what_if_use_segments"] = False
     st.session_state.form_last_values = collect_current_form_values(
         st.session_state["what_if_price"],
         st.session_state["what_if_discount"],
@@ -4227,6 +4697,7 @@ def reset_scenario_ui_state_to_base(results: Dict[str, Any], clear_saved_slot: b
         st.session_state["what_if_freight_mult"],
         st.session_state["what_if_demand_mult"],
         st.session_state["what_if_hdays"],
+        st.session_state["what_if_calc_mode"],
     )
     results["excel_buffer"] = build_excel_export_buffer(results)
     return results
@@ -4277,7 +4748,10 @@ def build_user_friendly_comparison_table(
                     "Промо": float(s.get("promotion", np.nan)),
                     "Логистика": float(s.get("freight_value", np.nan)),
                     "Confidence": str(s.get("confidence_label", "")),
+                    "Support": str(s.get("support_label", "")),
                     "Clip": "Да" if bool(s.get("price_clipped", False)) else "Нет",
+                    "Режим": str(s.get("scenario_calc_mode_label", scenario_mode_label(str(s.get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))))),
+                    "Warnings": int(len(s.get("warnings", []))) if isinstance(s.get("warnings", []), list) else 0,
                 }
             )
             rows.append(row)
@@ -4325,6 +4799,10 @@ if __name__ == "__main__":
         st.session_state.form_last_values = None
     if "last_saved_slot" not in st.session_state:
         st.session_state.last_saved_slot = None
+    if "what_if_calc_mode" not in st.session_state:
+        st.session_state["what_if_calc_mode"] = DEFAULT_SCENARIO_CALC_MODE
+    if "what_if_use_segments" not in st.session_state:
+        st.session_state["what_if_use_segments"] = False
 
     apply_theme()
 
@@ -4429,7 +4907,7 @@ if __name__ == "__main__":
     def _fmt_units(v: float) -> str:
         return f"{v:,.1f} шт."
 
-    def _download_blob(payload: Any, default: bytes) -> bytes | BytesIO:
+def _download_blob(payload: Any, default: bytes) -> bytes | BytesIO:
         if payload is None:
             return default
         if isinstance(payload, (bytes, bytearray, BytesIO)):
@@ -4438,6 +4916,201 @@ if __name__ == "__main__":
             return bytes(payload)
         except Exception:
             return default
+
+
+def build_scenario_support_info(
+    history_daily: pd.DataFrame,
+    effective_scenario: Dict[str, Any],
+    scenario_overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    history = history_daily.copy()
+    history["date"] = pd.to_datetime(history.get("date"), errors="coerce")
+    history = history.dropna(subset=["date"])
+    scenario_overrides = dict(scenario_overrides or {})
+    hist_days = int(len(history))
+    recent_days = int(min(90, hist_days))
+    recent = history.tail(recent_days) if hist_days else history
+    sales = pd.to_numeric(history.get("sales", pd.Series(np.zeros(hist_days))), errors="coerce").fillna(0.0)
+    price = pd.to_numeric(history.get("price", pd.Series(np.zeros(hist_days))), errors="coerce").fillna(0.0)
+    discount = pd.to_numeric(history.get("discount", pd.Series(np.zeros(hist_days))), errors="coerce").fillna(0.0).clip(0.0, 0.95)
+    promo = pd.to_numeric(history.get("promotion", pd.Series(np.zeros(hist_days))), errors="coerce").fillna(0.0)
+    freight = pd.to_numeric(history.get("freight_value", pd.Series(np.zeros(hist_days))), errors="coerce").fillna(0.0)
+    net_price = price * (1.0 - discount)
+    scen_net = float(effective_scenario.get("applied_price_net", 0.0))
+    scen_promo = float(effective_scenario.get("promotion", 0.0))
+    scen_freight = float(effective_scenario.get("freight_value", 0.0))
+    local_price_support = int(((net_price >= scen_net * 0.93) & (net_price <= scen_net * 1.07)).sum()) if hist_days else 0
+    local_promo_support = int((((promo > 0).astype(int)) == (1 if scen_promo > 0 else 0)).sum()) if hist_days else 0
+    local_freight_support = int(((freight >= scen_freight * 0.90) & (freight <= scen_freight * 1.10)).sum()) if hist_days else 0
+    promo_change_days = int(promo.diff().abs().gt(1e-9).sum()) if hist_days else 0
+    freight_change_days = int(freight.diff().abs().gt(1e-9).sum()) if hist_days else 0
+    support_score = float(
+        np.clip(
+            0.45 * min(local_price_support / 21.0, 1.0)
+            + 0.25 * min(local_promo_support / 21.0, 1.0)
+            + 0.30 * min(local_freight_support / 21.0, 1.0),
+            0.0,
+            1.0,
+        )
+    )
+    support_label = "high" if support_score >= 0.7 else ("medium" if support_score >= 0.45 else "low")
+    warnings = []
+    if local_price_support < 14:
+        warnings.append("Низкая локальная поддержка цены в истории.")
+    if scen_promo != float(history.get("promotion", pd.Series([0.0])).mean() if hist_days else 0.0) and promo_change_days < 6:
+        warnings.append("Промо-сценарий слабо поддержан историческими изменениями.")
+    if scen_freight != float(history.get("freight_value", pd.Series([0.0])).mean() if hist_days else 0.0) and freight_change_days < 8:
+        warnings.append("Фрахт-сценарий слабо поддержан историей.")
+    return {
+        "history_days": hist_days,
+        "recent_history_days": recent_days,
+        "recent_nonzero_sales_days": int((pd.to_numeric(recent.get("sales", pd.Series(np.zeros(len(recent)))), errors="coerce").fillna(0.0) > 0).sum()) if len(recent) else 0,
+        "unique_price_points": int(price.nunique()) if hist_days else 0,
+        "price_range_pct": float((price.max() - price.min()) / max(abs(float(price.median())), 1e-9)) if hist_days else 0.0,
+        "price_changes": int(price.diff().abs().gt(1e-9).sum()) if hist_days else 0,
+        "price_stability": float(np.clip(1.0 - (price.std(ddof=0) / max(abs(float(price.mean())), 1e-9)), 0.0, 1.0)) if hist_days else 0.0,
+        "promo_active_days": int((promo > 0).sum()) if hist_days else 0,
+        "promo_change_days": promo_change_days,
+        "promo_weeks": int(history.assign(week=history["date"].dt.to_period("W")).groupby("week")["promotion"].mean().gt(0).sum()) if hist_days else 0,
+        "promo_variability": float(promo.std(ddof=0)) if hist_days else 0.0,
+        "freight_change_days": freight_change_days,
+        "freight_changes": freight_change_days,
+        "freight_variation": float(freight.std(ddof=0) / max(abs(float(freight.mean())), 1e-9)) if hist_days else 0.0,
+        "discount_unique_count": int(discount.nunique()) if hist_days else 0,
+        "promotion_positive_share": float((promo > 0).mean()) if hist_days else 0.0,
+        "local_price_support_days": local_price_support,
+        "local_promo_support_days": local_promo_support,
+        "local_freight_support_days": local_freight_support,
+        "support_score": support_score,
+        "support_label": support_label,
+        "warnings": warnings,
+        "path_segments_used": bool(scenario_overrides.get("segments")),
+        "segment_count": int(len(scenario_overrides.get("segments", []))),
+        "has_time_varying_path": bool(
+            any(k in scenario_overrides for k in ["price_path", "discount_path", "promo_path", "freight_path", "cost_path", "demand_multiplier_path"])
+        ),
+    }
+
+
+def build_scenario_support_info_from_paths(
+    history_daily: pd.DataFrame,
+    scenario_daily: pd.DataFrame,
+    scenario_overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    base = build_scenario_support_info(history_daily, {}, scenario_overrides or {})
+    hist = history_daily.copy()
+    hist["date"] = pd.to_datetime(hist.get("date"), errors="coerce")
+    hist = hist.dropna(subset=["date"])
+    hist_price = pd.to_numeric(hist.get("price", pd.Series(np.zeros(len(hist)))), errors="coerce").fillna(0.0)
+    hist_discount = pd.to_numeric(hist.get("discount", pd.Series(np.zeros(len(hist)))), errors="coerce").fillna(0.0).clip(0.0, 0.95)
+    hist_net = hist_price * (1.0 - hist_discount)
+    hist_promo = pd.to_numeric(hist.get("promotion", pd.Series(np.zeros(len(hist)))), errors="coerce").fillna(0.0)
+    hist_freight = pd.to_numeric(hist.get("freight_value", pd.Series(np.zeros(len(hist)))), errors="coerce").fillna(0.0)
+    scen = scenario_daily.copy()
+    scen_net = pd.to_numeric(scen.get("scenario_price_net", scen.get("net_unit_price", pd.Series(np.zeros(len(scen))))), errors="coerce").fillna(0.0)
+    scen_promo = pd.to_numeric(scen.get("scenario_promotion", scen.get("promotion", pd.Series(np.zeros(len(scen))))), errors="coerce").fillna(0.0)
+    scen_freight = pd.to_numeric(scen.get("scenario_freight_value", scen.get("freight_value", pd.Series(np.zeros(len(scen))))), errors="coerce").fillna(0.0)
+    price_support_counts = [int(((hist_net >= x * 0.93) & (hist_net <= x * 1.07)).sum()) for x in scen_net.head(60)] if len(scen_net) else [0]
+    promo_support_counts = [int((((hist_promo > 0).astype(int)) == (1 if x > 0 else 0)).sum()) for x in scen_promo.head(60)] if len(scen_promo) else [0]
+    freight_support_counts = [int(((hist_freight >= x * 0.90) & (hist_freight <= x * 1.10)).sum()) for x in scen_freight.head(60)] if len(scen_freight) else [0]
+    local_price = int(np.median(price_support_counts)) if len(price_support_counts) else 0
+    local_promo = int(np.median(promo_support_counts)) if len(promo_support_counts) else 0
+    local_freight = int(np.median(freight_support_counts)) if len(freight_support_counts) else 0
+    support_score = float(
+        np.clip(
+            0.45 * min(local_price / 21.0, 1.0)
+            + 0.25 * min(local_promo / 21.0, 1.0)
+            + 0.30 * min(local_freight / 21.0, 1.0),
+            0.0,
+            1.0,
+        )
+    )
+    support_label = "high" if support_score >= 0.7 else ("medium" if support_score >= 0.45 else "low")
+    warnings = []
+    if local_price < 14:
+        warnings.append("Низкая локальная поддержка price-path в истории.")
+    if local_promo < 14:
+        warnings.append("Низкая локальная поддержка promo-path в истории.")
+    if local_freight < 14:
+        warnings.append("Низкая локальная поддержка freight-path в истории.")
+    out = dict(base)
+    out.update(
+        {
+            "local_price_support_days": local_price,
+            "local_promo_support_days": local_promo,
+            "local_freight_support_days": local_freight,
+            "support_score": support_score,
+            "support_label": support_label,
+            "path_price_min": float(scen_net.min()) if len(scen_net) else np.nan,
+            "path_price_avg": float(scen_net.mean()) if len(scen_net) else np.nan,
+            "path_price_max": float(scen_net.max()) if len(scen_net) else np.nan,
+            "path_promo_days": int((scen_promo > 0).sum()) if len(scen_promo) else 0,
+            "path_promo_share": float((scen_promo > 0).mean()) if len(scen_promo) else 0.0,
+            "path_avg_freight": float(scen_freight.mean()) if len(scen_freight) else 0.0,
+            "path_avg_demand_multiplier": float(pd.to_numeric(scen.get("shock_multiplier", pd.Series(np.ones(len(scen)))), errors="coerce").fillna(1.0).mean()) if len(scen) else 1.0,
+            "warnings": warnings,
+        }
+    )
+    return out
+
+
+def build_segment_paths(
+    future_dates: pd.DataFrame,
+    default_values: Dict[str, float],
+    segments: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], List[str]]:
+    warnings: List[str] = []
+    if len(future_dates) == 0:
+        return {}, warnings
+    dates = pd.to_datetime(future_dates["date"], errors="coerce")
+    price = pd.Series(np.repeat(float(default_values.get("price", 0.0)), len(dates)), index=dates)
+    discount = pd.Series(np.repeat(float(default_values.get("discount", 0.0)), len(dates)), index=dates)
+    promo = pd.Series(np.repeat(float(default_values.get("promotion", 0.0)), len(dates)), index=dates)
+    freight_mult = pd.Series(np.repeat(float(default_values.get("freight_multiplier", 1.0)), len(dates)), index=dates)
+    demand_mult = pd.Series(np.repeat(float(default_values.get("demand_multiplier", 1.0)), len(dates)), index=dates)
+    covered = pd.Series(np.zeros(len(dates), dtype=int), index=dates)
+    shocks: List[Dict[str, Any]] = []
+    for i, seg in enumerate(segments):
+        start = pd.to_datetime(seg.get("start_date"), errors="coerce")
+        end = pd.to_datetime(seg.get("end_date"), errors="coerce")
+        if pd.isna(start) or pd.isna(end) or end < start:
+            warnings.append(f"Сегмент {i+1}: некорректные даты.")
+            continue
+        mask = (dates >= start) & (dates <= end)
+        if int(mask.sum()) == 0:
+            warnings.append(f"Сегмент {i+1}: диапазон вне горизонта.")
+            continue
+        if int(covered.loc[mask.values].sum()) > 0:
+            warnings.append(f"Сегмент {i+1}: пересекается с другим сегментом.")
+        covered.loc[mask.values] += 1
+        price.loc[mask.values] = float(seg.get("price", default_values.get("price", 0.0)))
+        discount.loc[mask.values] = float(seg.get("discount", default_values.get("discount", 0.0)))
+        promo.loc[mask.values] = float(seg.get("promotion", default_values.get("promotion", 0.0)))
+        freight_mult.loc[mask.values] = float(seg.get("freight_multiplier", default_values.get("freight_multiplier", 1.0)))
+        demand_mult.loc[mask.values] = float(seg.get("demand_multiplier", default_values.get("demand_multiplier", 1.0)))
+        shock_units = float(seg.get("shock_units", 0.0))
+        if abs(shock_units) > 1e-9:
+            shocks.append(
+                {
+                    "shock_name": f"segment_{i+1}_units",
+                    "shock_type": "units",
+                    "shock_value": shock_units,
+                    "start_date": str(start.date()),
+                    "end_date": str(end.date()),
+                }
+            )
+    if int((covered == 0).sum()) > 0:
+        warnings.append("Некоторые дни горизонта не покрыты сегментами: использованы базовые scalar-параметры.")
+    return {
+        "price_path": [{"date": str(d.date()), "value": float(v)} for d, v in price.items()],
+        "discount_path": [{"date": str(d.date()), "value": float(v)} for d, v in discount.items()],
+        "promo_path": [{"date": str(d.date()), "value": float(v)} for d, v in promo.items()],
+        "freight_path": [{"date": str(d.date()), "value": float(default_values.get("freight_value", 0.0)) * float(v)} for d, v in freight_mult.items()],
+        "demand_multiplier_path": [{"date": str(d.date()), "value": float(v)} for d, v in demand_mult.items()],
+        "segments": segments,
+        "segment_warnings": warnings,
+        "segment_shocks": shocks,
+    }, warnings
 
 
     def render_upload_screen() -> dict[str, Any]:
@@ -4591,6 +5264,8 @@ if __name__ == "__main__":
         st.session_state["what_if_freight_mult"] = 1.0
         st.session_state["what_if_demand_mult"] = 1.0
         st.session_state["what_if_hdays"] = int(CONFIG["HORIZON_DAYS_DEFAULT"])
+        st.session_state["what_if_calc_mode"] = DEFAULT_SCENARIO_CALC_MODE
+        st.session_state["what_if_use_segments"] = False
         st.toast("Форма сброшена к базовым значениям", icon="⟲")
         st.rerun()
     elif action_click == "cancel_active":
@@ -4668,6 +5343,7 @@ if __name__ == "__main__":
             1.0,
             1.0,
             int(CONFIG["HORIZON_DAYS_DEFAULT"]),
+            DEFAULT_SCENARIO_CALC_MODE,
         )
         for key, val in {
             "what_if_price": base_form["manual_price"],
@@ -4676,6 +5352,7 @@ if __name__ == "__main__":
             "what_if_freight_mult": base_form["freight_mult"],
             "what_if_demand_mult": base_form["demand_mult"],
             "what_if_hdays": base_form["hdays"],
+            "what_if_calc_mode": base_form["scenario_calc_mode"],
         }.items():
             if key not in st.session_state:
                 st.session_state[key] = val
@@ -4687,6 +5364,7 @@ if __name__ == "__main__":
             st.session_state["what_if_freight_mult"],
             st.session_state["what_if_demand_mult"],
             st.session_state["what_if_hdays"],
+            st.session_state["what_if_calc_mode"],
         )
         st.session_state.form_last_values = current_form
         st.session_state.scenario_ui_status = get_user_scenario_status(
@@ -4718,23 +5396,111 @@ if __name__ == "__main__":
             demand_mult = st.slider("Ручной множитель спроса", 0.7, 1.3, key="what_if_demand_mult", step=0.05)
         st.markdown("#### Блок 3. Горизонт")
         hdays = st.slider("Горизонт, дней", 7, 90, key="what_if_hdays", step=1)
+        st.markdown("#### Блок 4. Режим расчёта")
+        scenario_calc_mode = st.radio(
+            "Режим расчёта сценария",
+            options=list(SCENARIO_CALC_MODES.keys()),
+            format_func=lambda x: SCENARIO_CALC_MODES[x],
+            key="what_if_calc_mode",
+        )
+        st.caption(
+            "**Текущий режим** — полностью текущая логика, без изменений.\n\n"
+            "**Усиленный v1** — baseline остаётся прежним, а эффекты факторов считаются локально на горизонте."
+        )
+        st.caption(
+            "Когда использовать: **Legacy** — для быстрого базового сценария; "
+            "**Enhanced** — когда нужен path-based сценарий по сегментам и расширенная диагностика поддержки историей."
+        )
+        segments_payload: Dict[str, Any] = {}
+        if scenario_calc_mode == "enhanced_local_factors":
+            st.markdown("#### Блок 5. Сегменты сценария (до 3)")
+            use_segments = st.checkbox("Использовать сегменты по горизонту", key="what_if_use_segments")
+            segments: List[Dict[str, Any]] = []
+            if use_segments:
+                seg_count = st.selectbox("Количество сегментов", options=[1, 2, 3], index=1)
+                fdates = r["_trained_bundle"]["future_dates"]
+                start_default = pd.to_datetime(fdates["date"]).min().date() if len(fdates) else pd.Timestamp.utcnow().date()
+                end_default = pd.to_datetime(fdates["date"]).max().date() if len(fdates) else start_default
+                for i in range(int(seg_count)):
+                    with st.expander(f"Сегмент {i+1}", expanded=True):
+                        s1, s2 = st.columns(2)
+                        seg_start = s1.date_input(f"Start {i+1}", value=start_default, key=f"seg_start_{i}")
+                        seg_end = s2.date_input(f"End {i+1}", value=end_default, key=f"seg_end_{i}")
+                        s3, s4, s5, s8 = st.columns(4)
+                        seg_price = s3.number_input(f"Цена {i+1}", min_value=0.01, value=float(manual_price), key=f"seg_price_{i}")
+                        seg_promo = s4.slider(f"Промо {i+1}", 0.0, 1.0, float(promo_value), step=0.05, key=f"seg_promo_{i}")
+                        seg_freight = s5.slider(f"Фрахт множитель {i+1}", 0.5, 1.5, float(freight_mult), step=0.05, key=f"seg_freight_{i}")
+                        seg_discount = s8.slider(f"Скидка {i+1}", 0.0, 0.95, float(discount), step=0.01, key=f"seg_discount_{i}")
+                        s6, s7 = st.columns(2)
+                        seg_demand = s6.slider(f"Demand shock {i+1}", 0.7, 1.3, float(demand_mult), step=0.05, key=f"seg_demand_{i}")
+                        seg_units = s7.number_input(f"Shock units {i+1}", value=0.0, step=1.0, key=f"seg_units_{i}")
+                        segments.append(
+                            {
+                                "start_date": str(seg_start),
+                                "end_date": str(seg_end),
+                                "price": float(seg_price),
+                                "discount": float(seg_discount),
+                                "promotion": float(seg_promo),
+                                "freight_multiplier": float(seg_freight),
+                                "demand_multiplier": float(seg_demand),
+                                "shock_units": float(seg_units),
+                            }
+                        )
+                segment_paths, segment_warnings = build_segment_paths(
+                    r["_trained_bundle"]["future_dates"].head(int(hdays)),
+                    {
+                        "price": float(manual_price),
+                        "promotion": float(promo_value),
+                        "discount": float(discount),
+                        "freight_multiplier": float(freight_mult),
+                        "demand_multiplier": float(demand_mult),
+                        "freight_value": float(r["_trained_bundle"]["base_ctx"].get("freight_value", 0.0)),
+                    },
+                    segments,
+                )
+                segments_payload = segment_paths
+                for sw in segment_warnings:
+                    st.warning(sw)
 
         p1, p2 = st.columns(2)
         p1.markdown(f"- Цена: **{manual_price:.2f} ₽**\n- Скидка: **{discount:.0%}**\n- Промо: **{promo_value:.0%}**")
         p2.markdown(f"- Логистика: **{freight_mult:.2f}x**\n- Доп. множитель спроса: **{demand_mult:.2f}x**\n- Горизонт: **{hdays} дней**")
+        if float(promo_value) > 0.70:
+            st.error("Промо выше 70% не допускается.")
+        if not (0.5 <= float(freight_mult) <= 1.5):
+            st.error("Множитель логистики должен быть в диапазоне 0.5..1.5.")
+        if abs(float(demand_mult) - 1.0) > 0.25:
+            st.warning("Ручной множитель спроса используется как внешний шок, а не как подтверждённый историей фактор.")
         if abs(float(manual_price) - float(r["current_price"])) / max(float(r["current_price"]), 1e-9) > 0.30:
             st.warning("Цена отличается от текущей более чем на 30%. Результат может быть менее стабильным для интерпретации.")
         apply_btn = st.button("Применить сценарий", type="primary", use_container_width=True)
         close_surface()
 
         if apply_btn:
+            overrides_payload = {"promotion": float(promo_value), "discount": float(discount)}
+            demand_multiplier_for_run = float(demand_mult)
+            if scenario_calc_mode == "enhanced_local_factors" and segments_payload:
+                overrides_payload.update(
+                    {
+                        "price_path": segments_payload.get("price_path", []),
+                        "discount_path": segments_payload.get("discount_path", []),
+                        "promo_path": segments_payload.get("promo_path", []),
+                        "freight_path": segments_payload.get("freight_path", []),
+                        "demand_multiplier_path": segments_payload.get("demand_multiplier_path", []),
+                        "segments": segments_payload.get("segments", []),
+                        "shocks": list(segments_payload.get("segment_shocks", [])),
+                    }
+                )
+                if len(segments_payload.get("demand_multiplier_path", [])):
+                    demand_multiplier_for_run = 1.0
             st.session_state.what_if_result = run_what_if_projection(
                 r["_trained_bundle"],
                 manual_price=float(manual_price),
                 freight_multiplier=float(freight_mult),
-                demand_multiplier=float(demand_mult),
+                demand_multiplier=float(demand_multiplier_for_run),
                 horizon_days=int(hdays),
-                overrides={"promotion": float(promo_value), "discount": float(discount)},
+                overrides=overrides_payload,
+                scenario_calc_mode=str(scenario_calc_mode),
             )
             wr = st.session_state.what_if_result
             r["scenario_forecast"] = wr["daily"].copy()
@@ -4751,6 +5517,7 @@ if __name__ == "__main__":
                 freight_mult,
                 demand_mult,
                 hdays,
+                scenario_calc_mode,
             )
             st.session_state.scenario_ui_status = "applied"
             st.session_state.results = r
@@ -4797,15 +5564,79 @@ if __name__ == "__main__":
                 f"При текущих настройках сценарий меняет спрос на {demand_delta:+,.1f} шт. относительно текущего плана.",
                 f"Ожидаемая выручка меняется на ₽ {revenue_delta:+,.0f}.",
                 f"Ожидаемая прибыль меняется на ₽ {profit_delta:+,.0f}.",
+                f"Режим расчёта: {wr.get('scenario_calc_mode', DEFAULT_SCENARIO_CALC_MODE)}.",
+                f"Эффекты: price={((wr.get('effect_breakdown') or {}).get('price_effect_mean', np.nan)):.3f}, promo={((wr.get('effect_breakdown') or {}).get('promo_effect_mean', np.nan)):.3f}, freight={((wr.get('effect_breakdown') or {}).get('freight_effect_mean', np.nan)):.3f}.",
                 "Это базовая оценка, её нужно интерпретировать вместе с уровнем надёжности.",
             ])
+            render_report_card("Контур расчёта сценария", [
+                f"Режим расчёта: {wr.get('scenario_calc_mode_label', scenario_mode_label(str(wr.get('scenario_calc_mode', DEFAULT_SCENARIO_CALC_MODE))))}",
+                f"Контур расчёта: {wr.get('active_path_contract_label', scenario_contract_label(str(wr.get('active_path_contract', ''))))}",
+                f"Источник эффектов: {wr.get('effect_source_label', effect_source_label(str(wr.get('effect_source', ''))))}",
+                f"Надёжность сценария: {wr.get('confidence_label', 'n/a')}",
+                f"Поддержка сценарием историей: {wr.get('support_label', 'n/a')}",
+                f"Предупреждений: {len(wr.get('warnings', [])) if isinstance(wr.get('warnings', []), list) else 0}",
+            ])
+            open_surface("Разложение эффекта сценария")
+            eb = wr.get("effect_breakdown", {}) or {}
+            d_base = float(baseline_forecast["actual_sales"].sum())
+            d_scen = float(wr.get("demand_total", scenario_forecast["actual_sales"].sum()))
+            st.markdown(
+                f"- baseline demand: **{d_base:,.1f}**\n"
+                f"- final scenario demand: **{d_scen:,.1f}**\n"
+                f"- avg price effect: **{float(eb.get('price_effect_mean', np.nan)):.3f}**\n"
+                f"- avg promo effect: **{float(eb.get('promo_effect_mean', np.nan)):.3f}**\n"
+                f"- avg freight effect: **{float(eb.get('freight_effect_mean', np.nan)):.3f}**\n"
+                f"- avg shock multiplier: **{float(eb.get('shock_multiplier_mean', np.nan)):.3f}**\n"
+                f"- stock cap applied: **{'yes' if bool(eb.get('stock_constraint_active', False)) else 'no'}**"
+            )
+            decomp = pd.DataFrame(wr.get("daily_effects_summary", []))
+            if len(decomp):
+                decomp["date"] = pd.to_datetime(decomp["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                merged_decomp = pd.DataFrame(
+                    {
+                        "date": pd.to_datetime(wr["daily"]["date"]).dt.strftime("%Y-%m-%d"),
+                        "baseline_units": pd.to_numeric(wr["daily"].get("base_pred_sales", 0.0), errors="coerce").fillna(0.0),
+                        "scenario_units": pd.to_numeric(wr["daily"].get("actual_sales", 0.0), errors="coerce").fillna(0.0),
+                    }
+                )
+                merged_decomp = merged_decomp.merge(
+                    decomp.rename(
+                        columns={
+                            "standard_multiplier": "total_multiplier",
+                            "price_effect": "price_multiplier",
+                            "promo_effect": "promo_multiplier",
+                            "freight_effect": "freight_multiplier",
+                            "shock_multiplier": "shock_multiplier",
+                        }
+                    ),
+                    on="date",
+                    how="left",
+                )
+                st.dataframe(merged_decomp.head(30), use_container_width=True)
+                fig_mult = go.Figure()
+                fig_mult.add_trace(go.Scatter(x=merged_decomp["date"], y=merged_decomp["baseline_units"], name="baseline units"))
+                fig_mult.add_trace(go.Scatter(x=merged_decomp["date"], y=merged_decomp["scenario_units"], name="scenario units"))
+                fig_mult.update_layout(**_plot_layout("Baseline vs Scenario Units"))
+                st.plotly_chart(fig_mult, use_container_width=True, config={"displayModeBar": False})
+            close_surface()
 
         compare_df = build_user_friendly_comparison_table(current_forecast, r.get("scenario_forecast"), st.session_state.saved_scenarios, True)
         render_compare_card(compare_df)
         st.caption("В таблице всегда есть база и текущий сценарий (если он применён), даже без сохранения в слот.")
 
         open_surface("Чувствительность")
-        sens = build_sensitivity_grid(r["_trained_bundle"], base_price=float(r["current_price"]), runner=run_what_if_projection).head(5)
+        st.caption(
+            f"Режим чувствительности: {scenario_mode_label(str(st.session_state['what_if_calc_mode']))}. "
+            "Sensitivity отражает отклик выбранного контура расчёта."
+        )
+        if wr is not None and str(wr.get("support_label", "")) == "low":
+            st.warning("Низкая историческая поддержка сценария: sensitivity интерпретировать осторожно.")
+        sens = build_sensitivity_grid(
+            r["_trained_bundle"],
+            base_price=float(r["current_price"]),
+            runner=run_what_if_projection,
+            runner_kwargs={"scenario_calc_mode": st.session_state["what_if_calc_mode"]},
+        ).head(5)
         fig_s = px.bar(sens, x="price", y="profit_adjusted", color_discrete_sequence=["#6F70FF"])
         fig_s.update_layout(**_plot_layout("Чувствительность"))
         st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False})

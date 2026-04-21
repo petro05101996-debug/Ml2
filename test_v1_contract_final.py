@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 
 from app import (
+    build_segment_paths,
+    build_scenario_support_info,
+    build_scenario_support_info_from_paths,
     build_applied_scenario_snapshot,
     build_business_report_payload,
     build_manual_scenario_artifacts,
@@ -15,6 +18,7 @@ from app import (
     resolve_final_active_path,
     run_full_pricing_analysis_universal,
     run_what_if_projection,
+    scenario_mode_label,
 )
 from test_smoke_mvp import _make_txn
 
@@ -250,3 +254,285 @@ def test_saved_scenario_snapshot_contains_effective_fields():
     saved = build_saved_scenario_metrics(res["as_is_forecast"], wr["daily"], wr)
     for key in ["requested_price_gross", "applied_price_gross", "applied_price_net", "applied_discount", "clip_reason"]:
         assert key in saved
+
+
+def test_mode_dispatch_and_unknown_mode_error():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    legacy = run_what_if_projection(bundle, manual_price=base_price, scenario_calc_mode="legacy_current")
+    enhanced = run_what_if_projection(bundle, manual_price=base_price, scenario_calc_mode="enhanced_local_factors")
+    assert legacy["scenario_calc_mode"] == "legacy_current"
+    assert enhanced["scenario_calc_mode"] == "enhanced_local_factors"
+    with np.testing.assert_raises(ValueError):
+        run_what_if_projection(bundle, manual_price=base_price, scenario_calc_mode="unknown")
+
+
+def test_mode_participates_in_dirty_state():
+    base_form = {
+        "manual_price": 100.0,
+        "discount": 0.1,
+        "promo_value": 0.2,
+        "freight_mult": 1.0,
+        "demand_mult": 1.0,
+        "hdays": 30,
+        "scenario_calc_mode": "legacy_current",
+    }
+    current_form = dict(base_form)
+    current_form["scenario_calc_mode"] = "enhanced_local_factors"
+    snapshot = {"scenario_status": "computed", "scenario_calc_mode": "legacy_current"}
+    status = get_user_scenario_status(current_form, base_form, snapshot, "applied")
+    assert status == "dirty"
+
+
+def test_saved_scenario_keeps_mode():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wa = run_what_if_projection(bundle, manual_price=base_price * 1.1, scenario_calc_mode="enhanced_local_factors")
+    saved = build_saved_scenario_metrics(res["as_is_forecast"], wa["daily"], wa)
+    assert saved["scenario_calc_mode"] == "enhanced_local_factors"
+
+
+def test_trained_bundle_contains_small_mode_info_for_enhanced_path():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    assert "small_mode_info" in bundle
+    assert isinstance(bundle["small_mode_info"], dict)
+    assert "small_mode" in bundle["small_mode_info"]
+
+
+def test_enhanced_result_explicit_path_metadata_not_legacy():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    enhanced = run_what_if_projection(bundle, manual_price=base_price * 1.05, scenario_calc_mode="enhanced_local_factors")
+    assert enhanced["active_path_contract"] == "legacy_baseline+enhanced_local_factor_layer"
+    assert enhanced["scenario_driver_mode"] == "baseline_daily_plus_local_factor_layer"
+    assert enhanced["legacy_or_enhanced_label"] == "enhanced"
+
+
+def test_enhanced_path_falls_back_to_small_mode_when_info_missing():
+    res = _analyze_bundle()
+    bundle = copy.deepcopy(res["_trained_bundle"])
+    bundle.pop("small_mode_info", None)
+    base_price = float(bundle["base_ctx"]["price"])
+    enhanced = run_what_if_projection(bundle, manual_price=base_price * 1.02, scenario_calc_mode="enhanced_local_factors")
+    assert enhanced["scenario_calc_mode"] == "enhanced_local_factors"
+    assert "price" in enhanced.get("confidence_factors", {})
+
+
+def test_enhanced_differs_from_legacy_with_time_varying_paths():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    horizon = 14
+    dates = pd.date_range(pd.to_datetime(bundle["future_dates"]["date"]).min(), periods=horizon, freq="D")
+    price_path = [{ "date": str(d.date()), "value": base_price * (0.95 if i < 7 else 1.10)} for i, d in enumerate(dates)]
+    promo_path = [{ "date": str(d.date()), "value": 0.8 if i < 7 else 0.0} for i, d in enumerate(dates)]
+
+    legacy = run_what_if_projection(
+        bundle,
+        manual_price=base_price,
+        horizon_days=horizon,
+        overrides={"promotion": 0.2},
+        scenario_calc_mode="legacy_current",
+    )
+    enhanced = run_what_if_projection(
+        bundle,
+        manual_price=base_price,
+        horizon_days=horizon,
+        overrides={"promotion": 0.2, "price_path": price_path, "promo_path": promo_path},
+        scenario_calc_mode="enhanced_local_factors",
+    )
+    assert not np.isclose(float(legacy["demand_total"]), float(enhanced["demand_total"]))
+    assert bool((enhanced.get("effect_breakdown") or {}).get("trajectory_inputs_active", False)) is True
+
+
+def test_support_block_contains_required_fields():
+    hist = pd.DataFrame(
+        {
+            "date": pd.date_range("2025-01-01", periods=30, freq="D"),
+            "sales": np.random.RandomState(0).randint(0, 20, size=30),
+            "price": np.linspace(90, 110, 30),
+            "discount": np.linspace(0.0, 0.2, 30),
+            "promotion": ([0.0] * 15) + ([0.3] * 15),
+            "freight_value": np.linspace(4, 6, 30),
+        }
+    )
+    support = build_scenario_support_info(
+        hist,
+        {"applied_price_net": 95.0, "promotion": 0.3, "freight_value": 5.0},
+        {},
+    )
+    required = {
+        "history_days",
+        "recent_history_days",
+        "recent_nonzero_sales_days",
+        "unique_price_points",
+        "price_range_pct",
+        "price_changes",
+        "price_stability",
+        "promo_active_days",
+        "promo_change_days",
+        "promo_weeks",
+        "promo_variability",
+        "freight_change_days",
+        "freight_changes",
+        "freight_variation",
+        "discount_unique_count",
+        "promotion_positive_share",
+        "local_price_support_days",
+        "local_promo_support_days",
+        "local_freight_support_days",
+    }
+    assert required.issubset(set(support.keys()))
+
+
+def test_build_segment_paths_warns_on_overlap_and_tracks_usage():
+    future = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=10, freq="D")})
+    payload, warnings = build_segment_paths(
+        future,
+        {"price": 100.0, "promotion": 0.0, "freight_multiplier": 1.0, "demand_multiplier": 1.0, "freight_value": 5.0},
+        [
+            {"start_date": "2025-01-01", "end_date": "2025-01-05", "price": 100.0, "promotion": 0.1, "freight_multiplier": 1.0, "demand_multiplier": 1.0, "shock_units": 0.0},
+            {"start_date": "2025-01-04", "end_date": "2025-01-08", "price": 110.0, "promotion": 0.1, "freight_multiplier": 1.1, "demand_multiplier": 1.0, "shock_units": 0.0},
+        ],
+    )
+    assert any("пересекается" in w for w in warnings)
+    assert len(payload.get("price_path", [])) == 10
+
+
+def test_enhanced_single_segment_matches_scalar_behavior():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    horizon = 10
+    scalar = run_what_if_projection(
+        bundle,
+        manual_price=base_price * 1.02,
+        horizon_days=horizon,
+        overrides={"promotion": 0.2},
+        scenario_calc_mode="enhanced_local_factors",
+    )
+    future = bundle["future_dates"].head(horizon)
+    payload, _ = build_segment_paths(
+        future,
+        {"price": base_price * 1.02, "promotion": 0.2, "freight_multiplier": 1.0, "demand_multiplier": 1.0, "freight_value": float(bundle["base_ctx"].get("freight_value", 0.0))},
+        [{"start_date": str(pd.to_datetime(future["date"]).min().date()), "end_date": str(pd.to_datetime(future["date"]).max().date()), "price": base_price * 1.02, "promotion": 0.2, "freight_multiplier": 1.0, "demand_multiplier": 1.0, "shock_units": 0.0}],
+    )
+    segmented = run_what_if_projection(
+        bundle,
+        manual_price=base_price * 1.02,
+        horizon_days=horizon,
+        overrides={"promotion": 0.2, "price_path": payload["price_path"], "promo_path": payload["promo_path"]},
+        scenario_calc_mode="enhanced_local_factors",
+    )
+    assert np.isclose(float(scalar["demand_total"]), float(segmented["demand_total"]), rtol=0.03)
+
+
+def test_mode_label_helper_human_readable():
+    assert "Legacy" in scenario_mode_label("legacy_current")
+
+
+def test_no_double_count_when_demand_path_and_global_multiplier_present():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    horizon = 12
+    dates = pd.date_range(pd.to_datetime(bundle["future_dates"]["date"]).min(), periods=horizon, freq="D")
+    dpath = [{"date": str(d.date()), "value": 1.1} for d in dates]
+    with_global = run_what_if_projection(
+        bundle,
+        manual_price=base_price,
+        demand_multiplier=1.1,
+        horizon_days=horizon,
+        overrides={"demand_multiplier_path": dpath},
+        scenario_calc_mode="enhanced_local_factors",
+    )
+    path_only = run_what_if_projection(
+        bundle,
+        manual_price=base_price,
+        demand_multiplier=1.0,
+        horizon_days=horizon,
+        overrides={"demand_multiplier_path": dpath},
+        scenario_calc_mode="enhanced_local_factors",
+    )
+    assert np.isclose(float(with_global["demand_total"]), float(path_only["demand_total"]))
+
+
+def test_support_label_changes_with_path_extremity():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    horizon = 14
+    dates = pd.date_range(pd.to_datetime(bundle["future_dates"]["date"]).min(), periods=horizon, freq="D")
+    mild = run_what_if_projection(
+        bundle,
+        manual_price=base_price,
+        horizon_days=horizon,
+        overrides={
+            "price_path": [{"date": str(d.date()), "value": base_price * 0.98} for d in dates],
+            "promo_path": [{"date": str(d.date()), "value": 0.1} for d in dates],
+        },
+        scenario_calc_mode="enhanced_local_factors",
+    )
+    extreme = run_what_if_projection(
+        bundle,
+        manual_price=base_price,
+        horizon_days=horizon,
+        overrides={
+            "price_path": [{"date": str(d.date()), "value": base_price * (1.45 if i % 2 == 0 else 0.55)} for i, d in enumerate(dates)],
+            "promo_path": [{"date": str(d.date()), "value": (1.0 if i % 2 == 0 else 0.0)} for i, d in enumerate(dates)],
+            "freight_path": [{"date": str(d.date()), "value": float(bundle["base_ctx"].get("freight_value", 0.0)) * (2.0 if i % 2 == 0 else 0.3)} for i, d in enumerate(dates)],
+        },
+        scenario_calc_mode="enhanced_local_factors",
+    )
+    mild_score = float((mild.get("scenario_support_info", {}) or {}).get("support_score", 0.0))
+    extreme_score = float((extreme.get("scenario_support_info", {}) or {}).get("support_score", 0.0))
+    assert extreme_score <= mild_score
+
+
+def test_path_guardrails_clip_extreme_values_and_emit_warnings():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    horizon = 7
+    dates = pd.date_range(pd.to_datetime(bundle["future_dates"]["date"]).min(), periods=horizon, freq="D")
+    scenario = run_what_if_projection(
+        bundle,
+        manual_price=base_price,
+        horizon_days=horizon,
+        overrides={
+            "price_path": [{"date": str(d.date()), "value": base_price * 3.0} for d in dates],
+            "promo_path": [{"date": str(d.date()), "value": 0.99} for d in dates],
+            "demand_multiplier_path": [{"date": str(d.date()), "value": 2.5} for d in dates],
+        },
+        scenario_calc_mode="enhanced_local_factors",
+    )
+    txt = " | ".join([str(x) for x in scenario.get("warnings", [])])
+    assert "guardrails" in txt
+    assert float(pd.to_numeric(scenario["daily"]["promotion"], errors="coerce").max()) <= 0.70 + 1e-9
+
+
+def test_path_support_warnings_are_path_based():
+    hist = pd.DataFrame(
+        {
+            "date": pd.date_range("2025-01-01", periods=20, freq="D"),
+            "sales": np.linspace(1, 2, 20),
+            "price": np.linspace(100, 101, 20),
+            "discount": np.zeros(20),
+            "promotion": np.zeros(20),
+            "freight_value": np.ones(20) * 5.0,
+        }
+    )
+    scenario_daily = pd.DataFrame(
+        {
+            "scenario_price_net": np.linspace(150, 180, 10),
+            "scenario_promotion": np.ones(10),
+            "scenario_freight_value": np.ones(10) * 12.0,
+            "shock_multiplier": np.ones(10),
+        }
+    )
+    info = build_scenario_support_info_from_paths(hist, scenario_daily, {})
+    assert len(info.get("warnings", [])) > 0

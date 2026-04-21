@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -10,6 +10,7 @@ def run_scenario_set(
     trained_bundle: Dict[str, Any],
     scenario_rows: List[Dict[str, Any]],
     runner: Callable[..., Dict[str, Any]],
+    runner_kwargs: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     records: List[Dict[str, Any]] = []
     baseline = None
@@ -25,6 +26,7 @@ def run_scenario_set(
             cost_multiplier=float(row.get("cost_multiplier", 1.0)),
             stock_cap=float(row.get("stock_cap", 0.0)),
             overrides=overrides,
+            **(runner_kwargs or {}),
         )
         if baseline is None and row["name"] == "Baseline":
             baseline = result
@@ -66,13 +68,14 @@ def build_sensitivity_grid(
     runner: Callable[..., Dict[str, Any]],
     price_steps: int = 9,
     demand_steps: int = 9,
+    runner_kwargs: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     price_grid = np.linspace(base_price * 0.85, base_price * 1.15, price_steps)
     demand_grid = np.linspace(0.8, 1.2, demand_steps)
     rows: List[Dict[str, Any]] = []
     for p in price_grid:
         for d in demand_grid:
-            r = runner(trained_bundle, manual_price=float(p), horizon_days=30, demand_multiplier=float(d))
+            r = runner(trained_bundle, manual_price=float(p), horizon_days=30, demand_multiplier=float(d), **(runner_kwargs or {}))
             rows.append({
                 "price": p,
                 "demand_multiplier": d,

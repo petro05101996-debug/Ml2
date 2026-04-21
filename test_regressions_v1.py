@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from scenario_engine import run_scenario
+from what_if import build_sensitivity_grid
 from v1_runtime_helpers import (
     build_backend_warning,
     compute_scenario_price_inputs,
@@ -120,3 +121,31 @@ def test_backend_status_is_explicit():
     warning = build_backend_warning(status["model_backend"], status["backend_reason"])
     assert status["model_backend"] == "deterministic_fallback"
     assert warning != ""
+
+
+def test_legacy_mode_regression_identical_to_default_path():
+    from app import run_full_pricing_analysis_universal, run_what_if_projection
+    from test_smoke_mvp import _make_txn
+
+    res = run_full_pricing_analysis_universal(_make_txn(240), "cat-a", "sku-1")
+    bundle = res["_trained_bundle"]
+    price = float(bundle["base_ctx"]["price"]) * 1.03
+    default_run = run_what_if_projection(bundle, manual_price=price, overrides={"promotion": 0.2})
+    explicit_legacy = run_what_if_projection(bundle, manual_price=price, overrides={"promotion": 0.2}, scenario_calc_mode="legacy_current")
+    assert np.isclose(float(default_run["demand_total"]), float(explicit_legacy["demand_total"]))
+    assert np.isclose(float(default_run["revenue_total"]), float(explicit_legacy["revenue_total"]))
+    assert np.isclose(float(default_run["profit_total"]), float(explicit_legacy["profit_total"]))
+    assert np.isclose(float(default_run["confidence"]), float(explicit_legacy["confidence"]))
+    assert np.isclose(float(default_run["daily"]["actual_sales"].sum()), float(explicit_legacy["daily"]["actual_sales"].sum()))
+
+
+def test_sensitivity_grid_propagates_runner_kwargs():
+    seen = []
+
+    def _runner(_bundle, manual_price, horizon_days=30, demand_multiplier=1.0, scenario_calc_mode="legacy_current"):
+        seen.append(scenario_calc_mode)
+        return {"profit_total_adjusted": 1.0, "demand_total": 1.0}
+
+    grid = build_sensitivity_grid({}, base_price=100.0, runner=_runner, price_steps=2, demand_steps=2, runner_kwargs={"scenario_calc_mode": "enhanced_local_factors"})
+    assert len(grid) == 4
+    assert set(seen) == {"enhanced_local_factors"}
