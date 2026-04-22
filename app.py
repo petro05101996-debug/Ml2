@@ -5132,94 +5132,95 @@ def build_segment_paths(
     }, warnings
 
 
-    def render_upload_screen() -> dict[str, Any]:
-        st.markdown(
-            '<div class="section-title">Мастер запуска анализа</div>'
-            '<div class="section-subtitle">3 шага: загрузите файл → проверьте сопоставление колонок → выберите SKU и запустите расчёт</div>',
-            unsafe_allow_html=True,
-        )
-        left, right = st.columns([1.2, 1], gap="large")
+def render_upload_screen() -> dict[str, Any]:
+    st.markdown(
+        '<div class="section-title">Мастер запуска анализа</div>'
+        '<div class="section-subtitle">3 шага: загрузите файл → проверьте сопоставление колонок → выберите SKU и запустите расчёт</div>',
+        unsafe_allow_html=True,
+    )
+    left, right = st.columns([1.2, 1], gap="large")
 
-        with left:
-            open_surface("Шаг 1. Загрузка файла")
-            st.caption("Поддерживаются форматы CSV и XLSX. Загрузите выгрузку с продажами, ценой и датой.")
-            universal_file = st.file_uploader("Файл транзакций", type=["csv", "xlsx"], key="universal_file")
-            close_surface()
+    with left:
+        open_surface("Шаг 1. Загрузка файла")
+        st.caption("Поддерживаются форматы CSV и XLSX. Загрузите выгрузку с продажами, ценой и датой.")
+        universal_file = st.file_uploader("Файл транзакций", type=["csv", "xlsx"], key="universal_file")
+        close_surface()
 
-            open_surface("Шаг 2. Проверка структуры данных")
-            universal_txn = None
-            schema_valid = False
-            schema_errors: list[str] = []
-            universal_quality: dict[str, Any] = {}
-            raw_for_select = None
-            universal_mapping: dict[str, Optional[str]] = {}
+        open_surface("Шаг 2. Проверка структуры данных")
+        universal_txn = None
+        schema_valid = False
+        schema_errors: list[str] = []
+        universal_quality: dict[str, Any] = {}
+        raw_for_select = None
+        universal_mapping: dict[str, Optional[str]] = {}
 
-            if universal_file is not None:
-                preview = read_uploaded_table_safely(universal_file)
-                auto_map = build_auto_mapping(list(preview.columns))
-                required_fields = [f.name for f in CANONICAL_FIELDS if f.required]
-                optional_fields = [f.name for f in CANONICAL_FIELDS if not f.required]
-                st.markdown("**Обязательные поля:** " + ", ".join(required_fields))
-                st.markdown("**Опциональные поля:** " + ", ".join(optional_fields[:6]) + ("..." if len(optional_fields) > 6 else ""))
-                with st.expander("Настроить сопоставление колонок", expanded=True):
-                    for f in CANONICAL_FIELDS:
-                        choices = ["<не использовать>"] + list(preview.columns)
-                        guessed = auto_map.get(f.name)
-                        idx = choices.index(guessed) if guessed in choices else 0
-                        selected = st.selectbox(
-                            f"{f.name} {'*' if f.required else ''}",
-                            choices,
-                            index=idx,
-                            key=f"map_universal_{f.name}",
-                            help="* — обязательное поле для запуска расчёта.",
-                        )
-                        universal_mapping[f.name] = None if selected == "<не использовать>" else selected
-                missing_required = validate_mapping_required_columns(universal_mapping)
-                if missing_required:
-                    schema_errors.append(f"Отсутствуют обязательные поля: {', '.join(missing_required)}")
+        if universal_file is not None:
+            preview = read_uploaded_table_safely(universal_file)
+            auto_map = build_auto_mapping(list(preview.columns))
+            required_fields = [f.name for f in CANONICAL_FIELDS if f.required]
+            optional_fields = [f.name for f in CANONICAL_FIELDS if not f.required]
+            st.markdown("**Обязательные поля:** " + ", ".join(required_fields))
+            st.markdown("**Опциональные поля:** " + ", ".join(optional_fields[:6]) + ("..." if len(optional_fields) > 6 else ""))
+            with st.expander("Настроить сопоставление колонок", expanded=True):
+                for f in CANONICAL_FIELDS:
+                    choices = ["<не использовать>"] + list(preview.columns)
+                    guessed = auto_map.get(f.name)
+                    idx = choices.index(guessed) if guessed in choices else 0
+                    selected = st.selectbox(
+                        f"{f.name} {'*' if f.required else ''}",
+                        choices,
+                        index=idx,
+                        key=f"map_universal_{f.name}",
+                        help="* — обязательное поле для запуска расчёта.",
+                    )
+                    universal_mapping[f.name] = None if selected == "<не использовать>" else selected
+            missing_required = validate_mapping_required_columns(universal_mapping)
+            if missing_required:
+                schema_errors.append(f"Отсутствуют обязательные поля: {', '.join(missing_required)}")
+            else:
+                universal_txn, universal_quality = normalize_transactions(preview, universal_mapping)
+                if universal_quality.get("errors"):
+                    schema_errors.extend(list(universal_quality["errors"]))
                 else:
-                    universal_txn, universal_quality = normalize_transactions(preview, universal_mapping)
-                    if universal_quality.get("errors"):
-                        schema_errors.extend(list(universal_quality["errors"]))
-                    else:
-                        schema_valid = True
-                        raw_for_select = universal_txn.copy().rename(columns={"category": "product_category_name", "product_id": "product_id"})
-                        st.success(f"✅ Данные готовы к расчёту: {len(universal_txn):,} строк после нормализации.")
-                        for w in universal_quality.get("warnings", []):
-                            st.warning(w)
-                        st.caption("Предпросмотр нормализованных данных:")
-                        st.dataframe(universal_txn.head(10), use_container_width=True, height=240)
-            for err in schema_errors:
-                st.error(err)
-            close_surface()
+                    schema_valid = True
+                    raw_for_select = universal_txn.copy().rename(columns={"category": "product_category_name", "product_id": "product_id"})
+                    st.success(f"✅ Данные готовы к расчёту: {len(universal_txn):,} строк после нормализации.")
+                    for w in universal_quality.get("warnings", []):
+                        st.warning(w)
+                    st.caption("Предпросмотр нормализованных данных:")
+                    st.dataframe(universal_txn.head(10), use_container_width=True, height=240)
+        for err in schema_errors:
+            st.error(err)
+        close_surface()
 
-        with right:
-            open_surface("Шаг 3. Выбор объекта и запуск")
-            st.caption("Выберите категорию и SKU, для которого хотите построить сценарий.")
-            target_category, target_sku = None, None
-            if 'raw_for_select' in locals() and raw_for_select is not None and len(raw_for_select) > 0:
-                category_col = "product_category_name" if "product_category_name" in raw_for_select.columns else "category"
-                categories = sorted(raw_for_select[category_col].dropna().astype(str).unique())
-                target_category = st.selectbox("Категория", categories, key="input_target_category") if categories else None
-                if target_category is not None:
-                    sku_col = "product_id"
-                    skus = sorted(raw_for_select[raw_for_select[category_col].astype(str) == str(target_category)][sku_col].astype(str).dropna().unique())
-                    target_sku = st.selectbox("SKU", skus, key="input_target_sku") if skus else None
-            horizon_days = st.slider("Горизонт прогноза, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
-            if target_category and target_sku:
-                st.info(f"Будет рассчитан SKU: **{target_sku}** в категории **{target_category}**.")
-            run_requested = st.button("Запустить анализ", type="primary", use_container_width=True)
-            close_surface()
+    with right:
+        open_surface("Шаг 3. Выбор объекта и запуск")
+        st.caption("Выберите категорию и SKU, для которого хотите построить сценарий.")
+        target_category, target_sku = None, None
+        if 'raw_for_select' in locals() and raw_for_select is not None and len(raw_for_select) > 0:
+            category_col = "product_category_name" if "product_category_name" in raw_for_select.columns else "category"
+            categories = sorted(raw_for_select[category_col].dropna().astype(str).unique())
+            target_category = st.selectbox("Категория", categories, key="input_target_category") if categories else None
+            if target_category is not None:
+                sku_col = "product_id"
+                skus = sorted(raw_for_select[raw_for_select[category_col].astype(str) == str(target_category)][sku_col].astype(str).dropna().unique())
+                target_sku = st.selectbox("SKU", skus, key="input_target_sku") if skus else None
+        horizon_days = st.slider("Горизонт прогноза, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
+        if target_category and target_sku:
+            st.info(f"Будет рассчитан SKU: **{target_sku}** в категории **{target_category}**.")
+        run_requested = st.button("Запустить анализ", type="primary", use_container_width=True)
+        close_surface()
 
-        return {
-            "universal_txn": universal_txn if 'universal_txn' in locals() else None,
-            "schema_valid": schema_valid if 'schema_valid' in locals() else False,
-            "target_category": target_category,
-            "target_sku": target_sku,
-            "run_requested": run_requested,
-            "horizon_days": horizon_days,
-        }
+    return {
+        "universal_txn": universal_txn if 'universal_txn' in locals() else None,
+        "schema_valid": schema_valid if 'schema_valid' in locals() else False,
+        "target_category": target_category,
+        "target_sku": target_sku,
+        "run_requested": run_requested,
+        "horizon_days": horizon_days,
+    }
 
+if __name__ == "__main__":
 
     ctx = {}
     if st.session_state.results is None:
