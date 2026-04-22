@@ -4806,9 +4806,27 @@ if __name__ == "__main__":
 
     apply_theme()
 
-    query_page = st.query_params.get("page", "landing")
-    if isinstance(query_page, list):
-        query_page = query_page[0]
+    def _set_page(page_name: str, rerun: bool = True) -> None:
+        st.session_state["nav_page"] = page_name
+        try:
+            st.query_params["page"] = page_name
+        except Exception:
+            try:
+                st.experimental_set_query_params(page=page_name)
+            except Exception:
+                pass
+        if rerun:
+            st.rerun()
+
+    query_page = st.session_state.get("nav_page")
+    if not query_page:
+        query_page = st.query_params.get("page", "landing")
+        if isinstance(query_page, list):
+            query_page = query_page[0]
+    query_page = str(query_page or "landing")
+    if query_page not in {"landing", "app"}:
+        query_page = "landing"
+    st.session_state["nav_page"] = query_page
 
     if query_page == "landing":
         from ui.components import (
@@ -4831,9 +4849,10 @@ if __name__ == "__main__":
         cta_action = render_landing_cta_v2()
         render_landing_footer()
         if hero_action == "app" or cta_action == "app" or st.button("Перейти в приложение", type="primary", use_container_width=True, key="to_app"):
-            st.query_params["page"] = "app"
-            st.rerun()
-        st.stop()
+            _set_page("app", rerun=False)
+            query_page = "app"
+        else:
+            st.stop()
 
     from ui.components import (
         render_top_header,
@@ -5248,8 +5267,7 @@ def build_segment_paths(
         status_color=status_color,
     )
     if back_to_landing:
-        st.query_params["page"] = "landing"
-        st.rerun()
+        _set_page("landing")
     action_click = render_action_row()
     if action_click == "new":
         r = reset_scenario_ui_state_to_base(r, clear_saved_slot=True)
