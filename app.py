@@ -2065,7 +2065,13 @@ def run_full_pricing_analysis_universal(
     region: Optional[str] = None,
     channel: Optional[str] = None,
     segment: Optional[str] = None,
+    scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
 ):
+    analysis_scenario_calc_mode = (
+        str(scenario_calc_mode)
+        if str(scenario_calc_mode) in SCENARIO_CALC_MODES
+        else DEFAULT_SCENARIO_CALC_MODE
+    )
     txn = normalized_txn.copy()
     raw_columns = set(normalized_txn.columns.tolist())
     if len(txn) == 0:
@@ -2880,24 +2886,29 @@ def run_full_pricing_analysis_universal(
     sensitivity_base = run_what_if_projection(
         sensitivity_trained_bundle,
         manual_price=float(base_ctx.get("price", baseline_price)),
+        scenario_calc_mode=analysis_scenario_calc_mode,
     )
     sensitivity_price_minus_5 = run_what_if_projection(
         sensitivity_trained_bundle,
         manual_price=float(base_ctx.get("price", baseline_price)) * 0.95,
+        scenario_calc_mode=analysis_scenario_calc_mode,
     )
     sensitivity_price_plus_5 = run_what_if_projection(
         sensitivity_trained_bundle,
         manual_price=float(base_ctx.get("price", baseline_price)) * 1.05,
+        scenario_calc_mode=analysis_scenario_calc_mode,
     )
     sensitivity_promo_plus_10pp = run_what_if_projection(
         sensitivity_trained_bundle,
         manual_price=float(base_ctx.get("price", baseline_price)),
         overrides={"promotion": min(1.0, float(base_ctx.get("promotion", 0.0)) + 0.10)},
+        scenario_calc_mode=analysis_scenario_calc_mode,
     )
     sensitivity_freight_plus_10pct = run_what_if_projection(
         sensitivity_trained_bundle,
         manual_price=float(base_ctx.get("price", baseline_price)),
         overrides={"freight_value": float(base_ctx.get("freight_value", 0.0)) * 1.10},
+        scenario_calc_mode=analysis_scenario_calc_mode,
     )
     base_demand_total = float(sensitivity_base["demand_total"])
     scenario_sensitivity_diagnostics = {
@@ -2936,6 +2947,8 @@ def run_full_pricing_analysis_universal(
             "holdout_period": [str(test_weekly["week_start"].min()), str(test_weekly["week_start"].max())],
             "fit_scope": "refit_full_history",
             "horizon_days": int(len(future_dates)),
+            "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
+            "analysis_scenario_calc_mode_label": scenario_mode_label(analysis_scenario_calc_mode),
             "baseline_features": baseline_feature_names,
             "seasonal_anchor_weight": float(seasonal_anchor_weight_full),
             "uplift_features": uplift_bundle.get("features", []),
@@ -3122,6 +3135,7 @@ def run_full_pricing_analysis_universal(
         "delta_vs_baseline": delta_vs_baseline,
         "warnings": warnings,
         "small_mode_info": small_mode_info,
+        "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
         "holdout_metrics": pd.DataFrame([holdout_metrics]),
         "elasticity_map": shrunk_random_effects,
         "current_price": float(base_ctx.get("price")),
@@ -4688,7 +4702,7 @@ def reset_scenario_ui_state_to_base(results: Dict[str, Any], clear_saved_slot: b
     st.session_state["what_if_freight_mult"] = 1.0
     st.session_state["what_if_demand_mult"] = 1.0
     st.session_state["what_if_hdays"] = int(CONFIG["HORIZON_DAYS_DEFAULT"])
-    st.session_state["what_if_calc_mode"] = DEFAULT_SCENARIO_CALC_MODE
+    st.session_state["what_if_calc_mode"] = str(results.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
     st.session_state["what_if_use_segments"] = False
     st.session_state.form_last_values = collect_current_form_values(
         st.session_state["what_if_price"],
@@ -5206,6 +5220,14 @@ def render_upload_screen() -> dict[str, Any]:
                 skus = sorted(raw_for_select[raw_for_select[category_col].astype(str) == str(target_category)][sku_col].astype(str).dropna().unique())
                 target_sku = st.selectbox("SKU", skus, key="input_target_sku") if skus else None
         horizon_days = st.slider("Горизонт прогноза, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
+        analysis_calc_mode = st.radio(
+            "Тракт расчёта (до запуска анализа)",
+            options=list(SCENARIO_CALC_MODES.keys()),
+            format_func=lambda x: SCENARIO_CALC_MODES[x],
+            index=list(SCENARIO_CALC_MODES.keys()).index(DEFAULT_SCENARIO_CALC_MODE),
+            key="input_analysis_calc_mode",
+        )
+        st.caption("Этот выбор применяется к тракту расчёта после нажатия «Запустить анализ» и становится режимом по умолчанию в What-if.")
         if target_category and target_sku:
             st.info(f"Будет рассчитан SKU: **{target_sku}** в категории **{target_category}**.")
         run_requested = st.button("Запустить анализ", type="primary", use_container_width=True)
@@ -5218,6 +5240,7 @@ def render_upload_screen() -> dict[str, Any]:
         "target_sku": target_sku,
         "run_requested": run_requested,
         "horizon_days": horizon_days,
+        "analysis_calc_mode": analysis_calc_mode,
     }
 
 if __name__ == "__main__":
@@ -5236,8 +5259,10 @@ if __name__ == "__main__":
                         ctx["universal_txn"],
                         ctx["target_category"],
                         ctx["target_sku"],
+                        scenario_calc_mode=str(ctx.get("analysis_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
                     )
                     st.session_state.results = copy.deepcopy(results)
+                    st.session_state["what_if_calc_mode"] = str(results.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
                     st.session_state.selected_category_for_results = ctx["target_category"]
                     st.session_state.selected_sku_for_results = ctx["target_sku"]
                     st.session_state.app_stage = "dashboard"
@@ -5283,7 +5308,7 @@ if __name__ == "__main__":
         st.session_state["what_if_freight_mult"] = 1.0
         st.session_state["what_if_demand_mult"] = 1.0
         st.session_state["what_if_hdays"] = int(CONFIG["HORIZON_DAYS_DEFAULT"])
-        st.session_state["what_if_calc_mode"] = DEFAULT_SCENARIO_CALC_MODE
+        st.session_state["what_if_calc_mode"] = str(r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
         st.session_state["what_if_use_segments"] = False
         st.toast("Форма сброшена к базовым значениям", icon="⟲")
         st.rerun()
