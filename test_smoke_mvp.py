@@ -243,6 +243,87 @@ def test_excel_export_includes_manual_scenario_sheet_when_applied():
         assert (metrics_df["metric_name"].astype(str).str.contains("holdout_metrics")).any()
 
 
+def test_analysis_excel_buffer_contains_non_empty_diagnostics():
+    res = _analyze()
+    with pd.ExcelFile(res["excel_buffer"]) as xls:
+        holdout_df = pd.read_excel(xls, "D_holdout_predictions")
+        feature_df = pd.read_excel(xls, "D_feature_report")
+        run_df = pd.read_excel(xls, "D_run_summary")
+        metrics_df = pd.read_excel(xls, "E_metrics_all")
+        assert len(holdout_df) > 0
+        assert len(feature_df) > 0
+        assert len(run_df) > 0
+        assert len(metrics_df) > 0
+
+
+def test_analysis_excel_marks_manual_scenario_absent():
+    res = _analyze()
+    with pd.ExcelFile(res["excel_buffer"]) as xls:
+        summary_df = pd.read_excel(xls, "C_manual_summary")
+        assert "artifact_scope" in summary_df.columns
+        assert str(summary_df.loc[0, "artifact_scope"]) == "analysis_only"
+        assert str(summary_df.loc[0, "scenario_status"]) == "as_is"
+
+
+def test_readme_matches_actual_sheet_presence():
+    res = _analyze()
+    with pd.ExcelFile(res["excel_buffer"]) as xls:
+        readme = pd.read_excel(xls, "README")
+        manual_row = readme.loc[readme["sheet"] == "B_manual_scenario"].iloc[0]
+        assert bool(manual_row["present"]) is False
+        assert "B_manual_scenario" not in xls.sheet_names
+
+
+def test_applied_scenario_excel_contains_manual_sheets_and_summary():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(bundle, manual_price=base_price * 1.1)
+    res["scenario_forecast"] = wr["daily"].copy()
+    res["manual_scenario_summary_json"], res["manual_scenario_daily_csv"] = build_manual_scenario_artifacts(res, wr)
+    res["excel_buffer"] = build_excel_export_buffer(res, wr)
+    with pd.ExcelFile(res["excel_buffer"]) as xls:
+        assert "B_manual_scenario" in xls.sheet_names
+        summary_df = pd.read_excel(xls, "C_manual_summary")
+        assert str(summary_df.loc[0, "artifact_scope"]) == "manual_scenario"
+        readme = pd.read_excel(xls, "README")
+        manual_row = readme.loc[readme["sheet"] == "B_manual_scenario"].iloc[0]
+        assert bool(manual_row["present"]) is True
+
+
+def test_applied_scenario_summary_is_consistent_even_without_manual_json():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(bundle, manual_price=base_price * 1.1)
+    res["scenario_forecast"] = wr["daily"].copy()
+    excel_blob = build_excel_export_buffer(res, wr)
+    with pd.ExcelFile(excel_blob) as xls:
+        summary_df = pd.read_excel(xls, "C_manual_summary")
+        assert str(summary_df.loc[0, "artifact_scope"]) == "manual_scenario"
+        assert str(summary_df.loc[0, "scenario_status"]) == "computed"
+        assert bool(summary_df.loc[0, "manual_scenario_present"]) is True
+
+
+def test_diagnostic_sheets_have_rows_or_stub_reason():
+    res = _analyze()
+    diag_sheets = [
+        "D_holdout_predictions",
+        "D_feature_report",
+        "D_baseline_vs_as_is",
+        "D_uplift_debug",
+        "D_uplift_trace",
+        "D_run_summary",
+        "E_metrics_all",
+    ]
+    with pd.ExcelFile(res["excel_buffer"]) as xls:
+        for sheet in diag_sheets:
+            df = pd.read_excel(xls, sheet)
+            assert len(df) > 0
+            if "status" in df.columns:
+                assert "reason" in df.columns
+
+
 def test_price_increase_above_train_max_is_not_silent():
     res = _analyze()
     bundle = res["_trained_bundle"]

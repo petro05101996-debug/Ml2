@@ -2659,15 +2659,6 @@ def run_full_pricing_analysis_universal(
         "holdout_rmse_delta": float(active_uplift_metrics["holdout_rmse"] - attempted_uplift_metrics["holdout_rmse"]) if np.isfinite(active_uplift_metrics["holdout_rmse"]) and np.isfinite(attempted_uplift_metrics["holdout_rmse"]) else float("nan"),
     }
 
-    excel_buffer = build_excel_export_buffer(
-        {
-            "history_daily": daily_base,
-            "neutral_baseline_forecast": baseline_sim["daily"],
-            "as_is_forecast": as_is_sim["daily"],
-            "holdout_metrics": pd.DataFrame([holdout_metrics]),
-            "scenario_forecast": None,
-        }
-    )
     delta_vs_as_is = {
         "demand_total": float((scenario_sim["daily"]["actual_sales"].sum() - as_is_sim["daily"]["actual_sales"].sum())) if scenario_sim else float("nan"),
         "revenue_total": float((scenario_sim["daily"]["revenue"].sum() - as_is_sim["daily"]["revenue"].sum())) if scenario_sim else float("nan"),
@@ -2681,12 +2672,15 @@ def run_full_pricing_analysis_universal(
     analysis_baseline_vs_as_is = pd.DataFrame({
         "date": pd.to_datetime(as_is_sim["daily"]["date"]).dt.strftime("%Y-%m-%d"),
         "series_id": str(target_sku),
-        "baseline_demand": baseline_sim["daily"]["actual_sales"].values,
         "as_is_demand": as_is_sim["daily"]["actual_sales"].values,
-        "baseline_revenue": baseline_sim["daily"]["revenue"].values,
+        "baseline_demand": baseline_sim["daily"]["actual_sales"].values,
+        "delta_demand": as_is_sim["daily"]["actual_sales"].values - baseline_sim["daily"]["actual_sales"].values,
         "as_is_revenue": as_is_sim["daily"]["revenue"].values,
-        "baseline_profit": baseline_sim["daily"]["profit"].values,
+        "baseline_revenue": baseline_sim["daily"]["revenue"].values,
+        "delta_revenue": as_is_sim["daily"]["revenue"].values - baseline_sim["daily"]["revenue"].values,
         "as_is_profit": as_is_sim["daily"]["profit"].values,
+        "baseline_profit": baseline_sim["daily"]["profit"].values,
+        "delta_profit": as_is_sim["daily"]["profit"].values - baseline_sim["daily"]["profit"].values,
     })
     feature_usage_rows = []
     report_features = list(dict.fromkeys(BASELINE_FEATURES + WEEKLY_MODEL_FEATURES + ["price", "discount", "cost", "stock", "freight_value", "promotion", "baseline_log_feature"]))
@@ -3056,10 +3050,17 @@ def run_full_pricing_analysis_universal(
         "scenario_inputs": {"as_is": {"price": float(base_ctx.get("price")), "discount": float(base_ctx.get("discount", 0.0))}, "neutral_baseline": neutral_overrides},
         "scenario_output_summary": {
             "artifact_scope": "analysis_only",
+            "report_type": "analysis_only",
             "scenario_status": "as_is" if scenario_sim is None else "computed",
-            "scenario_reason": "" if scenario_sim is None else "",
+            "scenario_reason": "no_manual_scenario_applied" if scenario_sim is None else "",
+            "manual_scenario_present": bool(scenario_sim is not None),
+            "manual_scenario_generated": bool(scenario_sim is not None),
             "active_path_contract": final_active_path,
             "learned_uplift_contract": "inactive_production_diagnostic_only",
+            "final_active_path": final_active_path,
+            "production_selected_candidate": "legacy_baseline",
+            "selection_mode": "diagnostic_comparison_runtime_frozen_to_legacy",
+            "production_selection_reason": "v1_contract_runtime_frozen_to_legacy",
             "uplift_mode": "diagnostic_only",
             "uplift_used_in_production": False,
             "scenario_driver_mode": str(as_is_sim.get("scenario_driver_mode", "unknown")),
@@ -3123,7 +3124,7 @@ def run_full_pricing_analysis_universal(
         },
     }
     current_price = float(base_ctx.get("price"))
-    return {
+    result = {
         "history_daily": daily_base,
         "quality_report": {"holdout_metrics": holdout_metrics},
         "feature_usage_report": feature_report,
@@ -3142,7 +3143,6 @@ def run_full_pricing_analysis_universal(
         "scenario_price": None,
         "current_profit": float(as_is_sim.get("adjusted_profit", as_is_sim.get("total_profit", 0.0))),
         "cost_input_available": bool("cost" in txn.columns and pd.to_numeric(txn.get("cost"), errors="coerce").notna().any()),
-        "excel_buffer": excel_buffer,
         "analysis_run_summary_json": json.dumps(run_summary, ensure_ascii=False, indent=2).encode("utf-8"),
         "holdout_predictions_csv": holdout_predictions.to_csv(index=False).encode("utf-8"),
         "holdout_weekly_diagnostics_csv": holdout_weekly_diagnostics.to_csv(index=False).encode("utf-8"),
@@ -3170,6 +3170,7 @@ def run_full_pricing_analysis_universal(
             "small_mode_info": small_mode_info,
         },
     }
+    return refresh_excel_export(result)
 
 
 def _run_what_if_projection_legacy(
@@ -4132,35 +4133,37 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
             return float("nan")
         return float(pd.to_numeric(df[col], errors="coerce").fillna(0.0).sum())
 
-    export_summary = pd.DataFrame(
-        [
-            {
-                "plan": "as_is",
-                "demand_total": _sum(as_is, "actual_sales"),
-                "revenue_total": _sum(as_is, "revenue"),
-                "profit_total": _sum(as_is, "profit"),
-            },
-            {
-                "plan": "neutral_baseline",
-                "demand_total": _sum(baseline, "actual_sales"),
-                "revenue_total": _sum(baseline, "revenue"),
-                "profit_total": _sum(baseline, "profit"),
-            },
-            {
-                "plan": "manual_scenario",
-                "demand_total": _sum(scenario_df, "actual_sales"),
-                "revenue_total": _sum(scenario_df, "revenue"),
-                "profit_total": _sum(scenario_df, "profit"),
-            },
-        ]
-    )
+    def non_empty_or_stub(df: pd.DataFrame, sheet_name: str, reason: str) -> pd.DataFrame:
+        if isinstance(df, pd.DataFrame) and len(df) > 0:
+            return df
+        return pd.DataFrame([{"status": "empty", "sheet": sheet_name, "reason": reason}])
 
     excel_buffer = BytesIO()
-    diagnostics_holdout_predictions = _from_blob_csv(result_dict.get("holdout_predictions_csv"))
-    diagnostics_feature_report = _from_blob_csv(result_dict.get("feature_report_csv"))
-    diagnostics_baseline_vs_as_is = _from_blob_csv(result_dict.get("analysis_baseline_vs_as_is_csv"))
-    diagnostics_uplift_debug = _from_blob_csv(result_dict.get("uplift_debug_report_csv"))
-    diagnostics_uplift_trace = _from_blob_csv(result_dict.get("uplift_holdout_trace_csv"))
+    diagnostics_holdout_predictions = non_empty_or_stub(
+        _from_blob_csv(result_dict.get("holdout_predictions_csv")),
+        "D_holdout_predictions",
+        "source_blob_empty",
+    )
+    diagnostics_feature_report = non_empty_or_stub(
+        _from_blob_csv(result_dict.get("feature_report_csv")),
+        "D_feature_report",
+        "source_blob_empty",
+    )
+    diagnostics_baseline_vs_as_is = non_empty_or_stub(
+        _from_blob_csv(result_dict.get("analysis_baseline_vs_as_is_csv")),
+        "D_baseline_vs_as_is",
+        "source_blob_empty",
+    )
+    diagnostics_uplift_debug = non_empty_or_stub(
+        _from_blob_csv(result_dict.get("uplift_debug_report_csv")),
+        "D_uplift_debug",
+        "source_blob_empty",
+    )
+    diagnostics_uplift_trace = non_empty_or_stub(
+        _from_blob_csv(result_dict.get("uplift_holdout_trace_csv")),
+        "D_uplift_trace",
+        "source_blob_empty",
+    )
     diagnostics_run_summary = _json_to_df(result_dict.get("analysis_run_summary_json"))
     manual_summary_df = _json_to_df(result_dict.get("manual_scenario_summary_json"))
     run_summary_obj = {}
@@ -4178,6 +4181,93 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
     except Exception:
         manual_summary_obj = {}
 
+    run_summary_cfg = (run_summary_obj or {}).get("config", {}) if isinstance(run_summary_obj, dict) else {}
+    scenario_output_summary = (run_summary_obj or {}).get("scenario_output_summary", {}) if isinstance(run_summary_obj, dict) else {}
+    manual_scenario_present = bool(len(scenario_df) > 0)
+    report_type = "manual_scenario" if manual_scenario_present else "analysis_only"
+    if manual_summary_df.empty:
+        manual_summary_stub = {
+            "artifact_scope": "analysis_only",
+            "report_type": "analysis_only",
+            "scenario_status": "as_is",
+            "scenario_reason": "no_manual_scenario_applied",
+            "manual_scenario_present": False,
+            "manual_scenario_generated": False,
+            "scenario_calc_mode": "not_applied",
+        }
+        if manual_scenario_present:
+            manual_summary_stub.update(
+                {
+                    "artifact_scope": "manual_scenario",
+                    "report_type": "manual_scenario",
+                    "scenario_status": "computed",
+                    "scenario_reason": "",
+                    "manual_scenario_present": True,
+                    "manual_scenario_generated": True,
+                    "scenario_calc_mode": str((what_if_result or {}).get("scenario_calc_mode", "unknown")),
+                }
+            )
+        manual_summary_stub.update(
+            {
+                "active_path_contract": str(
+                    run_summary_cfg.get("final_active_path", scenario_output_summary.get("active_path_contract", "legacy_baseline+scenario_recompute"))
+                ),
+                "learned_uplift_contract": str(
+                    scenario_output_summary.get("learned_uplift_contract", "inactive_production_diagnostic_only")
+                ),
+                "final_active_path": str(run_summary_cfg.get("final_active_path", "")),
+                "selected_candidate": str(run_summary_cfg.get("selected_candidate", "")),
+                "production_selected_candidate": str(run_summary_cfg.get("production_selected_candidate", "")),
+                "selection_mode": str(run_summary_cfg.get("selection_mode", "")),
+                "production_selection_reason": str(run_summary_cfg.get("production_selection_reason", "")),
+                "model_backend": str(run_summary_cfg.get("model_backend", scenario_output_summary.get("model_backend", "unknown"))),
+                "backend_reason": str(run_summary_cfg.get("backend_reason", scenario_output_summary.get("backend_reason", ""))),
+                "scenario_driver_mode": str(run_summary_cfg.get("scenario_driver_mode", scenario_output_summary.get("scenario_driver_mode", ""))),
+                "weekly_driver_mode": str(run_summary_cfg.get("weekly_driver_mode", scenario_output_summary.get("weekly_driver_mode", ""))),
+                "uplift_used_in_production": bool(run_summary_cfg.get("uplift_used_in_production", False)),
+            }
+        )
+        manual_summary_df = pd.json_normalize(manual_summary_stub, sep=".")
+    else:
+        if "report_type" not in manual_summary_df.columns:
+            manual_summary_df["report_type"] = "manual_scenario"
+        if "manual_scenario_present" not in manual_summary_df.columns:
+            manual_summary_df["manual_scenario_present"] = True
+        if "manual_scenario_generated" not in manual_summary_df.columns:
+            manual_summary_df["manual_scenario_generated"] = True
+
+    holdout_metrics_sheet = holdout_metrics.copy() if isinstance(holdout_metrics, pd.DataFrame) else pd.DataFrame()
+    if holdout_metrics_sheet.empty and isinstance(run_summary_obj, dict):
+        holdout_flat = (((run_summary_obj.get("metrics_summary", {}) or {}).get("holdout_flat", {})) or {})
+        if isinstance(holdout_flat, dict) and holdout_flat:
+            holdout_metrics_sheet = pd.DataFrame([holdout_flat])
+    if isinstance(run_summary_obj, dict):
+        scenario_summary = (run_summary_obj.get("scenario_output_summary", {}) or {})
+        cfg = (run_summary_obj.get("config", {}) or {})
+        extended_metrics = {
+            "baseline_wape": scenario_summary.get("wape_baseline", np.nan),
+            "final_wape": scenario_summary.get("wape_final", np.nan),
+            "baseline_mape": scenario_summary.get("mape_baseline", np.nan),
+            "final_mape": scenario_summary.get("mape_final", np.nan),
+            "baseline_rmse": scenario_summary.get("rmse_baseline", np.nan),
+            "final_rmse": scenario_summary.get("rmse_final", np.nan),
+            "corr_baseline": scenario_summary.get("corr_baseline", np.nan),
+            "corr_final": scenario_summary.get("corr_final", np.nan),
+            "std_ratio_baseline": scenario_summary.get("std_ratio_baseline", np.nan),
+            "std_ratio_final": scenario_summary.get("std_ratio_final", np.nan),
+            "shape_quality_low": scenario_summary.get("shape_quality_low", np.nan),
+            "uplift_holdout_keep": scenario_summary.get("uplift_holdout_keep", np.nan),
+            "best_naive_wape": cfg.get("best_naive_wape", np.nan),
+            "selected_forecaster": cfg.get("selected_forecaster", ""),
+        }
+        if holdout_metrics_sheet.empty:
+            holdout_metrics_sheet = pd.DataFrame([extended_metrics])
+        else:
+            for key, value in extended_metrics.items():
+                if key not in holdout_metrics_sheet.columns:
+                    holdout_metrics_sheet[key] = value
+    holdout_metrics_sheet = non_empty_or_stub(holdout_metrics_sheet, "D_metrics", "source_blob_empty")
+
     metrics_rows: List[Dict[str, Any]] = []
     for k, v in _flatten_obj("run_summary", run_summary_obj):
         metrics_rows.append({"metric_group": "run_summary", "metric_name": k, "metric_value": v})
@@ -4194,32 +4284,123 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
     metrics_all = pd.DataFrame(metrics_rows)
     if len(metrics_all):
         metrics_all = metrics_all.drop_duplicates(subset=["metric_name", "metric_value"]).sort_values(["metric_group", "metric_name"])
+    metrics_all = non_empty_or_stub(metrics_all, "E_metrics_all", "source_blob_empty")
+    diagnostics_run_summary = non_empty_or_stub(diagnostics_run_summary, "D_run_summary", "source_blob_empty")
+    manual_summary_df = non_empty_or_stub(manual_summary_df, "C_manual_summary", "manual_scenario_not_applied")
 
-    report_index = pd.DataFrame(
+    as_is_demand = _sum(as_is, "actual_sales")
+    as_is_revenue = _sum(as_is, "revenue")
+    as_is_profit = _sum(as_is, "profit")
+    baseline_demand = _sum(baseline, "actual_sales")
+    baseline_revenue = _sum(baseline, "revenue")
+    baseline_profit = _sum(baseline, "profit")
+    scenario_demand = _sum(scenario_df, "actual_sales") if manual_scenario_present else float("nan")
+    scenario_revenue = _sum(scenario_df, "revenue") if manual_scenario_present else float("nan")
+    scenario_profit = _sum(scenario_df, "profit") if manual_scenario_present else float("nan")
+
+    export_summary = pd.DataFrame(
         [
-            {"group": "A_CORE_INPUTS", "sheet": "A_history", "description": "История продаж и факторов."},
-            {"group": "B_FORECASTS", "sheet": "B_as_is", "description": "Текущий план (без изменений)."},
-            {"group": "B_FORECASTS", "sheet": "B_neutral_baseline", "description": "Нейтральный baseline."},
-            {"group": "B_FORECASTS", "sheet": "B_manual_scenario", "description": "Ручной сценарий (если применён)."},
-            {"group": "C_SUMMARY", "sheet": "C_export_summary", "description": "Итоги по спросу/выручке/прибыли."},
-            {"group": "C_SUMMARY", "sheet": "C_manual_summary", "description": "Контракт и метаданные сценария."},
-            {"group": "D_DIAGNOSTICS", "sheet": "D_metrics", "description": "Метрики holdout."},
-            {"group": "D_DIAGNOSTICS", "sheet": "D_holdout_predictions", "description": "Дневные предсказания holdout."},
-            {"group": "D_DIAGNOSTICS", "sheet": "D_feature_report", "description": "Использование признаков."},
-            {"group": "D_DIAGNOSTICS", "sheet": "D_baseline_vs_as_is", "description": "Сравнение baseline и as-is."},
-            {"group": "D_DIAGNOSTICS", "sheet": "D_uplift_debug", "description": "Диагностика uplift."},
-            {"group": "D_DIAGNOSTICS", "sheet": "D_uplift_trace", "description": "Трассировка uplift."},
-            {"group": "D_DIAGNOSTICS", "sheet": "D_run_summary", "description": "Сводный JSON прогона (flattened)."},
-            {"group": "E_METRICS", "sheet": "E_metrics_all", "description": "Все доступные метрики для разбора (flattened)."},
+            {
+                "plan": "as_is",
+                "present": True,
+                "artifact_scope": report_type,
+                "scenario_status": "as_is",
+                "report_type": report_type,
+                "demand_total": as_is_demand,
+                "revenue_total": as_is_revenue,
+                "profit_total": as_is_profit,
+                "delta_demand_vs_as_is": 0.0,
+                "delta_revenue_vs_as_is": 0.0,
+                "delta_profit_vs_as_is": 0.0,
+                "delta_demand_vs_baseline": as_is_demand - baseline_demand,
+                "delta_revenue_vs_baseline": as_is_revenue - baseline_revenue,
+                "delta_profit_vs_baseline": as_is_profit - baseline_profit,
+            },
+            {
+                "plan": "neutral_baseline",
+                "present": True,
+                "artifact_scope": report_type,
+                "scenario_status": "baseline",
+                "report_type": report_type,
+                "demand_total": baseline_demand,
+                "revenue_total": baseline_revenue,
+                "profit_total": baseline_profit,
+                "delta_demand_vs_as_is": baseline_demand - as_is_demand,
+                "delta_revenue_vs_as_is": baseline_revenue - as_is_revenue,
+                "delta_profit_vs_as_is": baseline_profit - as_is_profit,
+                "delta_demand_vs_baseline": 0.0,
+                "delta_revenue_vs_baseline": 0.0,
+                "delta_profit_vs_baseline": 0.0,
+            },
+            {
+                "plan": "manual_scenario",
+                "present": manual_scenario_present,
+                "artifact_scope": report_type,
+                "scenario_status": "computed" if manual_scenario_present else "not_applied",
+                "report_type": report_type,
+                "demand_total": scenario_demand,
+                "revenue_total": scenario_revenue,
+                "profit_total": scenario_profit,
+                "delta_demand_vs_as_is": scenario_demand - as_is_demand if manual_scenario_present else float("nan"),
+                "delta_revenue_vs_as_is": scenario_revenue - as_is_revenue if manual_scenario_present else float("nan"),
+                "delta_profit_vs_as_is": scenario_profit - as_is_profit if manual_scenario_present else float("nan"),
+                "delta_demand_vs_baseline": scenario_demand - baseline_demand if manual_scenario_present else float("nan"),
+                "delta_revenue_vs_baseline": scenario_revenue - baseline_revenue if manual_scenario_present else float("nan"),
+                "delta_profit_vs_baseline": scenario_profit - baseline_profit if manual_scenario_present else float("nan"),
+            },
         ]
     )
+
+    sheet_meta: List[Dict[str, Any]] = [
+        {"group": "A_CORE_INPUTS", "sheet": "A_history", "description": "История продаж и факторов.", "df": history, "optional": False, "note_absent": ""},
+        {"group": "B_FORECASTS", "sheet": "B_as_is", "description": "Текущий план (без изменений).", "df": as_is, "optional": False, "note_absent": ""},
+        {"group": "B_FORECASTS", "sheet": "B_neutral_baseline", "description": "Нейтральный baseline.", "df": baseline, "optional": False, "note_absent": ""},
+        {"group": "B_FORECASTS", "sheet": "B_manual_scenario", "description": "Ручной сценарий (если применён).", "df": scenario_df, "optional": True, "note_absent": "Manual scenario was not applied"},
+        {"group": "C_SUMMARY", "sheet": "C_export_summary", "description": "Итоги и дельты.", "df": export_summary, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "C_manual_summary", "description": "Контракт и метаданные сценария.", "df": manual_summary_df, "optional": False, "note_absent": ""},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_metrics", "description": "Метрики holdout.", "df": holdout_metrics_sheet, "optional": False, "note_absent": ""},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_holdout_predictions", "description": "Дневные предсказания holdout.", "df": diagnostics_holdout_predictions, "optional": False, "note_absent": ""},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_feature_report", "description": "Использование признаков.", "df": diagnostics_feature_report, "optional": False, "note_absent": ""},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_baseline_vs_as_is", "description": "Сравнение baseline и as-is.", "df": diagnostics_baseline_vs_as_is, "optional": False, "note_absent": ""},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_uplift_debug", "description": "Диагностика uplift.", "df": diagnostics_uplift_debug, "optional": False, "note_absent": ""},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_uplift_trace", "description": "Трассировка uplift.", "df": diagnostics_uplift_trace, "optional": False, "note_absent": ""},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_run_summary", "description": "Сводный JSON прогона (flattened).", "df": diagnostics_run_summary, "optional": False, "note_absent": ""},
+        {"group": "E_METRICS", "sheet": "E_metrics_all", "description": "Все доступные метрики (flattened).", "df": metrics_all, "optional": False, "note_absent": ""},
+    ]
+
+    readme_rows: List[Dict[str, Any]] = []
+    for item in sheet_meta:
+        df = item["df"] if isinstance(item.get("df"), pd.DataFrame) else pd.DataFrame()
+        present = bool(len(df) > 0) if item.get("optional", False) else True
+        rows_count = int(len(df)) if present else 0
+        status = "ok"
+        note = ""
+        if not present:
+            status = "not_generated"
+            note = item.get("note_absent", "")
+        elif {"status", "reason", "sheet"}.issubset(set(df.columns)):
+            status = "stub"
+            note = str(df.iloc[0].get("reason", ""))
+        readme_rows.append(
+            {
+                "sheet": item["sheet"],
+                "group": item["group"],
+                "description": item["description"],
+                "present": present,
+                "rows": rows_count,
+                "status": status,
+                "note": note,
+                "report_type": report_type,
+            }
+        )
+    report_index = pd.DataFrame(readme_rows)
 
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
         report_index.to_excel(writer, sheet_name="README", index=False)
         history.to_excel(writer, sheet_name="A_history", index=False)
         as_is.to_excel(writer, sheet_name="B_as_is", index=False)
         baseline.to_excel(writer, sheet_name="B_neutral_baseline", index=False)
-        holdout_metrics.to_excel(writer, sheet_name="D_metrics", index=False)
+        holdout_metrics_sheet.to_excel(writer, sheet_name="D_metrics", index=False)
         export_summary.to_excel(writer, sheet_name="C_export_summary", index=False)
         manual_summary_df.to_excel(writer, sheet_name="C_manual_summary", index=False)
         diagnostics_holdout_predictions.to_excel(writer, sheet_name="D_holdout_predictions", index=False)
@@ -4229,10 +4410,15 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         diagnostics_uplift_trace.to_excel(writer, sheet_name="D_uplift_trace", index=False)
         diagnostics_run_summary.to_excel(writer, sheet_name="D_run_summary", index=False)
         metrics_all.to_excel(writer, sheet_name="E_metrics_all", index=False)
-        if len(scenario_df):
+        if manual_scenario_present:
             scenario_df.to_excel(writer, sheet_name="B_manual_scenario", index=False)
     excel_buffer.seek(0)
     return excel_buffer
+
+
+def refresh_excel_export(result_dict: Dict[str, Any], what_if_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    result_dict["excel_buffer"] = build_excel_export_buffer(result_dict, what_if_result)
+    return result_dict
 
 
 def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -4713,8 +4899,7 @@ def reset_scenario_ui_state_to_base(results: Dict[str, Any], clear_saved_slot: b
         st.session_state["what_if_hdays"],
         st.session_state["what_if_calc_mode"],
     )
-    results["excel_buffer"] = build_excel_export_buffer(results)
-    return results
+    return refresh_excel_export(results)
 
 
 def build_user_friendly_comparison_table(
@@ -5552,7 +5737,7 @@ if __name__ == "__main__":
             r["scenario_price_modeled"] = float(wr.get("model_price", wr.get("price_for_model", manual_price)))
             r["scenario_price"] = r["scenario_price_modeled"]
             r["manual_scenario_summary_json"], r["manual_scenario_daily_csv"] = build_manual_scenario_artifacts(r, wr)
-            r["excel_buffer"] = build_excel_export_buffer(r, wr)
+            refresh_excel_export(r, wr)
             st.session_state.applied_scenario_snapshot = build_applied_scenario_snapshot(
                 wr,
                 manual_price,
