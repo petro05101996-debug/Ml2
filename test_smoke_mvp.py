@@ -285,7 +285,7 @@ def test_applied_scenario_excel_contains_manual_sheets_and_summary():
     with pd.ExcelFile(res["excel_buffer"]) as xls:
         assert "B_manual_scenario" in xls.sheet_names
         summary_df = pd.read_excel(xls, "C_manual_summary")
-        assert str(summary_df.loc[0, "artifact_scope"]) == "manual_scenario"
+        assert str(summary_df.loc[0, "artifact_scope"]) == "analysis_with_manual_scenario"
         readme = pd.read_excel(xls, "README")
         manual_row = readme.loc[readme["sheet"] == "B_manual_scenario"].iloc[0]
         assert bool(manual_row["present"]) is True
@@ -300,7 +300,7 @@ def test_applied_scenario_summary_is_consistent_even_without_manual_json():
     excel_blob = build_excel_export_buffer(res, wr)
     with pd.ExcelFile(excel_blob) as xls:
         summary_df = pd.read_excel(xls, "C_manual_summary")
-        assert str(summary_df.loc[0, "artifact_scope"]) == "manual_scenario"
+        assert str(summary_df.loc[0, "artifact_scope"]) == "analysis_with_manual_scenario"
         assert str(summary_df.loc[0, "scenario_status"]) == "computed"
         assert bool(summary_df.loc[0, "manual_scenario_present"]) is True
 
