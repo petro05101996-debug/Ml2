@@ -170,9 +170,9 @@ def render_landing_hero_v2() -> str | None:
         """
 <div class="hero-grid" style="margin-top:18px;">
   <div class="surface-card">
-    <div class="eyebrow">What-if прогнозирование спроса</div>
-    <div class="hero-headline">Проверяйте, как цена, промо и внешние факторы меняют продажи</div>
-    <div class="muted">Меняйте сценарий и сразу видите влияние на спрос, выручку и прибыль — в одном понятном отчёте.</div>
+    <div class="eyebrow">Проверка коммерческих решений</div>
+    <div class="hero-headline">Проверьте коммерческое решение до запуска</div>
+    <div class="muted">Загрузите историю продаж и оцените, как изменение цены, скидки, промо, логистики или внешнего спроса повлияет на спрос, выручку и прибыль.</div>
     <div class="chip-row">
       <span class="floating-chip">Цена</span>
       <span class="floating-chip">Промо</span>
@@ -199,9 +199,9 @@ def render_landing_hero_v2() -> str | None:
         unsafe_allow_html=True,
     )
     b1, b2 = st.columns(2)
-    if b1.button("Перейти в приложение", type="primary", use_container_width=True, key="landing_try_v2"):
+    if b1.button("Загрузить данные", type="primary", use_container_width=True, key="landing_try_v2"):
         return "app"
-    if b2.button("Посмотреть интерфейс", use_container_width=True, key="landing_demo_v2"):
+    if b2.button("Посмотреть пример сценария", use_container_width=True, key="landing_demo_v2"):
         return "app"
     return None
 
@@ -210,10 +210,10 @@ def render_landing_proof_strip() -> None:
     st.markdown(
         """
 <div class="proof-strip">
-  <div class="proof-item">⚡ Сценарий за минуты</div>
-  <div class="proof-item">🏷️ Цена / промо / факторы</div>
-  <div class="proof-item">📈 Спрос / выручка / прибыль</div>
-  <div class="proof-item">📄 Понятный итоговый отчёт</div>
+  <div class="proof-item">⚡ Воспроизводимые расчёты</div>
+  <div class="proof-item">🏷️ Цена / скидка / промо / логистика</div>
+  <div class="proof-item">📈 Спрос / выручка / прибыль / маржа</div>
+  <div class="proof-item">📄 Отчёт для руководителя</div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -225,30 +225,30 @@ def render_landing_controls_and_outputs() -> None:
         """
 <div class="split-showcase">
   <div class="surface-card">
-    <div class="card-title">Что можно менять</div>
+    <div class="card-title">Какие решения можно проверить</div>
     <ul class="landing-list">
-      <li>Цена</li>
-      <li>Скидка и промо</li>
-      <li>Логистика</li>
-      <li>Внешние факторы</li>
-      <li>Дополнительные сценарные шоки</li>
+      <li>Стоит ли делать скидку</li>
+      <li>Что будет при изменении цены</li>
+      <li>Окупится ли промо</li>
+      <li>Что если вырастет логистика</li>
+      <li>Что если спрос резко изменится</li>
     </ul>
     <div class="mini-control-panel">
       <div>Цена: <b>1290 ₽</b></div>
       <div class="mini-slider"><span>Промо</span><div></div></div>
       <div class="mini-slider"><span>Логистика</span><div></div></div>
       <div class="floating-chip">Шок +5%</div>
-      <button>Применить сценарий</button>
+      <button>Рассчитать сценарий</button>
     </div>
   </div>
   <div class="surface-card">
-    <div class="card-title">Что вы получаете</div>
+    <div class="card-title">Что пользователь получает</div>
     <ul class="landing-list">
-      <li>Новый прогноз спроса</li>
-      <li>Изменение выручки</li>
-      <li>Изменение прибыли</li>
-      <li>Уровень надёжности</li>
-      <li>Готовый управленческий отчёт</li>
+      <li>Базовый прогноз и сценарный прогноз</li>
+      <li>Сравнение вариантов A/B/C</li>
+      <li>Экономика прибыли и маржи</li>
+      <li>Надёжность и предупреждения</li>
+      <li>XLSX/CSV/JSON экспорт</li>
     </ul>
     <div class="mini-dashboard">
       <div class="mini-dashboard-grid">
@@ -272,11 +272,11 @@ def render_landing_pipeline() -> None:
 <div class="pipeline-row">
   <div class="pipeline-step"><span>🧾</span><b>Загрузите данные</b></div>
   <div class="pipeline-arrow">→</div>
-  <div class="pipeline-step"><span>📈</span><b>Получите базовый прогноз</b></div>
+  <div class="pipeline-step"><span>📈</span><b>Система строит базовый прогноз</b></div>
   <div class="pipeline-arrow">→</div>
-  <div class="pipeline-step"><span>🎛️</span><b>Измените сценарий</b></div>
+  <div class="pipeline-step"><span>🎛️</span><b>Настройте сценарий</b></div>
   <div class="pipeline-arrow">→</div>
-  <div class="pipeline-step"><span>✅</span><b>Сравните и примите решение</b></div>
+  <div class="pipeline-step"><span>✅</span><b>Сравните и сохраните отчёт</b></div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -310,8 +310,8 @@ def render_landing_cta_v2() -> str | None:
     st.markdown(
         """
 <div class="surface-card" style="text-align:center; position:relative;">
-  <div class="section-title">Запустите первый сценарий за несколько минут</div>
-  <div class="muted">Загрузите данные, измените параметры и сразу получите понятный результат.</div>
+<div class="section-title">Не просто прогноз продаж. Проверка решения до потери денег</div>
+  <div class="muted">LLM может объяснить идею. Этот инструмент считает сценарии на ваших данных, фиксирует формулы, сравнивает варианты и формирует отчёт.</div>
   <div class="cta-float cta-a">Scenario applied</div>
   <div class="cta-float cta-b">Profit +48k</div>
   <div class="cta-float cta-c">High confidence</div>
