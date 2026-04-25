@@ -123,16 +123,16 @@ ARTIFACT_SCHEMA_VERSION = "v39.1"
 APP_GENERATION = "39"
 
 SCENARIO_CALC_MODES = {
-    "legacy_current": "Текущий режим (как сейчас)",
-    "enhanced_local_factors": "Усиленный v1 (baseline + локальные эффекты факторов)",
+    "legacy_current": "Legacy: старый пересчёт сценария (совместимость)",
+    "enhanced_local_factors": "Enhanced what-if: дневной пересчёт факторов поверх baseline",
 }
-DEFAULT_SCENARIO_CALC_MODE = "legacy_current"
+DEFAULT_SCENARIO_CALC_MODE = "enhanced_local_factors"
 
 
 def scenario_mode_label(mode_code: str) -> str:
     mapping = {
-        "legacy_current": "Текущий расчёт (Legacy)",
-        "enhanced_local_factors": "Улучшенный расчёт (Enhanced Local Factors)",
+        "legacy_current": "Legacy: старый пересчёт сценария",
+        "enhanced_local_factors": "Enhanced what-if: дневной пересчёт факторов поверх baseline",
     }
     return mapping.get(str(mode_code), str(mode_code))
 
@@ -3991,7 +3991,10 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         ]
     ].copy()
     summary = {
-        "artifact_scope": "manual_scenario",
+        "artifact_scope": "analysis_with_manual_scenario",
+        "report_type": "scenario_report",
+        "manual_scenario_present": True,
+        "manual_scenario_generated": True,
         "scenario_status": what_if_result.get("scenario_status", "as_is"),
         "requested_price": float(what_if_result.get("requested_price", np.nan)),
         "model_price": float(what_if_result.get("model_price", what_if_result.get("price_for_model", np.nan))),
@@ -4026,6 +4029,7 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "applied_overrides": what_if_result.get("applied_overrides", {}),
         "scenario_forecast": manual_daily.to_dict("records"),
         "active_path_contract": str(what_if_result.get("active_path_contract", "legacy_baseline+scenario_recompute")),
+        "final_active_path": str(what_if_result.get("active_path_contract", "legacy_baseline+scenario_recompute")),
         "model_backend": str(what_if_result.get("model_backend", "unknown")),
         "backend_reason": str(what_if_result.get("backend_reason", "")),
         "learned_uplift_contract": "inactive_production_diagnostic_only",
@@ -4138,6 +4142,109 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
             return df
         return pd.DataFrame([{"status": "empty", "sheet": sheet_name, "reason": reason}])
 
+    def _build_executive_summary(
+        run_summary_obj: Dict[str, Any],
+        run_summary_cfg: Dict[str, Any],
+        scenario_output_summary: Dict[str, Any],
+        manual_scenario_present: bool,
+        scenario_calc_mode_value: str,
+        active_path_contract: str,
+        warnings_list: List[str],
+    ) -> pd.DataFrame:
+        holdout_flat = (((run_summary_obj.get("metrics_summary", {}) or {}).get("holdout_flat", {})) or {})
+        base_ctx = ((result_dict.get("_trained_bundle", {}) or {}).get("base_ctx", {}) or {})
+        history_local = result_dict.get("history_daily", pd.DataFrame())
+        train_start = pd.to_datetime(history_local.get("date"), errors="coerce").min() if len(history_local) else pd.NaT
+        train_end = pd.to_datetime(history_local.get("date"), errors="coerce").max() if len(history_local) else pd.NaT
+        top_warnings = "; ".join([str(w) for w in warnings_list[:5]]) if warnings_list else ""
+        return pd.DataFrame(
+            [
+                {
+                    "sku": str(base_ctx.get("product_id", "unknown")),
+                    "category": str(base_ctx.get("category", "unknown")),
+                    "train_period_start": "" if pd.isna(train_start) else str(pd.Timestamp(train_start).date()),
+                    "train_period_end": "" if pd.isna(train_end) else str(pd.Timestamp(train_end).date()),
+                    "holdout_period": str(run_summary_cfg.get("holdout_period", "")),
+                    "horizon_days": int(len(result_dict.get("neutral_baseline_forecast", pd.DataFrame()))),
+                    "wape": float(holdout_flat.get("wape", np.nan)),
+                    "mape": float(holdout_flat.get("mape", np.nan)),
+                    "mae": float(holdout_flat.get("mae", np.nan)),
+                    "rmse": float(holdout_flat.get("rmse", np.nan)),
+                    "forecast_shape_warning": bool((scenario_output_summary or {}).get("shape_quality_low", False)),
+                    "selected_baseline": str(run_summary_cfg.get("selected_candidate", "legacy_baseline")),
+                    "production_selected_candidate": str(run_summary_cfg.get("production_selected_candidate", "legacy_baseline")),
+                    "analysis_scenario_calc_mode": scenario_calc_mode_value,
+                    "manual_scenario_status": "applied" if manual_scenario_present else "not_applied",
+                    "active_scenario_path": active_path_contract,
+                    "uplift_status": "diagnostic_only",
+                    "top_warnings": top_warnings or ("Сценарий не применён. Это отчёт baseline-анализа." if not manual_scenario_present else ""),
+                }
+            ]
+        )
+
+    def _build_feature_usage_report(feature_report_df: pd.DataFrame, run_summary_cfg: Dict[str, Any]) -> pd.DataFrame:
+        if not isinstance(feature_report_df, pd.DataFrame) or feature_report_df.empty:
+            return pd.DataFrame([{"feature": "n/a", "group": "Found but not used", "reason_excluded": "feature_report_empty"}])
+        df = feature_report_df.copy()
+        feature_col = "feature" if "feature" in df.columns else ("factor_name" if "factor_name" in df.columns else ("name" if "name" in df.columns else None))
+        if feature_col is None:
+            return pd.DataFrame([{"feature": "n/a", "group": "Found but not used", "reason_excluded": "feature_column_missing"}])
+        df["feature"] = df[feature_col].astype(str)
+        baseline_features = set(run_summary_cfg.get("active_feature_columns", []) or [])
+        scenario_only_known = {"price", "discount", "promotion", "freight_value", "demand_multiplier", "shock_units"}
+        for col, default in {
+            "found_in_raw": True,
+            "present_in_daily": False,
+            "present_in_weekly": False,
+            "used_in_active_baseline": False,
+            "used_in_scenario": False,
+            "used_in_attempted_uplift": False,
+            "used_in_active_uplift": False,
+            "reason_excluded": "",
+            "active_usage_reason": "",
+        }.items():
+            if col not in df.columns:
+                df[col] = default
+        df["used_in_active_baseline"] = (
+            df["used_in_active_baseline"]
+            | df.get("used_in_weekly_baseline", False)
+            | df.get("used_in_weekly_model", False)
+            | df.get("used_in_final_active_forecast", False)
+        )
+        df["used_in_attempted_uplift"] = (
+            df["used_in_attempted_uplift"]
+            | df.get("used_in_weekly_uplift_attempted", False)
+            | df.get("used_in_uplift", False)
+        )
+        df["used_in_active_uplift"] = df["used_in_active_uplift"] | df.get("used_in_weekly_uplift_active", False)
+        df["used_in_active_baseline"] = df["used_in_active_baseline"] | df["feature"].isin(baseline_features)
+        df["used_in_scenario"] = df["used_in_scenario"] | df["feature"].isin(scenario_only_known)
+
+        def _group_row(row: pd.Series) -> str:
+            if bool(row.get("used_in_active_baseline", False)):
+                return "Active baseline ML features"
+            if bool(row.get("used_in_scenario", False)):
+                return "Scenario-only factors"
+            if bool(row.get("used_in_attempted_uplift", False)) or bool(row.get("used_in_active_uplift", False)):
+                return "Diagnostic-only factors"
+            return "Found but not used"
+
+        df["group"] = df.apply(_group_row, axis=1)
+        cols = [
+            "feature",
+            "group",
+            "found_in_raw",
+            "present_in_daily",
+            "present_in_weekly",
+            "used_in_active_baseline",
+            "used_in_scenario",
+            "used_in_attempted_uplift",
+            "used_in_active_uplift",
+            "reason_excluded",
+            "active_usage_reason",
+        ]
+        return df[cols].drop_duplicates(subset=["feature", "group"]).sort_values(["group", "feature"]).reset_index(drop=True)
+
     excel_buffer = BytesIO()
     diagnostics_holdout_predictions = non_empty_or_stub(
         _from_blob_csv(result_dict.get("holdout_predictions_csv")),
@@ -4184,7 +4291,14 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
     run_summary_cfg = (run_summary_obj or {}).get("config", {}) if isinstance(run_summary_obj, dict) else {}
     scenario_output_summary = (run_summary_obj or {}).get("scenario_output_summary", {}) if isinstance(run_summary_obj, dict) else {}
     manual_scenario_present = bool(len(scenario_df) > 0)
-    report_type = "manual_scenario" if manual_scenario_present else "analysis_only"
+    report_type = "scenario_report" if manual_scenario_present else "analysis_only"
+    artifact_scope = "analysis_with_manual_scenario" if manual_scenario_present else "analysis_only"
+    active_path_contract = str(
+        ((what_if_result or {}).get("active_path_contract"))
+        if manual_scenario_present
+        else run_summary_cfg.get("final_active_path", scenario_output_summary.get("active_path_contract", "legacy_baseline+scenario_recompute"))
+    )
+    scenario_calc_mode_value = str((what_if_result or {}).get("scenario_calc_mode", "unknown")) if manual_scenario_present else "not_applied"
     if manual_summary_df.empty:
         manual_summary_stub = {
             "artifact_scope": "analysis_only",
@@ -4194,28 +4308,27 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
             "manual_scenario_present": False,
             "manual_scenario_generated": False,
             "scenario_calc_mode": "not_applied",
+            "final_active_path": str(run_summary_cfg.get("final_active_path", scenario_output_summary.get("active_path_contract", "legacy_baseline+scenario_recompute"))),
         }
         if manual_scenario_present:
             manual_summary_stub.update(
                 {
-                    "artifact_scope": "manual_scenario",
-                    "report_type": "manual_scenario",
+                    "artifact_scope": "analysis_with_manual_scenario",
+                    "report_type": "scenario_report",
                     "scenario_status": "computed",
                     "scenario_reason": "",
                     "manual_scenario_present": True,
                     "manual_scenario_generated": True,
                     "scenario_calc_mode": str((what_if_result or {}).get("scenario_calc_mode", "unknown")),
+                    "final_active_path": str((what_if_result or {}).get("active_path_contract", "")),
                 }
             )
         manual_summary_stub.update(
             {
-                "active_path_contract": str(
-                    run_summary_cfg.get("final_active_path", scenario_output_summary.get("active_path_contract", "legacy_baseline+scenario_recompute"))
-                ),
+                "active_path_contract": active_path_contract,
                 "learned_uplift_contract": str(
                     scenario_output_summary.get("learned_uplift_contract", "inactive_production_diagnostic_only")
                 ),
-                "final_active_path": str(run_summary_cfg.get("final_active_path", "")),
                 "selected_candidate": str(run_summary_cfg.get("selected_candidate", "")),
                 "production_selected_candidate": str(run_summary_cfg.get("production_selected_candidate", "")),
                 "selection_mode": str(run_summary_cfg.get("selection_mode", "")),
@@ -4230,11 +4343,15 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         manual_summary_df = pd.json_normalize(manual_summary_stub, sep=".")
     else:
         if "report_type" not in manual_summary_df.columns:
-            manual_summary_df["report_type"] = "manual_scenario"
+            manual_summary_df["report_type"] = report_type
         if "manual_scenario_present" not in manual_summary_df.columns:
-            manual_summary_df["manual_scenario_present"] = True
+            manual_summary_df["manual_scenario_present"] = manual_scenario_present
         if "manual_scenario_generated" not in manual_summary_df.columns:
-            manual_summary_df["manual_scenario_generated"] = True
+            manual_summary_df["manual_scenario_generated"] = manual_scenario_present
+        manual_summary_df["artifact_scope"] = artifact_scope
+        manual_summary_df["report_type"] = report_type
+        if not manual_scenario_present:
+            manual_summary_df["scenario_calc_mode"] = "not_applied"
 
     holdout_metrics_sheet = holdout_metrics.copy() if isinstance(holdout_metrics, pd.DataFrame) else pd.DataFrame()
     if holdout_metrics_sheet.empty and isinstance(run_summary_obj, dict):
@@ -4303,7 +4420,7 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
             {
                 "plan": "as_is",
                 "present": True,
-                "artifact_scope": report_type,
+                "artifact_scope": artifact_scope,
                 "scenario_status": "as_is",
                 "report_type": report_type,
                 "demand_total": as_is_demand,
@@ -4319,7 +4436,7 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
             {
                 "plan": "neutral_baseline",
                 "present": True,
-                "artifact_scope": report_type,
+                "artifact_scope": artifact_scope,
                 "scenario_status": "baseline",
                 "report_type": report_type,
                 "demand_total": baseline_demand,
@@ -4335,7 +4452,7 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
             {
                 "plan": "manual_scenario",
                 "present": manual_scenario_present,
-                "artifact_scope": report_type,
+                "artifact_scope": artifact_scope,
                 "scenario_status": "computed" if manual_scenario_present else "not_applied",
                 "report_type": report_type,
                 "demand_total": scenario_demand,
@@ -4350,6 +4467,45 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
             },
         ]
     )
+    scenario_warnings = list((what_if_result or {}).get("warnings", [])) if isinstance(what_if_result, dict) else []
+    executive_summary = _build_executive_summary(
+        run_summary_obj=run_summary_obj if isinstance(run_summary_obj, dict) else {},
+        run_summary_cfg=run_summary_cfg,
+        scenario_output_summary=scenario_output_summary,
+        manual_scenario_present=manual_scenario_present,
+        scenario_calc_mode_value=scenario_calc_mode_value,
+        active_path_contract=active_path_contract,
+        warnings_list=scenario_warnings,
+    )
+    scenario_summary = pd.DataFrame(
+        [
+            {
+                "scenario_applied": bool(manual_scenario_present),
+                "baseline_demand": baseline_demand,
+                "scenario_demand": scenario_demand,
+                "delta_demand_pct": ((scenario_demand - baseline_demand) / max(abs(baseline_demand), 1e-9) * 100.0) if manual_scenario_present else float("nan"),
+                "baseline_revenue": baseline_revenue,
+                "scenario_revenue": scenario_revenue,
+                "delta_revenue_pct": ((scenario_revenue - baseline_revenue) / max(abs(baseline_revenue), 1e-9) * 100.0) if manual_scenario_present else float("nan"),
+                "baseline_profit": baseline_profit,
+                "scenario_profit": scenario_profit,
+                "delta_profit_pct": ((scenario_profit - baseline_profit) / max(abs(baseline_profit), 1e-9) * 100.0) if manual_scenario_present else float("nan"),
+                "avg_price": float(_sum(scenario_df, "price") / max(len(scenario_df), 1)) if manual_scenario_present and len(scenario_df) else float("nan"),
+                "avg_discount": float(_sum(scenario_df, "discount") / max(len(scenario_df), 1)) if manual_scenario_present and len(scenario_df) else float("nan"),
+                "promo_days": int(pd.to_numeric(scenario_df.get("promotion", pd.Series([])), errors="coerce").fillna(0.0).gt(0).sum()) if manual_scenario_present else 0,
+                "avg_freight_multiplier": float((what_if_result or {}).get("applied_path_summary", {}).get("avg_freight", np.nan)) if manual_scenario_present else float("nan"),
+                "manual_shocks": int(len(((what_if_result or {}).get("applied_overrides", {}) or {}).get("shocks", []))) if manual_scenario_present else 0,
+                "note": "" if manual_scenario_present else "Сценарий не применён. Это только анализ baseline.",
+            }
+        ]
+    )
+    feature_usage = _build_feature_usage_report(diagnostics_feature_report, run_summary_cfg)
+    effect_breakdown_df = pd.DataFrame([dict((what_if_result or {}).get("effect_breakdown", {}))]) if manual_scenario_present else pd.DataFrame(
+        [{"status": "not_applied", "reason": "manual_scenario_not_applied"}]
+    )
+    daily_effects_df = pd.DataFrame((what_if_result or {}).get("daily_effects_summary", [])) if manual_scenario_present else pd.DataFrame(
+        [{"status": "not_applied", "reason": "manual_scenario_not_applied"}]
+    )
 
     sheet_meta: List[Dict[str, Any]] = [
         {"group": "A_CORE_INPUTS", "sheet": "A_history", "description": "История продаж и факторов.", "df": history, "optional": False, "note_absent": ""},
@@ -4358,6 +4514,12 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         {"group": "B_FORECASTS", "sheet": "B_manual_scenario", "description": "Ручной сценарий (если применён).", "df": scenario_df, "optional": True, "note_absent": "Manual scenario was not applied"},
         {"group": "C_SUMMARY", "sheet": "C_export_summary", "description": "Итоги и дельты.", "df": export_summary, "optional": False, "note_absent": ""},
         {"group": "C_SUMMARY", "sheet": "C_manual_summary", "description": "Контракт и метаданные сценария.", "df": manual_summary_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Executive Summary", "description": "Пользовательская сводка v1.", "df": executive_summary, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Scenario Summary", "description": "Сводка baseline vs scenario.", "df": scenario_summary, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "scenario_vs_baseline_summary", "description": "Delta сценария к baseline.", "df": scenario_summary, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "effect_breakdown", "description": "Разложение эффектов сценария.", "df": effect_breakdown_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "daily_effects_summary", "description": "Дневные эффекты сценария.", "df": daily_effects_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Feature Usage", "description": "Что реально используется в baseline/scenario/diagnostics.", "df": feature_usage, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_metrics", "description": "Метрики holdout.", "df": holdout_metrics_sheet, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_holdout_predictions", "description": "Дневные предсказания holdout.", "df": diagnostics_holdout_predictions, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_feature_report", "description": "Использование признаков.", "df": diagnostics_feature_report, "optional": False, "note_absent": ""},
@@ -4403,6 +4565,12 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         holdout_metrics_sheet.to_excel(writer, sheet_name="D_metrics", index=False)
         export_summary.to_excel(writer, sheet_name="C_export_summary", index=False)
         manual_summary_df.to_excel(writer, sheet_name="C_manual_summary", index=False)
+        executive_summary.to_excel(writer, sheet_name="Executive Summary", index=False)
+        scenario_summary.to_excel(writer, sheet_name="Scenario Summary", index=False)
+        scenario_summary.to_excel(writer, sheet_name="scenario_vs_baseline_summary", index=False)
+        effect_breakdown_df.to_excel(writer, sheet_name="effect_breakdown", index=False)
+        daily_effects_df.to_excel(writer, sheet_name="daily_effects_summary", index=False)
+        feature_usage.to_excel(writer, sheet_name="Feature Usage", index=False)
         diagnostics_holdout_predictions.to_excel(writer, sheet_name="D_holdout_predictions", index=False)
         diagnostics_feature_report.to_excel(writer, sheet_name="D_feature_report", index=False)
         diagnostics_baseline_vs_as_is.to_excel(writer, sheet_name="D_baseline_vs_as_is", index=False)
@@ -4811,16 +4979,39 @@ def get_user_scenario_status(
     return "dirty"
 
 
-def render_scenario_status_banner(status: str, snapshot: Optional[Dict[str, Any]] = None, last_saved_slot: Optional[str] = None) -> None:
+def render_scenario_status_banner(
+    status: str,
+    snapshot: Optional[Dict[str, Any]] = None,
+    last_saved_slot: Optional[str] = None,
+    selected_mode: str = DEFAULT_SCENARIO_CALC_MODE,
+) -> None:
+    selected_mode_label = scenario_mode_label(selected_mode)
     if status == "as_is":
-        st.info("Сейчас показана база без изменений. Сценарий ещё не применён.")
+        st.info(
+            "Анализ выполнен.\n"
+            f"Режим what-if по умолчанию: {selected_mode_label}.\n"
+            "Сценарий ещё не применён. Чтобы получить результат сценария, нажмите «Применить сценарий»."
+        )
     elif status == "dirty":
-        st.warning("Вы изменили параметры, но ещё не применили сценарий. Цифры ниже относятся к последнему применённому состоянию.")
+        st.warning(
+            "Вы изменили параметры, но сценарий ещё не применён.\n"
+            "Текущие цифры относятся к последнему применённому состоянию."
+        )
     elif status == "saved":
         slot = last_saved_slot or "Scenario A"
-        st.success(f"Сценарий применён и сохранён в слот {slot}.")
+        path_label = snapshot.get("active_path_contract_label", "") if isinstance(snapshot, dict) else ""
+        st.success(
+            f"Сценарий применён и сохранён в слот {slot}.\n"
+            f"Активный сценарный тракт: {path_label or 'legacy_baseline+enhanced_local_factor_layer'}."
+        )
     elif status == "applied":
-        st.success("Сценарий применён. Ниже показан результат именно для этих параметров.")
+        path_label = snapshot.get("active_path_contract_label", "") if isinstance(snapshot, dict) else ""
+        mode_label = snapshot.get("scenario_calc_mode_label", selected_mode_label) if isinstance(snapshot, dict) else selected_mode_label
+        st.success(
+            "Сценарий применён.\n"
+            f"Активный сценарный тракт: {path_label or 'legacy_baseline+enhanced_local_factor_layer'}.\n"
+            f"Режим расчёта: {mode_label}."
+        )
     else:
         st.info("Состояние сценария не определено.")
 
@@ -5606,7 +5797,31 @@ if __name__ == "__main__":
             st.session_state.scenario_ui_status,
             st.session_state.applied_scenario_snapshot,
             st.session_state.last_saved_slot,
+            selected_mode=str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
         )
+        analysis_state = "completed" if bool(r.get("_trained_bundle")) else "not completed"
+        scenario_state = "applied" if st.session_state.what_if_result is not None else "not applied"
+        export_scope = "analysis_with_manual_scenario" if scenario_state == "applied" else "analysis_only"
+        if st.session_state.what_if_result is not None:
+            active_path_contract = str(st.session_state.what_if_result.get("active_path_contract", "legacy_baseline+enhanced_local_factor_layer"))
+        else:
+            try:
+                run_summary = json.loads(r.get("analysis_run_summary_json", b"{}").decode("utf-8"))
+                active_path_contract = str(((run_summary.get("config", {}) or {}).get("final_active_path", "legacy_baseline+scenario_recompute")))
+            except Exception:
+                active_path_contract = "legacy_baseline+scenario_recompute"
+        badge_df = pd.DataFrame(
+            [
+                {"status": "Analysis", "value": analysis_state},
+                {"status": "Scenario applied", "value": "yes" if scenario_state == "applied" else "no"},
+                {"status": "Scenario mode", "value": str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE))},
+                {"status": "Export scope", "value": export_scope},
+                {"status": "Active path contract", "value": active_path_contract},
+            ]
+        )
+        st.dataframe(badge_df, use_container_width=True, hide_index=True)
+        if scenario_state != "applied":
+            st.info("Это только baseline-анализ. What-if сценарий ещё не применён.")
 
         open_surface("Форма сценария")
         st.markdown("#### Блок 1. Цена и промо")
@@ -5633,12 +5848,11 @@ if __name__ == "__main__":
             key="what_if_calc_mode",
         )
         st.caption(
-            "**Текущий режим** — полностью текущая логика, без изменений.\n\n"
-            "**Усиленный v1** — baseline остаётся прежним, а эффекты факторов считаются локально на горизонте."
+            "**Legacy** — старый пересчёт сценария (совместимость), без enhanced слоя.\n\n"
+            "**Enhanced what-if** — baseline остаётся weekly ML, а эффекты факторов считаются локально на дневном горизонте после применения сценария."
         )
         st.caption(
-            "Когда использовать: **Legacy** — для быстрого базового сценария; "
-            "**Enhanced** — когда нужен path-based сценарий по сегментам и расширенная диагностика поддержки историей."
+            "Baseline остаётся weekly ML. Цена, скидка, промо, логистика и шоки применяются после нажатия «Применить сценарий» в daily scenario layer."
         )
         segments_payload: Dict[str, Any] = {}
         if scenario_calc_mode == "enhanced_local_factors":
