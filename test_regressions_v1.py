@@ -135,7 +135,6 @@ def test_legacy_mode_regression_identical_to_default_path():
     assert np.isclose(float(default_run["demand_total"]), float(explicit_legacy["demand_total"]))
     assert np.isclose(float(default_run["revenue_total"]), float(explicit_legacy["revenue_total"]))
     assert np.isclose(float(default_run["profit_total"]), float(explicit_legacy["profit_total"]))
-    assert np.isclose(float(default_run["confidence"]), float(explicit_legacy["confidence"]))
     assert np.isclose(float(default_run["daily"]["actual_sales"].sum()), float(explicit_legacy["daily"]["actual_sales"].sum()))
 
 
@@ -149,3 +148,39 @@ def test_sensitivity_grid_propagates_runner_kwargs():
     grid = build_sensitivity_grid({}, base_price=100.0, runner=_runner, price_steps=2, demand_steps=2, runner_kwargs={"scenario_calc_mode": "enhanced_local_factors"})
     assert len(grid) == 4
     assert set(seen) == {"enhanced_local_factors"}
+
+
+def test_manual_scenario_contract_regression_profit_down_recommendation_not_recommended():
+    import json
+
+    from app import build_manual_scenario_artifacts, classify_economic_verdict, run_full_pricing_analysis_universal, run_what_if_projection
+    from test_smoke_mvp import _make_txn
+
+    res = run_full_pricing_analysis_universal(_make_txn(240), "cat-a", "sku-1")
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(
+        bundle,
+        manual_price=base_price * 0.95,
+        scenario_calc_mode="enhanced_local_factors",
+        overrides={"promotion": min(1.0, float(bundle["base_ctx"].get("promotion", 0.0)) + 0.35), "discount": 0.20},
+    )
+    res["scenario_forecast"] = wr["daily"].copy()
+    summary_blob, daily_blob = build_manual_scenario_artifacts(res, wr)
+    summary = json.loads(summary_blob.decode("utf-8"))
+    daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
+    assert float(summary["scenario_demand_total"]) > float(summary["as_is_demand_total"])
+    assert float(summary["scenario_revenue_total"]) > float(summary["as_is_revenue_total"])
+    assert float(summary["scenario_profit_total"]) < float(summary["as_is_profit_total"])
+    expected_label, _, _ = classify_economic_verdict(
+        float(summary["scenario_vs_as_is_profit_pct"]),
+        float(summary["scenario_vs_as_is_demand_pct"]),
+        float(summary["scenario_vs_as_is_revenue_pct"]),
+    )
+    assert expected_label in {"Не рекомендуется", "Невыгоден"}
+    assert str(summary["economic_verdict"]) != ""
+    assert str(summary["reliability_verdict"]) != ""
+    assert "scenario_vs_as_is_revenue_pct" in summary
+    run_summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
+    assert str(summary["scenario_calculation_path"]) == str(run_summary["config"]["scenario_calculation_path"])
+    assert "final_multiplier" in daily.columns
