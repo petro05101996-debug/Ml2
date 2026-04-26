@@ -3722,6 +3722,22 @@ def _run_what_if_projection_enhanced(
     daily["freight_value"] = profile["scenario_freight_value"].to_numpy(dtype=float)
     daily["cost"] = profile["scenario_cost"].to_numpy(dtype=float)
     daily["stock"] = profile["available_stock"].to_numpy(dtype=float)
+    for col in [
+        "price_effect",
+        "promo_effect",
+        "freight_effect",
+        "standard_multiplier",
+        "shock_multiplier",
+        "shock_units",
+        "scenario_demand_raw",
+        "lost_sales",
+    ]:
+        if col in profile.columns:
+            daily[col] = pd.to_numeric(profile[col], errors="coerce").to_numpy(dtype=float)
+    daily["final_multiplier"] = (
+        pd.to_numeric(daily.get("standard_multiplier", pd.Series(np.ones(len(daily)))), errors="coerce").fillna(1.0)
+        * pd.to_numeric(daily.get("shock_multiplier", pd.Series(np.ones(len(daily)))), errors="coerce").fillna(1.0)
+    )
 
     conf_obj = enhanced.get("confidence", {})
     support_info = build_scenario_support_info_from_paths(base_history, profile, scenario_overrides)
@@ -4014,11 +4030,18 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
     merged["delta_demand"] = merged["scenario_demand"] - merged["as_is_demand"]
     merged["delta_revenue"] = merged["scenario_revenue"] - merged["as_is_revenue"]
     merged["delta_profit"] = merged["scenario_profit"] - merged["as_is_profit"]
-    for effect_col in ["price_effect", "promo_effect", "freight_effect", "shock_multiplier", "standard_multiplier"]:
+    for effect_col in ["price_effect", "promo_effect", "freight_effect", "shock_multiplier", "standard_multiplier", "shock_units"]:
         if effect_col in scenario.columns:
             merged[effect_col] = pd.to_numeric(scenario[effect_col], errors="coerce").values
         else:
-            merged[effect_col] = 1.0
+            merged[effect_col] = 0.0 if effect_col == "shock_units" else 1.0
+    baseline_series = pd.to_numeric(merged.get("baseline_demand", pd.Series(np.zeros(len(merged)))), errors="coerce")
+    scenario_series = pd.to_numeric(merged.get("scenario_demand", pd.Series(np.zeros(len(merged)))), errors="coerce")
+    merged["final_multiplier"] = np.where(
+        baseline_series.abs() > 1e-9,
+        scenario_series / baseline_series,
+        np.nan,
+    )
     merged["scenario_calc_mode"] = str(what_if_result.get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
     merged["confidence_label"] = str(what_if_result.get("confidence_label", ""))
     merged["support_label"] = str(what_if_result.get("support_label", ""))
@@ -4045,6 +4068,8 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
             "freight_effect",
             "shock_multiplier",
             "standard_multiplier",
+            "final_multiplier",
+            "shock_units",
             "scenario_calc_mode",
             "confidence_label",
             "support_label",
@@ -4057,7 +4082,6 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
             "lost_sales",
         ]
     ].copy()
-    manual_daily = manual_daily.rename(columns={"standard_multiplier": "final_multiplier"})
     demand_delta_pct = float((manual_daily["delta_demand"].sum() / max(float(manual_daily["as_is_demand"].sum()), 1e-9)) * 100.0)
     revenue_delta_pct = float((manual_daily["delta_revenue"].sum() / max(float(manual_daily["as_is_revenue"].sum()), 1e-9)) * 100.0)
     profit_delta_pct = float((manual_daily["delta_profit"].sum() / max(float(manual_daily["as_is_profit"].sum()), 1e-9)) * 100.0)
@@ -4625,7 +4649,12 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
                 "promo_days": int(pd.to_numeric(scenario_df.get("promotion", pd.Series([])), errors="coerce").fillna(0.0).gt(0).sum()) if manual_scenario_present else 0,
                 "avg_freight_value": float((what_if_result or {}).get("applied_path_summary", {}).get("avg_freight", np.nan)) if manual_scenario_present else float("nan"),
                 "freight_multiplier": float(((what_if_result or {}).get("effective_scenario", {}) or {}).get("freight_multiplier", np.nan)) if manual_scenario_present else float("nan"),
-                "manual_shocks": int(len(((what_if_result or {}).get("applied_overrides", {}) or {}).get("shocks", []))) if manual_scenario_present else 0,
+                "manual_shocks": (
+                    int(len(((what_if_result or {}).get("applied_overrides", {}) or {}).get("shocks", [])))
+                    + int(abs(float(((what_if_result or {}).get("applied_overrides", {}) or {}).get("manual_shock_multiplier", 1.0)) - 1.0) > 1e-9)
+                )
+                if manual_scenario_present
+                else 0,
                 "note": "" if manual_scenario_present else "Сценарий не применён. Это только анализ baseline.",
             }
         ]
@@ -4644,12 +4673,20 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
                 "Сценарий: прибыль": scenario_profit,
                 "Изменение прибыли, %": ((scenario_profit - as_is_profit) / max(abs(as_is_profit), 1e-9) * 100.0) if manual_scenario_present else float("nan"),
                 "Вывод": (
-                    "Сценарий увеличивает спрос, но снижает прибыль. Проверьте размер скидки или структуру затрат."
-                    if manual_scenario_present and scenario_profit < as_is_profit and scenario_demand >= as_is_demand
+                    "Сценарий не применён. Это только анализ текущего плана."
+                    if not manual_scenario_present
                     else (
-                        "Сценарий может быть экономически лучше текущего плана."
-                        if manual_scenario_present and scenario_profit >= as_is_profit
-                        else "Сценарий не применён. Это только анализ текущего плана."
+                        "Сценарий улучшает спрос и прибыль относительно текущего плана."
+                        if scenario_profit >= as_is_profit and scenario_demand >= as_is_demand
+                        else (
+                            "Сценарий может быть экономически лучше текущего плана, но проверьте влияние на спрос."
+                            if scenario_profit >= as_is_profit
+                            else (
+                                "Сценарий увеличивает спрос, но снижает прибыль. Проверьте скидку, цену и затраты."
+                                if scenario_demand >= as_is_demand
+                                else "Сценарий рассчитан, но ухудшает спрос, выручку и прибыль относительно текущего плана."
+                            )
+                        )
                     )
                 ),
                 "Рекомендация": build_user_recommendation(
