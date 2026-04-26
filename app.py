@@ -137,6 +137,13 @@ def scenario_mode_label(mode_code: str) -> str:
     return mapping.get(str(mode_code), str(mode_code))
 
 
+def scenario_method_caption(mode_code: str) -> str:
+    mode = str(mode_code)
+    if mode == "catboost_daily_factors":
+        return "Метод: CatBoost daily model — модель пересчитывает спрос напрямую по дневным факторам и выбранным what-if изменениям."
+    return "Метод: базовый прогноз + сценарный пересчёт факторов."
+
+
 def scenario_contract_label(contract_code: str) -> str:
     mapping = {
         "legacy_baseline+scenario_recompute": "Legacy baseline + scenario recompute",
@@ -1040,12 +1047,41 @@ def train_weekly_core_model(weekly_train: pd.DataFrame, feature_names: List[str]
             verbose=0,
             allow_writing_files=False,
             monotone_constraints=monotone,
+            od_type="Iter",
+            od_wait=50,
             thread_count=1,
         )
-        model.fit(X, y)
-        setattr(model, "model_backend", "catboost")
-        setattr(model, "backend_reason", "catboost_available")
-        return model
+        if len(X) >= 30:
+            split_idx = int(max(20, min(len(X) - 5, round(len(X) * 0.8))))
+            X_train, y_train = X.iloc[:split_idx], y.iloc[:split_idx]
+            X_val, y_val = X.iloc[split_idx:], y.iloc[split_idx:]
+            if len(X_val) >= 5:
+                model.fit(X_train, y_train, eval_set=(X_val, y_val), use_best_model=True)
+            else:
+                model.fit(X, y)
+        else:
+            model.fit(X, y)
+
+        best_iteration = getattr(model, "get_best_iteration", lambda: None)()
+        final_iterations = int(best_iteration + 1) if best_iteration is not None and int(best_iteration) > 0 else 300
+        final_iterations = max(50, min(final_iterations, 600))
+        final_model = CatBoostRegressor(
+            iterations=final_iterations,
+            learning_rate=0.03,
+            depth=4,
+            l2_leaf_reg=5.0,
+            loss_function="RMSE",
+            random_seed=42,
+            verbose=0,
+            allow_writing_files=False,
+            monotone_constraints=monotone,
+            thread_count=1,
+        )
+        final_model.fit(X, y)
+        setattr(final_model, "model_backend", "catboost")
+        setattr(final_model, "backend_reason", "catboost_available")
+        setattr(final_model, "final_iterations", int(final_iterations))
+        return final_model
     class DeterministicWeeklyModel:
         def predict(self, X_local):
             xdf = pd.DataFrame(X_local).copy()
@@ -6630,7 +6666,7 @@ if __name__ == "__main__":
             st.session_state["what_if_demand_mult"] = float(demand_mult)
             with st.expander("Дополнительно: технические настройки", expanded=False):
                 st.session_state["what_if_calc_mode"] = DEFAULT_SCENARIO_CALC_MODE
-                st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
+                st.caption(scenario_method_caption(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE)))
                 st.caption("Детали технического контура доступны ниже в блоке диагностики.")
             scenario_calc_mode = DEFAULT_SCENARIO_CALC_MODE
             segments_payload: Dict[str, Any] = {}
@@ -6725,7 +6761,7 @@ if __name__ == "__main__":
             has_segment_errors = len(segment_errors) > 0
             apply_btn = st.button("Рассчитать сценарий", type="primary", use_container_width=True, disabled=has_segment_errors)
             st.caption("После расчёта сценарий будет сравнен с текущим планом.")
-            st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
+            st.caption(scenario_method_caption(scenario_calc_mode))
             if has_segment_errors:
                 st.error("Сценарий нельзя рассчитать: исправьте ошибки в периодах сегментов.")
             st.markdown("</div>", unsafe_allow_html=True)
