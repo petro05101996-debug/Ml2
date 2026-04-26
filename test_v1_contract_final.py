@@ -5,6 +5,7 @@ import json
 import numpy as np
 import pandas as pd
 
+import app as app_module
 from app import (
     build_segment_paths,
     build_scenario_support_info,
@@ -35,7 +36,10 @@ def test_active_path_is_frozen_to_legacy_baseline():
     assert "diagnostic_selected_candidate" in summary["config"]
     assert summary["config"]["selection_mode"] == "diagnostic_comparison_runtime_frozen_to_legacy"
     assert summary["config"]["production_selection_reason"] == "v1_contract_runtime_frozen_to_legacy"
-    assert summary["config"]["final_active_path"] == "legacy_baseline+scenario_recompute"
+    assert summary["config"]["baseline_forecast_path"] == "weekly_ml_baseline"
+    assert summary["config"]["scenario_calculation_path"] == "enhanced_local_factor_layer"
+    assert summary["config"]["learned_uplift_path"] == "inactive_production_diagnostic_only"
+    assert summary["config"]["final_user_visible_path"] == "weekly_ml_baseline + enhanced_local_factor_layer"
 
 
 def test_uplift_not_used_in_production():
@@ -307,9 +311,81 @@ def test_enhanced_result_explicit_path_metadata_not_legacy():
     bundle = res["_trained_bundle"]
     base_price = float(bundle["base_ctx"]["price"])
     enhanced = run_what_if_projection(bundle, manual_price=base_price * 1.05, scenario_calc_mode="enhanced_local_factors")
-    assert enhanced["active_path_contract"] == "legacy_baseline+enhanced_local_factor_layer"
+    assert enhanced["active_path_contract"] == "weekly_ml_baseline + enhanced_local_factor_layer"
+    assert enhanced["scenario_calculation_path"] == "enhanced_local_factor_layer"
     assert enhanced["scenario_driver_mode"] == "baseline_daily_plus_local_factor_layer"
     assert enhanced["legacy_or_enhanced_label"] == "enhanced"
+
+
+def test_enhanced_path_uses_legacy_baseline_path_contract(monkeypatch):
+    res = _analyze_bundle()
+    bundle = copy.deepcopy(res["_trained_bundle"])
+    base_price = float(bundle["base_ctx"]["price"])
+
+    def _fake_legacy(*args, **kwargs):
+        future_dates = bundle["future_dates"].copy()
+        n = len(future_dates)
+        return {
+            "effective_scenario": {"applied_discount": 0.0, "cost": 10.0, "freight_value": 1.0, "promotion": 0.0},
+            "model_price": base_price,
+            "confidence": 0.6,
+            "baseline_forecast_path": "naive_lag1w_baseline",
+            "scenario_calculation_path": "scenario_recompute",
+            "learned_uplift_path": "inactive_production_diagnostic_only",
+            "final_user_visible_path": "naive_lag1w_baseline + scenario_recompute",
+            "active_path_contract": "naive_lag1w_baseline + scenario_recompute",
+            "daily": pd.DataFrame({"date": future_dates["date"], "base_pred_sales": np.full(n, 10.0)}),
+        }
+
+    def _fake_simulate(*args, **kwargs):
+        future_dates = (kwargs.get("future_dates") if "future_dates" in kwargs else args[2]).copy()
+        return {"daily": pd.DataFrame({"date": future_dates["date"], "base_pred_sales": np.full(len(future_dates), 10.0)})}
+
+    def _fake_enhanced(**kwargs):
+        future_dates = pd.to_datetime(kwargs["future_dates"]["date"])
+        n = len(future_dates)
+        profile = pd.DataFrame(
+            {
+                "date": future_dates,
+                "scenario_demand_raw": np.full(n, 11.0),
+                "actual_sales": np.full(n, 11.0),
+                "lost_sales": np.zeros(n),
+                "revenue": np.full(n, 110.0),
+                "profit": np.full(n, 44.0),
+                "scenario_price_gross": np.full(n, base_price),
+                "scenario_discount": np.zeros(n),
+                "scenario_price_net": np.full(n, base_price),
+                "scenario_promotion": np.zeros(n),
+                "scenario_freight_value": np.full(n, 1.0),
+                "scenario_cost": np.full(n, 10.0),
+                "available_stock": np.full(n, 999.0),
+                "price_effect": np.ones(n),
+                "promo_effect": np.ones(n),
+                "freight_effect": np.ones(n),
+                "standard_multiplier": np.ones(n),
+                "shock_multiplier": np.ones(n),
+                "shock_units": np.zeros(n),
+            }
+        )
+        return {
+            "scenario_profile": profile,
+            "confidence": {"price": {"score": 0.6}, "promo": {"score": 0.6}, "freight": {"score": 0.6}},
+            "price_effect_vector": np.ones(n),
+            "promo_effect_vector": np.ones(n),
+            "freight_effect_vector": np.ones(n),
+            "shock_multiplier": np.ones(n),
+            "effect_breakdown": {},
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(app_module, "_run_what_if_projection_legacy", _fake_legacy)
+    monkeypatch.setattr(app_module, "simulate_horizon_profit", _fake_simulate)
+    monkeypatch.setattr(app_module, "run_enhanced_scenario", _fake_enhanced)
+
+    enhanced = run_what_if_projection(bundle, manual_price=base_price, scenario_calc_mode="enhanced_local_factors")
+    assert enhanced["baseline_forecast_path"] == "naive_lag1w_baseline"
+    assert enhanced["scenario_calculation_path"] == "enhanced_local_factor_layer"
+    assert enhanced["final_user_visible_path"] == "naive_lag1w_baseline + enhanced_local_factor_layer"
 
 
 def test_enhanced_path_falls_back_to_small_mode_when_info_missing():

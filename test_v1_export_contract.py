@@ -57,7 +57,9 @@ def test_enhanced_scenario_export_status():
         summary_df = pd.read_excel(xls, "C_manual_summary")
         assert bool(summary_df.loc[0, "manual_scenario_present"]) is True
         assert str(summary_df.loc[0, "scenario_calc_mode"]) == "enhanced_local_factors"
-        assert str(summary_df.loc[0, "active_path_contract"]) == "legacy_baseline+enhanced_local_factor_layer"
+        assert str(summary_df.loc[0, "active_path_contract"]) == "weekly_ml_baseline + enhanced_local_factor_layer"
+        assert str(summary_df.loc[0, "scenario_calculation_path"]) == "enhanced_local_factor_layer"
+        assert str(summary_df.loc[0, "final_user_visible_path"]) == "weekly_ml_baseline + enhanced_local_factor_layer"
         assert "B_manual_scenario" in xls.sheet_names
         manual_sheet = pd.read_excel(xls, "B_manual_scenario")
         assert len(manual_sheet) > 0
@@ -74,7 +76,7 @@ def test_legacy_scenario_still_works():
     base_price = float(bundle["base_ctx"]["price"])
     wr = run_what_if_projection(bundle, manual_price=base_price * 1.02, scenario_calc_mode="legacy_current")
     assert wr["scenario_calc_mode"] == "legacy_current"
-    assert wr["active_path_contract"] == "legacy_baseline+scenario_recompute"
+    assert wr["active_path_contract"] == "weekly_ml_baseline + scenario_recompute"
 
 
 def test_neutral_scenario_close_to_baseline():

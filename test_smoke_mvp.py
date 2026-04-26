@@ -338,8 +338,9 @@ def test_price_increase_above_train_max_is_not_silent():
 def test_active_path_uses_selected_candidate_in_v1():
     res = _analyze_long_signal()
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
-    selected_candidate = summary["config"]["selected_candidate"]
-    assert selected_candidate in summary["config"]["final_active_path"]
+    assert summary["config"]["baseline_forecast_path"] == "weekly_ml_baseline"
+    assert summary["config"]["scenario_calculation_path"] == "enhanced_local_factor_layer"
+    assert summary["config"]["final_active_path"] == "weekly_ml_baseline + enhanced_local_factor_layer"
 
 
 def test_feature_contract_block():
@@ -833,7 +834,9 @@ def test_active_path_contract_and_uplift_off_in_report():
     res = _analyze()
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     out = summary["scenario_output_summary"]
-    assert out["active_path_contract"].startswith(summary["config"]["selected_candidate"])
+    assert out["active_path_contract"] == summary["config"]["final_active_path"]
+    assert summary["config"]["baseline_forecast_path"] == "weekly_ml_baseline"
+    assert summary["config"]["scenario_calculation_path"] == "enhanced_local_factor_layer"
     assert out["learned_uplift_contract"] == "inactive_production_diagnostic_only"
     assert summary["config"]["learned_uplift_active"] is False
 
@@ -1183,7 +1186,7 @@ def test_small_mode_does_not_override_scenario_result():
     assert float(np.abs(daily["pred_sales"] - daily["base_pred_sales"]).sum()) > 0.0
 
 
-def test_real_integration_run_what_if_projection_uses_scenario_engine_result(monkeypatch):
+def test_legacy_run_what_if_projection_uses_scenario_engine_result(monkeypatch):
     res = _analyze()
     bundle = res["_trained_bundle"]
     base_price = float(bundle["base_ctx"]["price"])
@@ -1210,7 +1213,7 @@ def test_real_integration_run_what_if_projection_uses_scenario_engine_result(mon
         }
 
     monkeypatch.setattr(app_module, "run_scenario", fake_run_scenario)
-    sc = run_what_if_projection(bundle, manual_price=base_price)
+    sc = run_what_if_projection(bundle, manual_price=base_price, scenario_calc_mode="legacy_current")
     assert float(sc["demand_total"]) == 0.0
     assert "legacy_baseline_meta" in sc and "scenario_engine_meta" in sc
     assert "price_confidence_score" in sc["scenario_engine_meta"]

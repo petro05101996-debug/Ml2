@@ -1554,6 +1554,28 @@ def resolve_final_active_path(
     return "deterministic_fallback+scenario_recompute"
 
 
+def resolve_path_contracts(selected_forecaster: str, production_selected_candidate: str, scenario_calc_mode: str) -> Dict[str, str]:
+    baseline_forecast_path = (
+        "weekly_ml_baseline"
+        if str(selected_forecaster) == "weekly_model"
+        else ("naive_lag1w_baseline" if str(selected_forecaster) == "naive_lag1w" else ("naive_ma4w_baseline" if str(selected_forecaster) == "naive_ma4w" else "deterministic_fallback_baseline"))
+    )
+    scenario_calculation_path = (
+        "enhanced_local_factor_layer"
+        if str(scenario_calc_mode) == "enhanced_local_factors"
+        else "scenario_recompute"
+    )
+    learned_uplift_path = "inactive_production_diagnostic_only"
+    final_user_visible_path = f"{baseline_forecast_path} + {scenario_calculation_path}"
+    return {
+        "baseline_forecast_path": baseline_forecast_path,
+        "scenario_calculation_path": scenario_calculation_path,
+        "learned_uplift_path": learned_uplift_path,
+        "final_user_visible_path": final_user_visible_path,
+        "production_selected_candidate": str(production_selected_candidate or "legacy_baseline"),
+    }
+
+
 def allocate_weekly_to_daily(weekly_forecast: pd.DataFrame, daily_history: pd.DataFrame, future_daily_context: pd.DataFrame) -> pd.DataFrame:
     hist = daily_history.sort_values("date").copy().tail(84)
     hist["dow"] = pd.to_datetime(hist["date"]).dt.dayofweek
@@ -2923,10 +2945,12 @@ def run_full_pricing_analysis_universal(
         "promo_plus_10pp_demand_delta_pct": float(((sensitivity_promo_plus_10pp["demand_total"] - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
         "freight_plus_10pct_demand_delta_pct": float(((sensitivity_freight_plus_10pct["demand_total"] - base_demand_total) / max(base_demand_total, 1e-9)) * 100.0),
     }
-    final_active_path = resolve_final_active_path(
+    path_contracts = resolve_path_contracts(
         selected_forecaster=selected_forecaster,
         production_selected_candidate=selected_candidate_name,
+        scenario_calc_mode=analysis_scenario_calc_mode,
     )
+    final_active_path = path_contracts["final_user_visible_path"]
     run_summary = {
             "config": {
             "git_commit": _safe_git_commit(),
@@ -2973,6 +2997,10 @@ def run_full_pricing_analysis_universal(
             "uplift_used_in_production": False,
             "quality_improvement_expected": False,
             "quality_improvement_expectation_reason": "diagnostic_only_modes_active_path_frozen",
+            "baseline_forecast_path": path_contracts["baseline_forecast_path"],
+            "scenario_calculation_path": path_contracts["scenario_calculation_path"],
+            "learned_uplift_path": path_contracts["learned_uplift_path"],
+            "final_user_visible_path": path_contracts["final_user_visible_path"],
             "final_active_path": final_active_path,
                 "v1_contract": {
                     "active_path": final_active_path,
@@ -3057,6 +3085,10 @@ def run_full_pricing_analysis_universal(
             "manual_scenario_generated": bool(scenario_sim is not None),
             "active_path_contract": final_active_path,
             "learned_uplift_contract": "inactive_production_diagnostic_only",
+            "baseline_forecast_path": path_contracts["baseline_forecast_path"],
+            "scenario_calculation_path": path_contracts["scenario_calculation_path"],
+            "learned_uplift_path": path_contracts["learned_uplift_path"],
+            "final_user_visible_path": path_contracts["final_user_visible_path"],
             "final_active_path": final_active_path,
             "production_selected_candidate": "legacy_baseline",
             "selection_mode": "diagnostic_comparison_runtime_frozen_to_legacy",
@@ -3432,9 +3464,10 @@ def _run_what_if_projection_legacy(
     )
     confidence_label = "Высокая" if confidence_scenario >= 0.75 else ("Средняя" if confidence_scenario >= 0.45 else "Низкая")
     baseline_bundle_meta = trained_bundle.get("baseline_bundle", {})
-    active_path = resolve_final_active_path(
+    path_contracts = resolve_path_contracts(
         selected_forecaster=str(baseline_bundle_meta.get("selected_forecaster", "weekly_model")),
         production_selected_candidate=str(baseline_bundle_meta.get("selected_candidate", "legacy_baseline")),
+        scenario_calc_mode="legacy_current",
     )
     model_backend = str(trained_bundle.get("baseline_bundle", {}).get("model_backend", "deterministic_fallback"))
     backend_reason = str(trained_bundle.get("baseline_bundle", {}).get("backend_reason", "unknown"))
@@ -3447,7 +3480,7 @@ def _run_what_if_projection_legacy(
         "scenario_driver_mode": "weekly_ml_exogenous_recompute",
         "weekly_driver_mode": str(baseline_sim.get("weekly_driver_mode", "weekly_ml_core_only")),
         "baseline_has_exogenous_driver": bool(baseline_sim.get("baseline_has_exogenous_driver", True)),
-        "active_path_contract": active_path,
+        "active_path_contract": path_contracts["final_user_visible_path"],
         "model_backend": model_backend,
         "backend_reason": backend_reason,
     }
@@ -3498,6 +3531,10 @@ def _run_what_if_projection_legacy(
         "legacy_simulation_used": False,
         "legacy_baseline_meta": runtime_meta,
         "active_path_contract": runtime_meta["active_path_contract"],
+        "baseline_forecast_path": path_contracts["baseline_forecast_path"],
+        "scenario_calculation_path": path_contracts["scenario_calculation_path"],
+        "learned_uplift_path": path_contracts["learned_uplift_path"],
+        "final_user_visible_path": path_contracts["final_user_visible_path"],
         "model_backend": model_backend,
         "backend_reason": backend_reason,
         "scenario_engine_meta": scenario_engine_meta,
@@ -3721,6 +3758,10 @@ def _run_what_if_projection_enhanced(
         conf_score = min(conf_score, 0.35)
     conf_label = "Высокая" if conf_score >= 0.75 else ("Средняя" if conf_score >= 0.45 else "Низкая")
     out = dict(legacy_result)
+    baseline_path = str(legacy_result.get("baseline_forecast_path", "weekly_ml_baseline"))
+    scenario_path = "enhanced_local_factor_layer"
+    learned_uplift_path = str(legacy_result.get("learned_uplift_path", "inactive_production_diagnostic_only"))
+    visible_path = f"{baseline_path} + {scenario_path}"
     out.update(
         {
             "daily": daily,
@@ -3735,14 +3776,18 @@ def _run_what_if_projection_enhanced(
             "confidence_label": conf_label,
             "uncertainty": 1.0 - conf_score,
             "scenario_driver_mode": "baseline_daily_plus_local_factor_layer",
-            "active_path_contract": "legacy_baseline+enhanced_local_factor_layer",
+            "active_path_contract": visible_path,
+            "baseline_forecast_path": baseline_path,
+            "scenario_calculation_path": scenario_path,
+            "learned_uplift_path": learned_uplift_path,
+            "final_user_visible_path": visible_path,
             "scenario_price_effect_source": "baseline_daily_x_local_factor_layer",
             "scenario_calc_mode": "enhanced_local_factors",
             "scenario_engine_version": "v1_enhanced_local_factors",
             "effect_source": "baseline_daily_x_local_factor_layer",
             "legacy_or_enhanced_label": "enhanced",
             "scenario_calc_mode_label": scenario_mode_label("enhanced_local_factors"),
-            "active_path_contract_label": scenario_contract_label("legacy_baseline+enhanced_local_factor_layer"),
+            "active_path_contract_label": scenario_contract_label(visible_path),
             "effect_source_label": effect_source_label("baseline_daily_x_local_factor_layer"),
             "support_label": str(support_info.get("support_label", "medium")),
             "scenario_support_info": support_info,
@@ -3969,6 +4014,14 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
     merged["delta_demand"] = merged["scenario_demand"] - merged["as_is_demand"]
     merged["delta_revenue"] = merged["scenario_revenue"] - merged["as_is_revenue"]
     merged["delta_profit"] = merged["scenario_profit"] - merged["as_is_profit"]
+    for effect_col in ["price_effect", "promo_effect", "freight_effect", "shock_multiplier", "standard_multiplier"]:
+        if effect_col in scenario.columns:
+            merged[effect_col] = pd.to_numeric(scenario[effect_col], errors="coerce").values
+        else:
+            merged[effect_col] = 1.0
+    merged["scenario_calc_mode"] = str(what_if_result.get("scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
+    merged["confidence_label"] = str(what_if_result.get("confidence_label", ""))
+    merged["support_label"] = str(what_if_result.get("support_label", ""))
     merged["date"] = pd.to_datetime(merged["date"]).dt.strftime("%Y-%m-%d")
     merged["series_id"] = str(result_dict.get("_trained_bundle", {}).get("base_ctx", {}).get("product_id", "unknown"))
     manual_daily = merged[
@@ -3984,6 +4037,17 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
             "as_is_profit",
             "scenario_profit",
             "delta_profit",
+            "baseline_demand",
+            "baseline_revenue",
+            "baseline_profit",
+            "price_effect",
+            "promo_effect",
+            "freight_effect",
+            "shock_multiplier",
+            "standard_multiplier",
+            "scenario_calc_mode",
+            "confidence_label",
+            "support_label",
             "scenario_price_gross",
             "scenario_discount",
             "scenario_price_net",
@@ -3993,6 +4057,45 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
             "lost_sales",
         ]
     ].copy()
+    manual_daily = manual_daily.rename(columns={"standard_multiplier": "final_multiplier"})
+    demand_delta_pct = float((manual_daily["delta_demand"].sum() / max(float(manual_daily["as_is_demand"].sum()), 1e-9)) * 100.0)
+    revenue_delta_pct = float((manual_daily["delta_revenue"].sum() / max(float(manual_daily["as_is_revenue"].sum()), 1e-9)) * 100.0)
+    profit_delta_pct = float((manual_daily["delta_profit"].sum() / max(float(manual_daily["as_is_profit"].sum()), 1e-9)) * 100.0)
+    economic_label, _, _ = classify_economic_verdict(profit_delta_pct, demand_delta_pct, revenue_delta_pct)
+    shape_quality_low = bool((result_dict.get("summary", {}) or {}).get("shape_quality_low", False) or (result_dict.get("diagnostics", {}) or {}).get("shape_quality_low", False))
+    reliability_label, _, _ = classify_reliability_verdict(
+        bool(what_if_result.get("ood_flag", False)),
+        list(what_if_result.get("warnings", [])),
+        str(what_if_result.get("confidence_label", "")),
+        str(what_if_result.get("support_label", "")),
+        shape_quality_low,
+        bool((what_if_result.get("validation_gate", {}) or {}).get("ok", True)),
+    )
+    run_summary_cfg = (((result_dict.get("run_summary", {}) or {}).get("config", {}) or {}))
+    baseline_forecast_path = str(
+        what_if_result.get("baseline_forecast_path")
+        or run_summary_cfg.get("baseline_forecast_path")
+        or "weekly_ml_baseline"
+    )
+    scenario_calculation_path = str(
+        what_if_result.get("scenario_calculation_path")
+        or run_summary_cfg.get("scenario_calculation_path")
+        or "enhanced_local_factor_layer"
+    )
+    learned_uplift_path = str(
+        what_if_result.get("learned_uplift_path")
+        or run_summary_cfg.get("learned_uplift_path")
+        or "inactive_production_diagnostic_only"
+    )
+    final_user_visible_path = str(
+        what_if_result.get("final_user_visible_path")
+        or run_summary_cfg.get("final_user_visible_path")
+        or f"{baseline_forecast_path} + {scenario_calculation_path}"
+    )
+    active_path_contract = str(what_if_result.get("active_path_contract") or final_user_visible_path)
+    economic_verdict = str(what_if_result.get("economic_verdict", "")).strip() or economic_label
+    reliability_verdict = str(what_if_result.get("reliability_verdict", "")).strip() or reliability_label
+    learned_factor_confidence = "Не используется" if learned_uplift_path == "inactive_production_diagnostic_only" else "Активен"
     summary = {
         "artifact_scope": "analysis_with_manual_scenario",
         "report_type": "scenario_report",
@@ -4013,8 +4116,9 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "scenario_demand_total": float(manual_daily["scenario_demand"].sum()),
         "scenario_revenue_total": float(manual_daily["scenario_revenue"].sum()),
         "scenario_profit_total": float(manual_daily["scenario_profit"].sum()),
-        "scenario_vs_as_is_demand_pct": float((manual_daily["delta_demand"].sum() / max(float(manual_daily["as_is_demand"].sum()), 1e-9)) * 100.0),
-        "scenario_vs_as_is_profit_pct": float((manual_daily["delta_profit"].sum() / max(float(manual_daily["as_is_profit"].sum()), 1e-9)) * 100.0),
+        "scenario_vs_as_is_demand_pct": demand_delta_pct,
+        "scenario_vs_as_is_revenue_pct": revenue_delta_pct,
+        "scenario_vs_as_is_profit_pct": profit_delta_pct,
         "delta_vs_as_is": {
             "demand_total": float(manual_daily["delta_demand"].sum()),
             "revenue_total": float(manual_daily["delta_revenue"].sum()),
@@ -4037,8 +4141,12 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "scenario_inputs_contract": what_if_result.get("scenario_inputs_contract", {}),
         "applied_overrides": what_if_result.get("applied_overrides", {}),
         "scenario_forecast": manual_daily.to_dict("records"),
-        "active_path_contract": str(what_if_result.get("active_path_contract", "legacy_baseline+scenario_recompute")),
-        "final_active_path": str(what_if_result.get("active_path_contract", "legacy_baseline+scenario_recompute")),
+        "baseline_forecast_path": baseline_forecast_path,
+        "scenario_calculation_path": scenario_calculation_path,
+        "learned_uplift_path": learned_uplift_path,
+        "final_user_visible_path": final_user_visible_path,
+        "active_path_contract": active_path_contract,
+        "final_active_path": final_user_visible_path,
         "model_backend": str(what_if_result.get("model_backend", "unknown")),
         "backend_reason": str(what_if_result.get("backend_reason", "")),
         "learned_uplift_contract": "inactive_production_diagnostic_only",
@@ -4054,8 +4162,11 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "legacy_or_enhanced_label": "enhanced" if str(what_if_result.get("scenario_calc_mode")) == "enhanced_local_factors" else "legacy",
         "confidence_label": str(what_if_result.get("confidence_label", "")),
         "support_label": str(what_if_result.get("support_label", "")),
-        "economic_verdict": str(what_if_result.get("economic_verdict", "")),
-        "reliability_verdict": str(what_if_result.get("reliability_verdict", "")),
+        "economic_verdict": economic_verdict,
+        "reliability_verdict": reliability_verdict,
+        "forecast_confidence": ("Средняя" if shape_quality_low else str(what_if_result.get("confidence_label", "Низкая"))),
+        "scenario_math_confidence": "Высокая",
+        "learned_factor_confidence": learned_factor_confidence,
         "warnings": list(what_if_result.get("warnings", [])),
         "segments_summary": {
             "path_segments_used": bool(((what_if_result.get("scenario_support_info", {}) or {})).get("path_segments_used", False)),
@@ -4319,6 +4430,10 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
             "manual_scenario_present": False,
             "manual_scenario_generated": False,
             "scenario_calc_mode": "not_applied",
+            "baseline_forecast_path": str(run_summary_cfg.get("baseline_forecast_path", "weekly_ml_baseline")),
+            "scenario_calculation_path": str(run_summary_cfg.get("scenario_calculation_path", "scenario_recompute")),
+            "learned_uplift_path": str(run_summary_cfg.get("learned_uplift_path", "inactive_production_diagnostic_only")),
+            "final_user_visible_path": str(run_summary_cfg.get("final_user_visible_path", "weekly_ml_baseline + scenario_recompute")),
             "final_active_path": str(run_summary_cfg.get("final_active_path", scenario_output_summary.get("active_path_contract", "legacy_baseline+scenario_recompute"))),
         }
         if manual_scenario_present:
@@ -4331,6 +4446,10 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
                     "manual_scenario_present": True,
                     "manual_scenario_generated": True,
                     "scenario_calc_mode": str((what_if_result or {}).get("scenario_calc_mode", "unknown")),
+                    "baseline_forecast_path": str((what_if_result or {}).get("baseline_forecast_path", run_summary_cfg.get("baseline_forecast_path", "weekly_ml_baseline"))),
+                    "scenario_calculation_path": str((what_if_result or {}).get("scenario_calculation_path", run_summary_cfg.get("scenario_calculation_path", "enhanced_local_factor_layer"))),
+                    "learned_uplift_path": str((what_if_result or {}).get("learned_uplift_path", "inactive_production_diagnostic_only")),
+                    "final_user_visible_path": str((what_if_result or {}).get("final_user_visible_path", (what_if_result or {}).get("active_path_contract", ""))),
                     "final_active_path": str((what_if_result or {}).get("active_path_contract", "")),
                 }
             )
@@ -6652,6 +6771,32 @@ if __name__ == "__main__":
             r["scenario_price_requested"] = float(wr.get("requested_price", manual_price))
             r["scenario_price_modeled"] = float(wr.get("model_price", wr.get("price_for_model", manual_price)))
             r["scenario_price"] = r["scenario_price_modeled"]
+            base_units_local = float(base_for_scenario["actual_sales"].sum()) if len(base_for_scenario) else float("nan")
+            base_revenue_local = float(base_for_scenario["revenue"].sum()) if len(base_for_scenario) else float("nan")
+            base_profit_local = float(base_for_scenario["profit"].sum()) if ("profit" in base_for_scenario.columns and len(base_for_scenario)) else float("nan")
+            sc_forecast_local = wr.get("daily", pd.DataFrame())
+            sc_units_local = float(sc_forecast_local["actual_sales"].sum()) if len(sc_forecast_local) else float("nan")
+            sc_revenue_local = float(sc_forecast_local["revenue"].sum()) if len(sc_forecast_local) else float("nan")
+            sc_profit_local = float(sc_forecast_local["profit"].sum()) if ("profit" in sc_forecast_local.columns and len(sc_forecast_local)) else float("nan")
+            demand_delta_pct_local = ((sc_units_local - base_units_local) / base_units_local * 100.0) if base_units_local else float("nan")
+            revenue_delta_pct_local = ((sc_revenue_local - base_revenue_local) / base_revenue_local * 100.0) if base_revenue_local else float("nan")
+            profit_delta_pct_local = ((sc_profit_local - base_profit_local) / base_profit_local * 100.0) if base_profit_local else float("nan")
+            shape_quality_low_local = bool((r.get("summary", {}) or {}).get("shape_quality_low", False) or (r.get("diagnostics", {}) or {}).get("shape_quality_low", False))
+            economic_label_local, _, _ = classify_economic_verdict(
+                float(profit_delta_pct_local) if np.isfinite(profit_delta_pct_local) else float("nan"),
+                float(demand_delta_pct_local) if np.isfinite(demand_delta_pct_local) else float("nan"),
+                float(revenue_delta_pct_local) if np.isfinite(revenue_delta_pct_local) else float("nan"),
+            )
+            reliability_label_local, _, _ = classify_reliability_verdict(
+                bool(wr.get("ood_flag", False)),
+                list(wr.get("warnings", [])),
+                str(wr.get("confidence_label", "")),
+                str(wr.get("support_label", "")),
+                shape_quality_low_local,
+                bool((wr.get("validation_gate", {}) or {}).get("ok", True)),
+            )
+            wr["economic_verdict"] = economic_label_local
+            wr["reliability_verdict"] = reliability_label_local
             r["manual_scenario_summary_json"], r["manual_scenario_daily_csv"] = build_manual_scenario_artifacts(r, wr)
             refresh_excel_export(r, wr)
             st.session_state.applied_scenario_snapshot = build_applied_scenario_snapshot(
