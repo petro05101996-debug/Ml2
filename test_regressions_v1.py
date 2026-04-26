@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from scenario_engine import run_scenario
 from what_if import build_sensitivity_grid
@@ -184,3 +185,42 @@ def test_manual_scenario_contract_regression_profit_down_recommendation_not_reco
     run_summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     assert str(summary["scenario_calculation_path"]) == str(run_summary["config"]["scenario_calculation_path"])
     assert "final_multiplier" in daily.columns
+
+
+def test_manual_scenario_exports_effect_multipliers_and_verdict_consistently():
+    import json
+
+    from app import build_excel_export_buffer, build_manual_scenario_artifacts, run_full_pricing_analysis_universal, run_what_if_projection
+    from test_smoke_mvp import _make_txn
+
+    res = run_full_pricing_analysis_universal(_make_txn(240), "cat-a", "sku-1")
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(
+        bundle,
+        manual_price=base_price,
+        scenario_calc_mode="enhanced_local_factors",
+        demand_multiplier=0.82,
+        overrides={
+            "promotion": 0.20,
+            "discount": 0.0,
+            "shocks": [],
+        },
+    )
+    res["scenario_forecast"] = wr["daily"].copy()
+    summary_blob, daily_blob = build_manual_scenario_artifacts(res, wr)
+    summary = json.loads(summary_blob.decode("utf-8"))
+    daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
+    assert pd.to_numeric(daily["promo_effect"], errors="coerce").mean() == pytest.approx(1.12, rel=1e-2)
+    assert pd.to_numeric(daily["shock_multiplier"], errors="coerce").mean() == pytest.approx(0.82, rel=1e-2)
+    assert pd.to_numeric(daily["final_multiplier"], errors="coerce").mean() == pytest.approx(0.9184, rel=1e-2)
+    baseline_total = float(pd.to_numeric(daily["baseline_demand"], errors="coerce").sum())
+    scenario_total = float(pd.to_numeric(daily["scenario_demand"], errors="coerce").sum())
+    assert scenario_total == pytest.approx(baseline_total * 0.9184, rel=3e-2)
+
+    excel_blob = build_excel_export_buffer(res, wr)
+    user_summary = pd.read_excel(excel_blob, sheet_name="User Scenario Summary")
+    assert "Сценарий не применён" not in str(user_summary.loc[0, "Вывод"])
+    scenario_summary = pd.read_excel(excel_blob, sheet_name="Scenario Summary")
+    assert int(scenario_summary.loc[0, "manual_shocks"]) >= 1
+    assert summary["manual_scenario_present"] is True
