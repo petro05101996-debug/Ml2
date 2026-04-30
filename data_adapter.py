@@ -131,6 +131,7 @@ def build_daily_from_transactions(
     region: Optional[str] = None,
     channel: Optional[str] = None,
     segment: Optional[str] = None,
+    include_extra_factors: bool = False,
 ) -> pd.DataFrame:
     sku = txn[txn["product_id"].astype(str) == str(sku_id)].copy()
     if target_category is not None and "category" in sku.columns:
@@ -140,6 +141,10 @@ def build_daily_from_transactions(
             sku = sku[sku[col].astype(str) == str(val)].copy()
     if len(sku) == 0:
         raise ValueError("Нет данных по выбранному SKU.")
+
+    extra_factor_cols = {"numeric": [], "categorical": []}
+    if include_extra_factors:
+        extra_factor_cols = infer_extra_factor_columns(sku)
 
     rows: List[Dict[str, Any]] = []
     for day, g in sku.groupby(pd.Grouper(key="date", freq="D")):
@@ -171,6 +176,15 @@ def build_daily_from_transactions(
         for ctx in ["category", "region", "channel", "segment"]:
             if ctx in g.columns and g[ctx].notna().any():
                 rec[ctx] = str(g[ctx].dropna().iloc[-1])
+        if include_extra_factors:
+            for col in extra_factor_cols["numeric"]:
+                safe_col = f"factor__{col}"
+                vals = pd.to_numeric(g[col], errors="coerce")
+                rec[safe_col] = float(vals.mean()) if vals.notna().any() else float("nan")
+            for col in extra_factor_cols["categorical"]:
+                safe_col = f"factor__{col}"
+                vals = g[col].dropna().astype(str)
+                rec[safe_col] = str(vals.mode().iloc[0]) if len(vals) else "unknown"
         rows.append(rec)
     daily = pd.DataFrame(rows)
     if len(daily) == 0 or daily["date"].isna().all():
@@ -208,12 +222,91 @@ def build_daily_from_transactions(
         daily["price"] * (1.0 - daily["discount"]),
     )
     daily["net_unit_price"] = pd.to_numeric(daily["net_unit_price"], errors="coerce").fillna(daily["price"] * (1.0 - daily["discount"])).clip(lower=0.01)
+    if include_extra_factors:
+        factor_cols = [c for c in daily.columns if str(c).startswith("factor__")]
+        for c in factor_cols:
+            if pd.api.types.is_numeric_dtype(daily[c]):
+                daily[c] = pd.to_numeric(daily[c], errors="coerce").ffill().bfill()
+            else:
+                daily[c] = daily[c].astype("object").ffill().bfill().fillna("unknown")
     daily["category"] = sku["category"].mode().iloc[0] if "category" in sku.columns and not sku["category"].dropna().empty else "unknown"
     daily["sku_id"] = str(sku_id)
     for ctx in ["region", "channel", "segment"]:
         if ctx in sku.columns:
             daily[ctx] = str(sku[ctx].mode().iloc[0]) if not sku[ctx].dropna().empty else "unknown"
     return daily
+
+
+def infer_extra_factor_columns(txn: pd.DataFrame) -> Dict[str, List[str]]:
+    protected = {
+        "date",
+        "product_id",
+        "sku_id",
+        "quantity",
+        "sales",
+        "revenue",
+        "profit",
+        "margin",
+        "price",
+        "price_median",
+        "net_unit_price",
+        "discount",
+        "cost",
+        "freight_value",
+        "promotion",
+        "rating",
+        "review_score",
+        "reviews_count",
+        "stock",
+        "category",
+        "region",
+        "channel",
+        "segment",
+    }
+    leak_keywords = [
+        "order",
+        "orders",
+        "order_count",
+        "units_sold",
+        "sold_units",
+        "demand",
+        "target",
+        "label",
+        "actual",
+        "forecast",
+        "prediction",
+        "predicted",
+        "gmv",
+        "turnover",
+        "profit",
+        "margin",
+        "revenue",
+        "sales",
+        "quantity",
+        "qty",
+    ]
+    numeric_cols: List[str] = []
+    categorical_cols: List[str] = []
+    for col in txn.columns:
+        raw_name = str(col)
+        name = raw_name.strip().lower()
+        if name in protected:
+            continue
+        if any(k in name for k in leak_keywords):
+            continue
+        s = txn[col]
+        non_null_share = float(s.notna().mean()) if len(s) else 0.0
+        if non_null_share < 0.2:
+            continue
+        if pd.api.types.is_numeric_dtype(s):
+            unique_count = int(pd.to_numeric(s, errors="coerce").nunique(dropna=True))
+            if unique_count >= 2:
+                numeric_cols.append(raw_name)
+        else:
+            unique_count = int(s.astype(str).nunique(dropna=True))
+            if 2 <= unique_count <= 50:
+                categorical_cols.append(raw_name)
+    return {"numeric": numeric_cols, "categorical": categorical_cols}
 
 
 def build_feature_eligibility_report(df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -245,4 +338,3 @@ def build_feature_eligibility_report(df: pd.DataFrame) -> List[Dict[str, Any]]:
             }
         )
     return report
-

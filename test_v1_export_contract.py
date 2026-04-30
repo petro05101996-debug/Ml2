@@ -190,3 +190,21 @@ def test_excel_contains_user_summary():
         assert "Feature Usage" in xls.sheet_names
         warnings_df = pd.read_excel(xls, "Executive Summary")
         assert "top_warnings" in warnings_df.columns
+
+
+def test_excel_contains_catboost_and_override_alias_sheets():
+    res = _analyze()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    wr = run_what_if_projection(
+        bundle,
+        manual_price=base_price * 1.01,
+        scenario_calc_mode="enhanced_local_factors",
+        overrides={"promotion": 0.1, "discount": 0.02},
+    )
+    res["scenario_forecast"] = wr["daily"].copy()
+    excel_blob = build_excel_export_buffer(res, wr)
+    with pd.ExcelFile(excel_blob) as xls:
+        assert "D_catboost_feature_importance" in xls.sheet_names
+        assert "D_catboost_holdout" in xls.sheet_names
+        assert "D_what_if_applied_overrides" in xls.sheet_names

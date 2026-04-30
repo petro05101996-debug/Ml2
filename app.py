@@ -28,6 +28,11 @@ from data_adapter import (
 from data_schema import CANONICAL_FIELDS, canonical_required_fields
 from scenario_engine import run_scenario
 from scenario_engine_enhanced import run_enhanced_scenario
+from catboost_full_factor_engine import (
+    CATBOOST_FULL_FACTOR_MODE,
+    predict_catboost_full_factor_projection,
+    train_catboost_full_factor_bundle,
+)
 from v1_runtime_helpers import (
     build_backend_warning,
     compute_scenario_price_inputs,
@@ -125,6 +130,7 @@ APP_GENERATION = "39"
 SCENARIO_CALC_MODES = {
     "legacy_current": "Legacy: старый пересчёт сценария (совместимость)",
     "enhanced_local_factors": "Enhanced what-if: дневной пересчёт факторов поверх baseline",
+    CATBOOST_FULL_FACTOR_MODE: "CatBoost full factors: модельный what-if по факторам",
 }
 DEFAULT_SCENARIO_CALC_MODE = "enhanced_local_factors"
 
@@ -133,6 +139,7 @@ def scenario_mode_label(mode_code: str) -> str:
     mapping = {
         "legacy_current": "Legacy: старый пересчёт сценария",
         "enhanced_local_factors": "Enhanced what-if: дневной пересчёт факторов поверх baseline",
+        CATBOOST_FULL_FACTOR_MODE: "CatBoost full factors: модельный what-if по факторам",
     }
     return mapping.get(str(mode_code), str(mode_code))
 
@@ -141,6 +148,7 @@ def scenario_contract_label(contract_code: str) -> str:
     mapping = {
         "legacy_baseline+scenario_recompute": "Legacy baseline + scenario recompute",
         "legacy_baseline+enhanced_local_factor_layer": "Legacy baseline + local factor layer",
+        "daily_catboost_full_factors+model_reprediction": "Daily CatBoost full factors + model reprediction",
     }
     return mapping.get(str(contract_code), str(contract_code))
 
@@ -149,8 +157,35 @@ def effect_source_label(effect_source: str) -> str:
     mapping = {
         "scenario_engine_recompute_from_baseline": "Legacy scenario effects from baseline recompute",
         "baseline_daily_x_local_factor_layer": "Local factor layer over daily baseline",
+        "catboost_full_factor_reprediction": "CatBoost повторно прогнозирует спрос по изменённым факторам",
     }
     return mapping.get(str(effect_source), str(effect_source))
+
+
+def resolve_scenario_calc_mode(mode: Optional[str]) -> str:
+    if mode is None:
+        return DEFAULT_SCENARIO_CALC_MODE
+    mode_val = str(mode)
+    return mode_val if mode_val in SCENARIO_CALC_MODES else DEFAULT_SCENARIO_CALC_MODE
+
+
+def normalize_factor_report_for_ui(report: pd.DataFrame) -> pd.DataFrame:
+    if report is None or len(report) == 0:
+        return pd.DataFrame(columns=["feature", "used_in_active_model", "reason"])
+    out = report.copy()
+    if "feature" not in out.columns and "factor" in out.columns:
+        out["feature"] = out["factor"]
+    if "used_in_active_model" not in out.columns:
+        if "usable_in_model" in out.columns:
+            out["used_in_active_model"] = out["usable_in_model"].astype(bool)
+        else:
+            out["used_in_active_model"] = False
+    if "reason" not in out.columns:
+        if "reason_if_excluded" in out.columns:
+            out["reason"] = out["reason_if_excluded"]
+        else:
+            out["reason"] = ""
+    return out
 
 
 def robust_clean_dirty_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -1555,6 +1590,14 @@ def resolve_final_active_path(
 
 
 def resolve_path_contracts(selected_forecaster: str, production_selected_candidate: str, scenario_calc_mode: str) -> Dict[str, str]:
+    if str(scenario_calc_mode) == CATBOOST_FULL_FACTOR_MODE:
+        return {
+            "baseline_forecast_path": "daily_catboost_full_factor_baseline",
+            "scenario_calculation_path": "catboost_full_factor_reprediction",
+            "learned_uplift_path": "inactive_not_used_in_this_mode",
+            "final_user_visible_path": "daily_catboost_full_factor_baseline + catboost_full_factor_reprediction",
+            "production_selected_candidate": "catboost_full_factors",
+        }
     baseline_forecast_path = (
         "weekly_ml_baseline"
         if str(selected_forecaster) == "weekly_model"
@@ -2089,16 +2132,227 @@ def run_full_pricing_analysis_universal(
     segment: Optional[str] = None,
     scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
 ):
-    analysis_scenario_calc_mode = (
-        str(scenario_calc_mode)
-        if str(scenario_calc_mode) in SCENARIO_CALC_MODES
-        else DEFAULT_SCENARIO_CALC_MODE
+    analysis_scenario_calc_mode = resolve_scenario_calc_mode(scenario_calc_mode)
+    if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
+        return _run_catboost_full_factor_analysis_universal(
+            normalized_txn=normalized_txn,
+            target_category=target_category,
+            target_sku=target_sku,
+            region=region,
+            channel=channel,
+            segment=segment,
+        )
+    return _run_existing_legacy_enhanced_analysis_universal(
+        normalized_txn=normalized_txn,
+        target_category=target_category,
+        target_sku=target_sku,
+        region=region,
+        channel=channel,
+        segment=segment,
+        scenario_calc_mode=analysis_scenario_calc_mode,
     )
+
+
+def _run_catboost_full_factor_analysis_universal(
+    normalized_txn: pd.DataFrame,
+    target_category: str,
+    target_sku: str,
+    region: Optional[str] = None,
+    channel: Optional[str] = None,
+    segment: Optional[str] = None,
+) -> Dict[str, Any]:
+    analysis_scenario_calc_mode = CATBOOST_FULL_FACTOR_MODE
+    txn = normalized_txn.copy()
+    if len(txn) == 0:
+        raise ValueError("Пустой датасет после нормализации.")
+    daily_base = build_daily_from_transactions(
+        txn,
+        target_sku,
+        target_category=target_category,
+        region=region,
+        channel=channel,
+        segment=segment,
+        include_extra_factors=True,
+    )
+    daily_base = robust_clean_dirty_data(daily_base)
+    daily_base = build_feature_matrix(daily_base).dropna(subset=["sales", "price"]).reset_index(drop=True)
+    future_dates = forecast_future_dates(pd.Timestamp(daily_base["date"].max()))
+    base_ctx = current_price_context(daily_base)
+    base_ctx["category"] = target_category
+    base_ctx["product_id"] = target_sku
+    latest_row = dict(base_ctx)
+    latest_row["requested_price"] = float(base_ctx.get("price", safe_median(daily_base["price"], 1.0)))
+    catboost_full_factor_bundle = train_catboost_full_factor_bundle(
+        daily_base=daily_base,
+        future_dates=future_dates,
+    )
+    warnings = list(catboost_full_factor_bundle.get("warnings", []))
+    if not catboost_full_factor_bundle.get("enabled", False):
+        return refresh_excel_export(
+            {
+                "history_daily": daily_base,
+                "quality_report": {"holdout_metrics": {}},
+                "feature_usage_report": pd.DataFrame(),
+                "feature_report": pd.DataFrame(),
+                "neutral_baseline_forecast": pd.DataFrame(),
+                "as_is_forecast": pd.DataFrame(),
+                "scenario_forecast": None,
+                "delta_vs_as_is": {},
+                "delta_vs_baseline": {},
+                "warnings": warnings,
+                "analysis_valid": False,
+                "small_mode_info": detect_small_mode_info(daily_base),
+                "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
+                "analysis_scenario_calc_mode_label": scenario_mode_label(analysis_scenario_calc_mode),
+                "blocking_error": True,
+                "blocking_error_code": "catboost_full_factors_unavailable",
+                "blocking_error_message": (
+                    "Выбран CatBoost full factors, но модель не может быть обучена: "
+                    f"{catboost_full_factor_bundle.get('reason', 'unknown')}."
+                ),
+                "catboost_full_factor_report": catboost_full_factor_bundle.get("feature_report", pd.DataFrame()),
+                "catboost_full_factor_importances": pd.DataFrame(catboost_full_factor_bundle.get("feature_importances", [])),
+                "_trained_bundle": {
+                    "daily_base": daily_base,
+                    "base_ctx": base_ctx,
+                    "latest_row": latest_row,
+                    "future_dates": future_dates,
+                    "analysis_scenario_calc_mode": CATBOOST_FULL_FACTOR_MODE,
+                    "catboost_full_factor_bundle": catboost_full_factor_bundle,
+                },
+            }
+        )
+    provisional_bundle = {
+        "daily_base": daily_base,
+        "base_ctx": base_ctx,
+        "latest_row": latest_row,
+        "future_dates": future_dates,
+        "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
+        "catboost_full_factor_bundle": catboost_full_factor_bundle,
+    }
+    neutral_overrides = {
+        "discount": 0.0,
+        "promotion": 0.0,
+        "freight_value": float(safe_median(daily_base.get("freight_value", pd.Series([0.0])), 0.0)),
+    }
+    as_is_sim = predict_catboost_full_factor_projection(
+        provisional_bundle,
+        manual_price=float(base_ctx.get("price")),
+        horizon_days=int(CONFIG["HORIZON_DAYS_DEFAULT"]),
+        overrides={
+            "discount": float(base_ctx.get("discount", 0.0)),
+            "promotion": float(base_ctx.get("promotion", 0.0)),
+            "freight_value": float(base_ctx.get("freight_value", 0.0)),
+        },
+    )
+    baseline_price = float(safe_median(daily_base["price"], float(base_ctx.get("price", 1.0))))
+    baseline_sim = predict_catboost_full_factor_projection(
+        provisional_bundle,
+        manual_price=baseline_price,
+        horizon_days=int(CONFIG["HORIZON_DAYS_DEFAULT"]),
+        overrides=neutral_overrides,
+    )
+    run_summary = {
+        "config": {
+            "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
+            "analysis_scenario_calc_mode_label": scenario_mode_label(analysis_scenario_calc_mode),
+            "model_backend": "catboost",
+            "backend_reason": "catboost_full_factor_mode",
+            "baseline_forecast_path": "daily_catboost_full_factor_baseline",
+            "scenario_calculation_path": "catboost_full_factor_reprediction",
+            "final_user_visible_path": "daily_catboost_full_factor_baseline + catboost_full_factor_reprediction",
+            "final_active_path": "daily_catboost_full_factors+model_reprediction",
+        },
+        "catboost_full_factor": {
+            "enabled": True,
+            "feature_count": int(len(catboost_full_factor_bundle.get("feature_cols", []))),
+            "cat_feature_count": int(len(catboost_full_factor_bundle.get("cat_feature_names", []))),
+            "holdout_metrics": dict(catboost_full_factor_bundle.get("holdout_metrics", {})),
+            "top_features": list(catboost_full_factor_bundle.get("feature_importances", []))[:20],
+        },
+        "metrics_summary": {"holdout_flat": dict(catboost_full_factor_bundle.get("holdout_metrics", {}))},
+        "scenario_output_summary": {
+            "model_backend": "catboost",
+            "backend_reason": "catboost_full_factor_mode",
+            "active_path_contract": "daily_catboost_full_factors+model_reprediction",
+        },
+    }
+    result = {
+        "history_daily": daily_base,
+        "quality_report": {"holdout_metrics": dict(catboost_full_factor_bundle.get("holdout_metrics", {}))},
+        "feature_usage_report": catboost_full_factor_bundle.get("feature_report", pd.DataFrame()),
+        "feature_report": catboost_full_factor_bundle.get("feature_report", pd.DataFrame()),
+        "neutral_baseline_forecast": baseline_sim["daily"],
+        "as_is_forecast": as_is_sim["daily"],
+        "scenario_forecast": None,
+        "delta_vs_as_is": {},
+        "delta_vs_baseline": {
+            "demand_total": float(as_is_sim["daily"]["actual_sales"].sum() - baseline_sim["daily"]["actual_sales"].sum()),
+            "revenue_total": float(as_is_sim["daily"]["revenue"].sum() - baseline_sim["daily"]["revenue"].sum()),
+            "profit_total": float(as_is_sim["daily"]["profit"].sum() - baseline_sim["daily"]["profit"].sum()),
+        },
+        "warnings": warnings,
+        "analysis_valid": True,
+        "small_mode_info": detect_small_mode_info(daily_base),
+        "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
+        "analysis_scenario_calc_mode_label": scenario_mode_label(analysis_scenario_calc_mode),
+        "holdout_metrics": pd.DataFrame([dict(catboost_full_factor_bundle.get("holdout_metrics", {}))]),
+        "elasticity_map": {},
+        "current_price": float(base_ctx.get("price")),
+        "scenario_price": None,
+        "current_profit": float(as_is_sim.get("profit_total", 0.0)),
+        "analysis_run_summary_json": json.dumps(run_summary, ensure_ascii=False, indent=2).encode("utf-8"),
+        "holdout_predictions_csv": catboost_full_factor_bundle.get("holdout_predictions", pd.DataFrame()).to_csv(index=False).encode("utf-8"),
+        "analysis_baseline_vs_as_is_csv": pd.DataFrame(
+            {
+                "date": pd.to_datetime(as_is_sim["daily"]["date"]).dt.strftime("%Y-%m-%d"),
+                "as_is_sales": pd.to_numeric(as_is_sim["daily"]["actual_sales"], errors="coerce").fillna(0.0),
+                "baseline_sales": pd.to_numeric(baseline_sim["daily"]["actual_sales"], errors="coerce").fillna(0.0),
+            }
+        ).to_csv(index=False).encode("utf-8"),
+        "uplift_debug_report_csv": pd.DataFrame([{"status": "not_used_in_catboost_full_factor_mode"}]).to_csv(index=False).encode("utf-8"),
+        "uplift_holdout_trace_csv": pd.DataFrame([{"status": "not_used_in_catboost_full_factor_mode"}]).to_csv(index=False).encode("utf-8"),
+        "manual_scenario_summary_json": b"{}",
+        "manual_scenario_daily_csv": b"",
+        "feature_report_csv": catboost_full_factor_bundle.get("feature_report", pd.DataFrame()).to_csv(index=False).encode("utf-8"),
+        "catboost_full_factor_report": catboost_full_factor_bundle.get("feature_report", pd.DataFrame()),
+        "catboost_full_factor_importances": pd.DataFrame(catboost_full_factor_bundle.get("feature_importances", [])),
+        "_trained_bundle": {
+            "daily_base": daily_base,
+            "base_ctx": base_ctx,
+            "latest_row": latest_row,
+            "future_dates": future_dates,
+            "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
+            "catboost_full_factor_bundle": catboost_full_factor_bundle,
+        },
+    }
+    return refresh_excel_export(result)
+
+
+def _run_existing_legacy_enhanced_analysis_universal(
+    normalized_txn: pd.DataFrame,
+    target_category: str,
+    target_sku: str,
+    region: Optional[str] = None,
+    channel: Optional[str] = None,
+    segment: Optional[str] = None,
+    scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
+):
+    analysis_scenario_calc_mode = resolve_scenario_calc_mode(scenario_calc_mode)
+    assert analysis_scenario_calc_mode in {"legacy_current", "enhanced_local_factors"}
     txn = normalized_txn.copy()
     raw_columns = set(normalized_txn.columns.tolist())
     if len(txn) == 0:
         raise ValueError("Пустой датасет после нормализации.")
-    daily_base = build_daily_from_transactions(txn, target_sku, target_category=target_category, region=region, channel=channel, segment=segment)
+    daily_base = build_daily_from_transactions(
+        txn,
+        target_sku,
+        target_category=target_category,
+        region=region,
+        channel=channel,
+        segment=segment,
+        include_extra_factors=False,
+    )
     daily_base = robust_clean_dirty_data(daily_base)
     daily_base = build_feature_matrix(daily_base).dropna(subset=["sales", "price"]).reset_index(drop=True)
     if len(daily_base) < 56:
@@ -2646,9 +2900,10 @@ def run_full_pricing_analysis_universal(
     latest_row = dict(base_ctx)
     latest_row["requested_price"] = float(base_ctx.get("price", safe_median(daily_base["price"], 1.0)))
     future_dates = forecast_future_dates(pd.Timestamp(daily_base["date"].max()))
+    catboost_full_factor_bundle = None
     baseline_price = float(safe_median(daily_base["price"], float(base_ctx.get("price", 1.0))))
-    as_is_sim = simulate_horizon_profit(latest_row, float(base_ctx.get("price")), future_dates, baseline_bundle, uplift_bundle, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef)
     neutral_overrides = {"discount": 0.0, "promotion": 0.0, "freight_value": float(safe_median(daily_base.get("freight_value", pd.Series([0.0])), 0.0))}
+    as_is_sim = simulate_horizon_profit(latest_row, float(base_ctx.get("price")), future_dates, baseline_bundle, uplift_bundle, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef)
     baseline_sim = simulate_horizon_profit(latest_row, baseline_price, future_dates, baseline_bundle, uplift_bundle, daily_base, base_ctx, shrunk_random_effects, fixed_log_price_coef, overrides=neutral_overrides)
     scenario_sim = None
     scenario_forecast = scenario_sim["daily"] if scenario_sim else None
@@ -2898,6 +3153,8 @@ def run_full_pricing_analysis_universal(
         "pooled_elasticity": fixed_log_price_coef,
         "confidence": confidence,
         "small_mode_info": small_mode_info,
+        "catboost_full_factor_bundle": catboost_full_factor_bundle,
+        "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
     }
     sensitivity_base = run_what_if_projection(
         sensitivity_trained_bundle,
@@ -2951,6 +3208,12 @@ def run_full_pricing_analysis_universal(
         scenario_calc_mode=analysis_scenario_calc_mode,
     )
     final_active_path = path_contracts["final_user_visible_path"]
+    if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE and catboost_full_factor_bundle:
+        catboost_feature_report = catboost_full_factor_bundle.get("feature_report", pd.DataFrame())
+        catboost_feature_importances = pd.DataFrame(catboost_full_factor_bundle.get("feature_importances", []))
+    else:
+        catboost_feature_report = pd.DataFrame()
+        catboost_feature_importances = pd.DataFrame()
     run_summary = {
             "config": {
             "git_commit": _safe_git_commit(),
@@ -3071,6 +3334,13 @@ def run_full_pricing_analysis_universal(
         },
         "weekly_baseline_candidate_comparison": weekly_baseline_candidate_comparison,
         "scenario_sensitivity_diagnostics": scenario_sensitivity_diagnostics,
+        "catboost_full_factor": {
+            "enabled": bool((catboost_full_factor_bundle or {}).get("enabled", False)) if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE else False,
+            "feature_count": int(len((catboost_full_factor_bundle or {}).get("feature_cols", []))) if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE else 0,
+            "cat_feature_count": int(len((catboost_full_factor_bundle or {}).get("cat_feature_names", []))) if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE else 0,
+            "holdout_metrics": dict((catboost_full_factor_bundle or {}).get("holdout_metrics", {})) if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE else {},
+            "top_features": list((catboost_full_factor_bundle or {}).get("feature_importances", []))[:20] if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE else [],
+        },
         "candidate_feature_readiness": candidate_feature_readiness,
         "warnings": warnings,
         "small_mode_info": small_mode_info,
@@ -3156,9 +3426,12 @@ def run_full_pricing_analysis_universal(
         },
     }
     current_price = float(base_ctx.get("price"))
+    effective_holdout_metrics = holdout_metrics
+    if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE and isinstance(catboost_full_factor_bundle, dict):
+        effective_holdout_metrics = dict(catboost_full_factor_bundle.get("holdout_metrics", holdout_metrics) or holdout_metrics)
     result = {
         "history_daily": daily_base,
-        "quality_report": {"holdout_metrics": holdout_metrics},
+        "quality_report": {"holdout_metrics": effective_holdout_metrics},
         "feature_usage_report": feature_report,
         "feature_report": feature_report,
         "neutral_baseline_forecast": baseline_sim["daily"],
@@ -3169,7 +3442,8 @@ def run_full_pricing_analysis_universal(
         "warnings": warnings,
         "small_mode_info": small_mode_info,
         "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
-        "holdout_metrics": pd.DataFrame([holdout_metrics]),
+        "analysis_scenario_calc_mode_label": scenario_mode_label(analysis_scenario_calc_mode),
+        "holdout_metrics": pd.DataFrame([effective_holdout_metrics]),
         "elasticity_map": shrunk_random_effects,
         "current_price": float(base_ctx.get("price")),
         "scenario_price": None,
@@ -3184,6 +3458,8 @@ def run_full_pricing_analysis_universal(
         "manual_scenario_summary_json": b"{}",
         "manual_scenario_daily_csv": b"",
         "feature_report_csv": feature_report.to_csv(index=False).encode("utf-8"),
+        "catboost_full_factor_report": catboost_feature_report,
+        "catboost_full_factor_importances": catboost_feature_importances,
         "flag": {"auto_apply": False, "reasons": {"mode": "single-core-what-if"}},
         "_trained_bundle": {
             "baseline_bundle": baseline_bundle,
@@ -3200,6 +3476,8 @@ def run_full_pricing_analysis_universal(
             "confidence": confidence,
             "small_mode": small_mode,
             "small_mode_info": small_mode_info,
+            "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
+            "catboost_full_factor_bundle": catboost_full_factor_bundle,
         },
     }
     return refresh_excel_export(result)
@@ -3849,9 +4127,27 @@ def run_what_if_projection(
     cost_multiplier: float = 1.0,
     stock_cap: float = 0.0,
     overrides: Optional[Dict[str, Any]] = None,
-    scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
+    factor_overrides: Optional[Dict[str, Any]] = None,
+    scenario_calc_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if scenario_calc_mode == "legacy_current":
+    if scenario_calc_mode is not None and str(scenario_calc_mode) not in SCENARIO_CALC_MODES:
+        raise ValueError(f"Unknown scenario_calc_mode: {scenario_calc_mode}")
+    selected_mode = scenario_calc_mode if scenario_calc_mode is not None else trained_bundle.get("analysis_scenario_calc_mode")
+    mode = resolve_scenario_calc_mode(selected_mode)
+    if mode == CATBOOST_FULL_FACTOR_MODE:
+        return predict_catboost_full_factor_projection(
+            trained_bundle=trained_bundle,
+            manual_price=manual_price,
+            freight_multiplier=freight_multiplier,
+            demand_multiplier=demand_multiplier,
+            horizon_days=horizon_days,
+            discount_multiplier=discount_multiplier,
+            cost_multiplier=cost_multiplier,
+            stock_cap=stock_cap,
+            overrides=overrides,
+            factor_overrides=factor_overrides,
+        )
+    if mode == "legacy_current":
         result = _run_what_if_projection_legacy(
             trained_bundle=trained_bundle,
             manual_price=manual_price,
@@ -3871,7 +4167,7 @@ def run_what_if_projection(
         result.setdefault("legacy_or_enhanced_label", "legacy")
         result.setdefault("scenario_calc_mode_label", scenario_mode_label("legacy_current"))
         return result
-    if scenario_calc_mode == "enhanced_local_factors":
+    if mode == "enhanced_local_factors":
         return _run_what_if_projection_enhanced(
             trained_bundle=trained_bundle,
             manual_price=manual_price,
@@ -4183,7 +4479,15 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "scenario_engine_version": str(what_if_result.get("scenario_engine_version", "v1_legacy_current")),
         "effect_source": str(what_if_result.get("effect_source", "")),
         "effect_breakdown": what_if_result.get("effect_breakdown", {}),
-        "legacy_or_enhanced_label": "enhanced" if str(what_if_result.get("scenario_calc_mode")) == "enhanced_local_factors" else "legacy",
+        "legacy_or_enhanced_label": (
+            "catboost_full_factors"
+            if str(what_if_result.get("scenario_calc_mode")) == CATBOOST_FULL_FACTOR_MODE
+            else (
+                "enhanced_local_factors"
+                if str(what_if_result.get("scenario_calc_mode")) == "enhanced_local_factors"
+                else "legacy_current"
+            )
+        ),
         "confidence_label": str(what_if_result.get("confidence_label", "")),
         "support_label": str(what_if_result.get("support_label", "")),
         "economic_verdict": economic_verdict,
@@ -4418,6 +4722,53 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         "source_blob_empty",
     )
     diagnostics_run_summary = _json_to_df(result_dict.get("analysis_run_summary_json"))
+    catboost_feature_report_sheet = non_empty_or_stub(
+        result_dict.get("catboost_full_factor_report", pd.DataFrame()) if isinstance(result_dict.get("catboost_full_factor_report", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "D_catboost_feature_report",
+        "CatBoost full factor mode was not used",
+    )
+    catboost_importances_sheet = non_empty_or_stub(
+        result_dict.get("catboost_full_factor_importances", pd.DataFrame()) if isinstance(result_dict.get("catboost_full_factor_importances", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "D_catboost_importances",
+        "CatBoost full factor mode was not used",
+    )
+    catboost_bundle_export = ((result_dict.get("_trained_bundle", {}) or {}).get("catboost_full_factor_bundle", {}) or {})
+    catboost_holdout_predictions_sheet = non_empty_or_stub(
+        catboost_bundle_export.get("holdout_predictions", pd.DataFrame()) if isinstance(catboost_bundle_export.get("holdout_predictions", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "D_catboost_holdout_predictions",
+        "CatBoost holdout predictions unavailable",
+    )
+    catboost_factor_catalog_sheet = non_empty_or_stub(
+        catboost_bundle_export.get("factor_catalog", pd.DataFrame()) if isinstance(catboost_bundle_export.get("factor_catalog", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "D_catboost_factor_catalog",
+        "CatBoost factor catalog unavailable",
+    )
+    catboost_guardrails_sheet = non_empty_or_stub(
+        pd.json_normalize(catboost_bundle_export.get("guardrails", {}), sep="."),
+        "D_catboost_guardrails",
+        "CatBoost guardrails unavailable",
+    )
+    catboost_scenario_overrides_sheet = non_empty_or_stub(
+        pd.DataFrame(
+            [
+                {"feature": k, "value": v}
+                for k, v in ((what_if_result or {}).get("applied_overrides", {}) or {}).items()
+                if str(k).startswith("factor__")
+            ]
+        ),
+        "D_catboost_scenario_overrides",
+        "No CatBoost factor overrides in scenario",
+    )
+    what_if_applied_overrides_sheet = non_empty_or_stub(
+        pd.DataFrame(
+            [
+                {"feature": str(k), "value": v}
+                for k, v in ((what_if_result or {}).get("applied_overrides", {}) or {}).items()
+            ]
+        ),
+        "D_what_if_applied_overrides",
+        "No scenario overrides were applied",
+    )
     manual_summary_df = _json_to_df(result_dict.get("manual_scenario_summary_json"))
     run_summary_obj = {}
     manual_summary_obj = {}
@@ -4727,6 +5078,15 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         {"group": "D_DIAGNOSTICS", "sheet": "D_uplift_debug", "description": "Диагностика uplift.", "df": diagnostics_uplift_debug, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_uplift_trace", "description": "Трассировка uplift.", "df": diagnostics_uplift_trace, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_run_summary", "description": "Сводный JSON прогона (flattened).", "df": diagnostics_run_summary, "optional": False, "note_absent": ""},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_feature_report", "description": "Факторы CatBoost full factor mode.", "df": catboost_feature_report_sheet, "optional": True, "note_absent": "CatBoost full factor mode was not used"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_importances", "description": "Feature importance CatBoost full factor mode.", "df": catboost_importances_sheet, "optional": True, "note_absent": "CatBoost full factor mode was not used"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_feature_importance", "description": "Alias: Feature importance CatBoost full factor mode.", "df": catboost_importances_sheet, "optional": True, "note_absent": "CatBoost full factor mode was not used"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_holdout", "description": "Alias: Daily holdout predictions CatBoost.", "df": catboost_holdout_predictions_sheet, "optional": True, "note_absent": "CatBoost holdout predictions unavailable"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_holdout_predictions", "description": "Daily holdout predictions CatBoost.", "df": catboost_holdout_predictions_sheet, "optional": True, "note_absent": "CatBoost holdout predictions unavailable"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_factor_catalog", "description": "Каталог факторов CatBoost.", "df": catboost_factor_catalog_sheet, "optional": True, "note_absent": "CatBoost factor catalog unavailable"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_guardrails", "description": "Guardrails CatBoost факторов.", "df": catboost_guardrails_sheet, "optional": True, "note_absent": "CatBoost guardrails unavailable"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_scenario_overrides", "description": "Переопределения factor__* в сценарии.", "df": catboost_scenario_overrides_sheet, "optional": True, "note_absent": "No CatBoost factor overrides in scenario"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_what_if_applied_overrides", "description": "Все применённые overrides сценария.", "df": what_if_applied_overrides_sheet, "optional": True, "note_absent": "No scenario overrides were applied"},
         {"group": "E_METRICS", "sheet": "E_metrics_all", "description": "Все доступные метрики (flattened).", "df": metrics_all, "optional": False, "note_absent": ""},
     ]
 
@@ -4778,6 +5138,15 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         diagnostics_uplift_debug.to_excel(writer, sheet_name="D_uplift_debug", index=False)
         diagnostics_uplift_trace.to_excel(writer, sheet_name="D_uplift_trace", index=False)
         diagnostics_run_summary.to_excel(writer, sheet_name="D_run_summary", index=False)
+        catboost_feature_report_sheet.to_excel(writer, sheet_name="D_catboost_feature_report", index=False)
+        catboost_importances_sheet.to_excel(writer, sheet_name="D_catboost_importances", index=False)
+        catboost_importances_sheet.to_excel(writer, sheet_name="D_catboost_feature_importance", index=False)
+        catboost_holdout_predictions_sheet.to_excel(writer, sheet_name="D_catboost_holdout", index=False)
+        catboost_holdout_predictions_sheet.to_excel(writer, sheet_name="D_catboost_holdout_predictions", index=False)
+        catboost_factor_catalog_sheet.to_excel(writer, sheet_name="D_catboost_factor_catalog", index=False)
+        catboost_guardrails_sheet.to_excel(writer, sheet_name="D_catboost_guardrails", index=False)
+        catboost_scenario_overrides_sheet.to_excel(writer, sheet_name="D_catboost_scenario_overrides", index=False)
+        what_if_applied_overrides_sheet.to_excel(writer, sheet_name="D_what_if_applied_overrides", index=False)
         metrics_all.to_excel(writer, sheet_name="E_metrics_all", index=False)
         if manual_scenario_present:
             scenario_df.to_excel(writer, sheet_name="B_manual_scenario", index=False)
@@ -5980,13 +6349,23 @@ if __name__ == "__main__":
         confidence = wr.get("confidence_label", "n/a")
 
         st.markdown("#### Как работает механизм расчёта")
-        st.markdown(
-            "1) Пользователь задаёт **gross price**.  \n"
-            "2) Система применяет **clip** по историческому диапазону (если нужно).  \n"
-            "3) Затем применяется **discount** и формируется **effective net price**.  \n"
-            "4) Реакция спроса считается именно от **effective net price**.  \n"
-            "5) Выручка/прибыль считаются из applied gross/discount/cost/freight."
-        )
+        if str(wr.get("scenario_calc_mode")) == CATBOOST_FULL_FACTOR_MODE:
+            st.markdown(
+                "1) До расчёта обучается дневная CatBoost-модель на продажах, календаре, цене, скидках, промо, логистике и дополнительных факторах из файла.  \n"
+                "2) В what-if система строит будущий дневной набор факторов.  \n"
+                "3) Изменённые пользователем цена/скидка/промо/логистика подставляются в будущие строки.  \n"
+                "4) CatBoost повторно прогнозирует спрос по этим изменённым факторам.  \n"
+                "5) Выручка и прибыль считаются из спрогнозированного спроса, net price, cost и freight.  \n"
+                "6) Ручной внешний шок применяется отдельно как пользовательское допущение, а не как обученный эффект."
+            )
+        else:
+            st.markdown(
+                "1) Пользователь задаёт **gross price**.  \n"
+                "2) Система применяет **clip** по историческому диапазону (если нужно).  \n"
+                "3) Затем применяется **discount** и формируется **effective net price**.  \n"
+                "4) Реакция спроса считается именно от **effective net price**.  \n"
+                "5) Выручка/прибыль считаются из applied gross/discount/cost/freight."
+            )
         st.markdown("#### Что именно система сравнивает")
         st.markdown(
             f"- Цена: requested `{requested_price}` → modeled `{model_price}`.  \n"
@@ -6358,6 +6737,13 @@ if __name__ == "__main__":
         st.stop()
 
     r = st.session_state.results
+    if bool(r.get("blocking_error", False)):
+        st.error(str(r.get("blocking_error_message", "Расчёт остановлен из-за блокирующей ошибки.")))
+        if r.get("blocking_error_code"):
+            st.caption(f"Код ошибки: {r.get('blocking_error_code')}")
+        for w in r.get("warnings", []):
+            st.warning(str(w))
+        st.stop()
     history_daily = r["history_daily"]
     current_forecast = r["as_is_forecast"]
     baseline_forecast = r["neutral_baseline_forecast"]
@@ -6629,16 +7015,74 @@ if __name__ == "__main__":
             st.session_state["what_if_freight_mult"] = float(freight_mult)
             st.session_state["what_if_demand_mult"] = float(demand_mult)
             with st.expander("Дополнительно: технические настройки", expanded=False):
-                st.session_state["what_if_calc_mode"] = DEFAULT_SCENARIO_CALC_MODE
-                st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
+                current_analysis_mode = str(r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
+                st.session_state["what_if_calc_mode"] = str(
+                    st.session_state.get("what_if_calc_mode", current_analysis_mode)
+                )
+                st.caption(f"Метод расчёта: {scenario_mode_label(st.session_state['what_if_calc_mode'])}")
+                if st.session_state["what_if_calc_mode"] == CATBOOST_FULL_FACTOR_MODE:
+                    st.caption(
+                        "В этом режиме сценарий пересчитывается через повторный прогноз CatBoost "
+                        "на изменённых факторах. Ручной внешний шок применяется как отдельный overlay."
+                    )
+                else:
+                    st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
                 st.caption("Детали технического контура доступны ниже в блоке диагностики.")
-            scenario_calc_mode = DEFAULT_SCENARIO_CALC_MODE
+            scenario_calc_mode = str(st.session_state.get("what_if_calc_mode", r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)))
+            factor_overrides: Dict[str, Any] = {}
+            if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
+                cb_bundle_ui = ((r.get("_trained_bundle", {}) or {}).get("catboost_full_factor_bundle", {}) or {})
+                factor_catalog_ui = cb_bundle_ui.get("factor_catalog", pd.DataFrame()) if isinstance(cb_bundle_ui, dict) else pd.DataFrame()
+                with st.expander("Дополнительные факторы CatBoost", expanded=False):
+                    if isinstance(factor_catalog_ui, pd.DataFrame) and len(factor_catalog_ui):
+                        if "editable" not in factor_catalog_ui.columns:
+                            factor_catalog_ui["editable"] = True
+                        editable = factor_catalog_ui[
+                            factor_catalog_ui["feature"].astype(str).str.startswith("factor__")
+                            & factor_catalog_ui["editable"].astype(bool)
+                        ].copy()
+                        if len(editable) == 0:
+                            st.caption("Дополнительные факторы для ручного изменения не найдены.")
+                        else:
+                            st.caption("CatBoost учёл внешние факторы в baseline; ниже можно задать overrides для what-if.")
+                            for _, fr in editable.iterrows():
+                                feature_name = str(fr.get("feature"))
+                                ui_key = f"what_if_factor_{feature_name.replace('factor__', '').replace(' ', '_')}"
+                                dtype = str(fr.get("dtype", "numeric"))
+                                if dtype == "numeric":
+                                    default_val = float(pd.to_numeric(fr.get("current_value", fr.get("fill_value", 0.0)), errors="coerce"))
+                                    lo = pd.to_numeric(fr.get("train_min", np.nan), errors="coerce")
+                                    hi = pd.to_numeric(fr.get("train_max", np.nan), errors="coerce")
+                                    if np.isfinite(lo) and np.isfinite(hi) and lo < hi:
+                                        val = st.slider(
+                                            f"{feature_name}",
+                                            min_value=float(lo),
+                                            max_value=float(hi),
+                                            value=float(np.clip(default_val, float(lo), float(hi))),
+                                            key=ui_key,
+                                        )
+                                    else:
+                                        val = st.number_input(f"{feature_name}", value=float(default_val), key=ui_key)
+                                else:
+                                    choices = []
+                                    if feature_name in r["_trained_bundle"]["daily_base"].columns:
+                                        choices = sorted(r["_trained_bundle"]["daily_base"][feature_name].dropna().astype(str).unique().tolist())
+                                    if not choices:
+                                        choices = [str(fr.get("current_value", "unknown"))]
+                                    default_choice = str(fr.get("current_value", choices[0]))
+                                    idx = choices.index(default_choice) if default_choice in choices else 0
+                                    val = st.selectbox(f"{feature_name}", options=choices, index=idx, key=ui_key)
+                                factor_overrides[feature_name] = val
+                    else:
+                        st.caption("Каталог факторов CatBoost недоступен.")
             segments_payload: Dict[str, Any] = {}
             segment_errors: List[str] = []
             segment_count_ui = 0
             with st.expander("Экспертный режим: разные параметры по периодам", expanded=False):
                 use_segments = st.checkbox("Использовать разные параметры по периодам", key="what_if_use_segments")
                 segments: List[Dict[str, Any]] = []
+                if use_segments and scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
+                    st.info("Сегменты для CatBoost full factors будут добавлены отдельным патчем. Сейчас применяется единый сценарий на весь горизонт.")
                 if use_segments and scenario_calc_mode == "enhanced_local_factors":
                     seg_count = st.selectbox("Количество сегментов", options=[1, 2, 3], index=1)
                     segment_count_ui = int(seg_count)
@@ -6725,7 +7169,10 @@ if __name__ == "__main__":
             has_segment_errors = len(segment_errors) > 0
             apply_btn = st.button("Рассчитать сценарий", type="primary", use_container_width=True, disabled=has_segment_errors)
             st.caption("После расчёта сценарий будет сравнен с текущим планом.")
-            st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
+            if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
+                st.caption("Метод: CatBoost повторно прогнозирует спрос по изменённым факторам (без legacy/enhanced multiplier).")
+            else:
+                st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
             if has_segment_errors:
                 st.error("Сценарий нельзя рассчитать: исправьте ошибки в периодах сегментов.")
             st.markdown("</div>", unsafe_allow_html=True)
@@ -6786,6 +7233,7 @@ if __name__ == "__main__":
                 demand_multiplier=float(demand_multiplier_for_run),
                 horizon_days=int(hdays),
                 overrides=overrides_payload,
+                factor_overrides=factor_overrides,
                 scenario_calc_mode=str(scenario_calc_mode),
             )
             wr = st.session_state.what_if_result
@@ -7060,8 +7508,26 @@ if __name__ == "__main__":
         st.markdown("</div>", unsafe_allow_html=True)
 
     elif active_tab == "Факторы":
-        factor_report = r.get("feature_report", pd.DataFrame())
-        used = factor_report[factor_report.get("used_in_active_model", False) == True]["feature"].tolist() if len(factor_report) else []
+        if str(r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)) == CATBOOST_FULL_FACTOR_MODE:
+            factor_report = normalize_factor_report_for_ui(r.get("catboost_full_factor_report", pd.DataFrame()))
+            used = factor_report[factor_report.get("used_in_active_model", False) == True]["feature"].tolist() if len(factor_report) else []
+            excluded = factor_report[factor_report.get("used_in_active_model", False) != True][["feature", "reason"]] if len(factor_report) else pd.DataFrame()
+            importances = r.get("catboost_full_factor_importances", pd.DataFrame())
+            cb_bundle = ((r.get("_trained_bundle", {}) or {}).get("catboost_full_factor_bundle", {}) or {})
+            holdout = cb_bundle.get("holdout_metrics", {}) if isinstance(cb_bundle, dict) else {}
+            st.markdown("**Режим: CatBoost full factors**")
+            st.caption(f"Статус модели: {'активна' if bool(cb_bundle.get('enabled', False)) else 'не активна'}")
+            st.caption(f"Использованных факторов: {len(used)}")
+            if holdout:
+                st.caption(f"Holdout WAPE: {holdout.get('wape', float('nan')):.2f} | MAE: {holdout.get('mae', float('nan')):.2f}")
+            top_feats = [str(x.get("feature", "")) for x in list(cb_bundle.get("feature_importances", []))[:5]]
+            if top_feats and all("sales_lag" in f or "sales_roll" in f for f in top_feats):
+                st.warning("Модель в основном опирается на лаги продаж; влияние внешних факторов в сценарии может быть ограничено.")
+        else:
+            factor_report = normalize_factor_report_for_ui(r.get("feature_report", pd.DataFrame()))
+            used = factor_report[factor_report.get("used_in_active_model", False) == True]["feature"].tolist() if len(factor_report) else []
+            excluded = pd.DataFrame()
+            importances = pd.DataFrame()
         changed = []
         if st.session_state.what_if_result is not None:
             c = st.session_state.what_if_result.get("scenario_inputs_contract", {})
@@ -7070,6 +7536,10 @@ if __name__ == "__main__":
                     changed.append((k, c[k]))
 
         render_report_card("Используемые факторы", used[:12] if used else ["Факторы будут показаны после расчета"]) 
+        if len(importances):
+            st.dataframe(importances.head(15), use_container_width=True, hide_index=True)
+        if len(excluded):
+            st.dataframe(excluded, use_container_width=True, hide_index=True)
         render_report_card("Управляемые факторы", ["цена — целевая цена", "промо — интенсивность промо", "внешний шок спроса — ручное допущение"]) 
         render_report_card("Внешние факторы", ["сезонность — сезонность", "внешний рынок — внешний спрос", "погода/праздники — календарные эффекты (если есть)"]) 
         render_report_card("Изменено в сценарии", [f"{k}: {v}" for k, v in changed] if changed else ["Изменений пока нет"]) 
