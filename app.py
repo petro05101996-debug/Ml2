@@ -6477,10 +6477,17 @@ if __name__ == "__main__":
     def _fmt_units(v: float) -> str:
         return f"{v:,.1f} шт."
 
-def _download_blob(payload: Any, default: bytes) -> bytes | BytesIO:
+def _download_blob(payload: Any, default: bytes) -> bytes:
         if payload is None:
             return default
-        if isinstance(payload, (bytes, bytearray, BytesIO)):
+        if isinstance(payload, BytesIO):
+            try:
+                return payload.getvalue()
+            except Exception:
+                return default
+        if isinstance(payload, bytearray):
+            return bytes(payload)
+        if isinstance(payload, bytes):
             return payload
         try:
             return bytes(payload)
