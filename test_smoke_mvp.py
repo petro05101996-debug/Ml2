@@ -58,6 +58,60 @@ def test_read_uploaded_csv_safely_supports_semicolon_delimiter():
     assert len(df) == 1
 
 
+def test_unit_cost_not_divided_during_normalization():
+    df = pd.DataFrame(
+        {
+            "date": ["2025-01-01"],
+            "product_id": ["sku-1"],
+            "price": [100.0],
+            "quantity": [10.0],
+            "revenue": [1000.0],
+            "cost": [60.0],
+            "freight_value": [5.0],
+        }
+    )
+    norm, _ = normalize_transactions(df, {})
+    assert float(norm.loc[0, "cost"]) == 60.0
+    assert float(norm.loc[0, "freight_value"]) == 5.0
+
+
+def test_total_cost_converted_to_unit_during_normalization():
+    df = pd.DataFrame(
+        {
+            "date": ["2025-01-01"],
+            "product_id": ["sku-1"],
+            "price": [100.0],
+            "quantity": [10.0],
+            "revenue": [1000.0],
+            "cost": [600.0],
+            "freight_value": [50.0],
+        }
+    )
+    norm, quality = normalize_transactions(df, {})
+    assert float(norm.loc[0, "cost"]) == 60.0
+    assert float(norm.loc[0, "freight_value"]) == 5.0
+    assert any("converted to per-unit" in str(w) for w in quality.get("warnings", []))
+
+
+def test_daily_aggregation_uses_total_inputs_per_unit():
+    df = pd.DataFrame(
+        {
+            "date": ["2025-01-01", "2025-01-01"],
+            "product_id": ["sku-1", "sku-1"],
+            "price": [100.0, 100.0],
+            "quantity": [10.0, 20.0],
+            "revenue": [1000.0, 2000.0],
+            "cost": [600.0, 1200.0],
+            "freight_value": [50.0, 100.0],
+        }
+    )
+    norm, _ = normalize_transactions(df, {})
+    daily = build_daily_from_transactions(norm, "sku-1")
+    row = daily.loc[daily["date"] == pd.Timestamp("2025-01-01")].iloc[0]
+    assert float(row["cost"]) == 60.0
+    assert float(row["freight_value"]) == 5.0
+
+
 def test_scenario_runner_baseline_fallback():
     def runner(_bundle, **kwargs):
         p = kwargs["manual_price"]

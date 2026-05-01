@@ -4378,9 +4378,25 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
             "lost_sales",
         ]
     ].copy()
+    scenario_cost_ratio = pd.to_numeric(manual_daily.get("scenario_cost", np.nan), errors="coerce") / pd.to_numeric(
+        manual_daily.get("scenario_price_net", np.nan), errors="coerce"
+    ).replace(0, np.nan)
+    scenario_freight_ratio = pd.to_numeric(manual_daily.get("scenario_freight_value", np.nan), errors="coerce") / pd.to_numeric(
+        manual_daily.get("scenario_price_net", np.nan), errors="coerce"
+    ).replace(0, np.nan)
+    invalid_unit_econ = (
+        (np.isfinite(float(scenario_cost_ratio.median())) and float(scenario_cost_ratio.median()) > 2.0)
+        or (np.isfinite(float(scenario_freight_ratio.median())) and float(scenario_freight_ratio.median()) > 1.0)
+    )
+    warnings_export = list(what_if_result.get("warnings", []))
+    if invalid_unit_econ:
+        manual_daily["as_is_profit"] = np.nan
+        manual_daily["scenario_profit"] = np.nan
+        manual_daily["delta_profit"] = np.nan
+        warnings_export.append("Себестоимость/логистика выглядят как total-суммы, прибыль отключена до проверки единиц измерения.")
     demand_delta_pct = float((manual_daily["delta_demand"].sum() / max(float(manual_daily["as_is_demand"].sum()), 1e-9)) * 100.0)
     revenue_delta_pct = float((manual_daily["delta_revenue"].sum() / max(float(manual_daily["as_is_revenue"].sum()), 1e-9)) * 100.0)
-    profit_delta_pct = float((manual_daily["delta_profit"].sum() / max(float(manual_daily["as_is_profit"].sum()), 1e-9)) * 100.0)
+    profit_delta_pct = safe_signed_pct(float(manual_daily["delta_profit"].sum()), float(manual_daily["as_is_profit"].sum()))
     economic_label, _, _ = classify_economic_verdict(profit_delta_pct, demand_delta_pct, revenue_delta_pct)
     shape_quality_low = bool((result_dict.get("summary", {}) or {}).get("shape_quality_low", False) or (result_dict.get("diagnostics", {}) or {}).get("shape_quality_low", False))
     reliability_label, _, _ = classify_reliability_verdict(
@@ -4413,7 +4429,7 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         or f"{baseline_forecast_path} + {scenario_calculation_path}"
     )
     active_path_contract = str(what_if_result.get("active_path_contract") or final_user_visible_path)
-    economic_verdict = str(what_if_result.get("economic_verdict", "")).strip() or economic_label
+    economic_verdict = economic_label
     reliability_verdict = str(what_if_result.get("reliability_verdict", "")).strip() or reliability_label
     learned_factor_confidence = "Не используется" if learned_uplift_path == "inactive_production_diagnostic_only" else "Активен"
     summary = {
@@ -4495,7 +4511,7 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "forecast_confidence": ("Средняя" if shape_quality_low else str(what_if_result.get("confidence_label", "Низкая"))),
         "scenario_math_confidence": "Высокая",
         "learned_factor_confidence": learned_factor_confidence,
-        "warnings": list(what_if_result.get("warnings", [])),
+        "warnings": warnings_export,
         "segments_summary": {
             "path_segments_used": bool(((what_if_result.get("scenario_support_info", {}) or {})).get("path_segments_used", False)),
             "segment_count": int(((what_if_result.get("scenario_support_info", {}) or {})).get("segment_count", 0)),
@@ -5022,7 +5038,7 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
                 "Изменение выручки, %": ((scenario_revenue - as_is_revenue) / max(abs(as_is_revenue), 1e-9) * 100.0) if manual_scenario_present else float("nan"),
                 "Текущий план: прибыль": as_is_profit,
                 "Сценарий: прибыль": scenario_profit,
-                "Изменение прибыли, %": ((scenario_profit - as_is_profit) / max(abs(as_is_profit), 1e-9) * 100.0) if manual_scenario_present else float("nan"),
+            "Изменение прибыли, %": safe_signed_pct((scenario_profit - as_is_profit), as_is_profit) if manual_scenario_present else float("nan"),
                 "Вывод": (
                     "Сценарий не применён. Это только анализ текущего плана."
                     if not manual_scenario_present
@@ -5659,7 +5675,7 @@ def calculate_scenario_deltas(as_is_forecast: pd.DataFrame, scenario_forecast: p
 
     delta_units_pct = (delta_units / max(abs(base_units), 1e-9) * 100.0) if np.isfinite(base_units) else float("nan")
     delta_revenue_pct = (delta_revenue / max(abs(base_revenue), 1e-9) * 100.0) if np.isfinite(base_revenue) else float("nan")
-    delta_profit_pct = (delta_profit / max(abs(base_profit), 1e-9) * 100.0) if np.isfinite(delta_profit) else float("nan")
+    delta_profit_pct = safe_signed_pct(delta_profit, base_profit) if np.isfinite(delta_profit) else float("nan")
 
     base_margin_pct = (base_profit / max(abs(base_revenue), 1e-9) * 100.0) if np.isfinite(base_profit) else float("nan")
     scenario_margin_pct = (scenario_profit / max(abs(scenario_revenue), 1e-9) * 100.0) if np.isfinite(scenario_profit) else float("nan")
@@ -5849,6 +5865,12 @@ def classify_economic_verdict(profit_delta_pct: float, demand_delta_pct: float, 
         "Сценарий можно рассмотреть."
     )
     return "Можно рассмотреть", "scenario-success-inline", text
+
+
+def safe_signed_pct(delta: float, base: float) -> float:
+    if not np.isfinite(delta) or not np.isfinite(base) or abs(base) < 1e-9:
+        return float("nan")
+    return float(delta / abs(base) * 100.0)
 
 
 def classify_reliability_verdict(
@@ -7321,7 +7343,7 @@ if __name__ == "__main__":
             sc_profit_local = float(sc_forecast_local["profit"].sum()) if ("profit" in sc_forecast_local.columns and len(sc_forecast_local)) else float("nan")
             demand_delta_pct_local = ((sc_units_local - base_units_local) / base_units_local * 100.0) if base_units_local else float("nan")
             revenue_delta_pct_local = ((sc_revenue_local - base_revenue_local) / base_revenue_local * 100.0) if base_revenue_local else float("nan")
-            profit_delta_pct_local = ((sc_profit_local - base_profit_local) / base_profit_local * 100.0) if base_profit_local else float("nan")
+            profit_delta_pct_local = safe_signed_pct((sc_profit_local - base_profit_local), base_profit_local)
             shape_quality_low_local = bool((r.get("summary", {}) or {}).get("shape_quality_low", False) or (r.get("diagnostics", {}) or {}).get("shape_quality_low", False))
             economic_label_local, _, _ = classify_economic_verdict(
                 float(profit_delta_pct_local) if np.isfinite(profit_delta_pct_local) else float("nan"),
@@ -7374,7 +7396,7 @@ if __name__ == "__main__":
             profit_delta = sc_profit_local - base_profit_local
             demand_delta_pct = (demand_delta / base_units_local * 100.0) if base_units_local else float("nan")
             revenue_delta_pct = (revenue_delta / base_revenue_local * 100.0) if base_revenue_local else float("nan")
-            profit_delta_pct = (profit_delta / base_profit_local * 100.0) if base_profit_local else float("nan")
+            profit_delta_pct = safe_signed_pct(profit_delta, base_profit_local)
             base_margin = (base_profit_local / base_revenue_local * 100.0) if base_revenue_local else float("nan")
             scenario_margin = (sc_profit_local / sc_revenue_local * 100.0) if sc_revenue_local else float("nan")
             margin_delta = scenario_margin - base_margin if np.isfinite(scenario_margin) and np.isfinite(base_margin) else float("nan")
@@ -7667,7 +7689,7 @@ if __name__ == "__main__":
         demand_delta = float(report_deltas.get("delta_units", np.nan)) if scenario_applied else np.nan
         revenue_delta = float(report_deltas.get("delta_revenue", np.nan)) if scenario_applied else np.nan
         profit_delta = float(report_deltas.get("delta_profit", np.nan)) if scenario_applied else np.nan
-        profit_delta_pct_report = float((profit_delta / max(base_profit, 1e-9)) * 100.0) if scenario_applied and np.isfinite(profit_delta) else float("nan")
+        profit_delta_pct_report = safe_signed_pct(profit_delta, base_profit) if scenario_applied and np.isfinite(profit_delta) else float("nan")
         ui_decision = build_ui_decision_summary(gate_ok, profit_delta_pct_report, str(wr.get("confidence_label", "")))
         recommendation = ui_decision["decision_label"]
 

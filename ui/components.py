@@ -76,7 +76,7 @@ def render_decision_summary_card(decision_label: str, tone: str, reason: str, me
 
 def humanize_feature_name(name: str) -> str:
     n = str(name)
-    mapping = {"price":"Цена","manual_price":"Цена","discount":"Скидка","promotion":"Промо","promo":"Промо","freight":"Логистика","freight_value":"Логистика","cost":"Себестоимость","quantity":"Продажи","sales":"Продажи","revenue":"Выручка","profit":"Прибыль","margin":"Маржа","sales_lag_7":"Продажи 7 дней назад","sales_lag_14":"Продажи 14 дней назад","sales_roll_7":"Средние продажи за 7 дней","sales_roll_14":"Средние продажи за 14 дней","day_of_week":"День недели","month":"Месяц","holiday":"Праздники","weather":"Погода"}
+    mapping = {"price":"Цена","manual_price":"Цена","discount":"Скидка","promotion":"Промо","promo":"Промо","freight":"Логистика за единицу","freight_value":"Логистика за единицу","cost":"Себестоимость за единицу","quantity":"Продажи","sales":"Продажи","revenue":"Выручка","profit":"Прибыль","margin":"Маржа","sales_lag_7":"Продажи 7 дней назад","sales_lag_14":"Продажи 14 дней назад","sales_roll_7":"Средние продажи за 7 дней","sales_roll_14":"Средние продажи за 14 дней","day_of_week":"День недели","month":"Месяц","holiday":"Праздники","weather":"Погода"}
     if n.startswith("factor__"):
         return f"Внешний фактор: {n.replace('factor__','')}"
     return mapping.get(n, n.replace("_", " ").strip().capitalize())
