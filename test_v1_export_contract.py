@@ -222,12 +222,12 @@ def test_manual_export_contains_guardrail_fields():
     summary_blob, daily_blob = app.build_manual_scenario_artifacts(res, wr)
     summary = json.loads(summary_blob.decode("utf-8"))
     daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
-    assert summary["price_guardrail_mode"] == "exact_manual"
+    assert summary["price_guardrail_mode"] == "economic_extrapolation"
     assert summary["requested_price_gross"] == pytest.approx(35.0)
     assert summary["applied_price_gross"] == pytest.approx(35.0)
     assert summary["price_out_of_range"] is True
     assert summary["price_clipped"] is False
-    assert daily["price_guardrail_mode"].iloc[0] == "exact_manual"
+    assert daily["price_guardrail_mode"].iloc[0] == "economic_extrapolation"
     assert daily["requested_price_gross"].iloc[0] == pytest.approx(35.0)
     assert daily["applied_price_gross"].iloc[0] == pytest.approx(35.0)
     assert daily["shock_multiplier"].mean() == pytest.approx(0.87)
@@ -250,3 +250,32 @@ def test_manual_export_safe_clip_applies_safe_price():
     assert summary["applied_price_gross"] == pytest.approx(summary["safe_price_gross"])
     assert summary["price_clipped"] is True
     assert daily["applied_price_gross"].iloc[0] == pytest.approx(daily["safe_price_gross"].iloc[0])
+
+
+def test_manual_export_contains_extrapolation_fields():
+    import json
+    import app
+
+    txn = _make_txn()
+    res = app.run_full_pricing_analysis_universal(txn, "cat-contract", "sku-contract", scenario_calc_mode="catboost_full_factors")
+    wr = app.run_what_if_projection(res["_trained_bundle"], manual_price=35.0, scenario_calc_mode="catboost_full_factors", price_guardrail_mode="economic_extrapolation")
+    summary_blob, daily_blob = app.build_manual_scenario_artifacts(res, wr)
+    summary = json.loads(summary_blob.decode("utf-8"))
+    daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
+    for col in ["model_price_gross", "price_for_model", "extrapolation_applied", "elasticity_used", "extrapolation_tail_multiplier", "scenario_price_effect_source"]:
+        assert col in daily.columns
+    assert "elasticity_used" in summary
+    assert "extrapolation_tail_multiplier" in summary
+
+
+def test_manual_export_uses_financial_price_as_scenario_price_gross():
+    import app
+    txn = _make_txn()
+    res = app.run_full_pricing_analysis_universal(txn, "cat-contract", "sku-contract", scenario_calc_mode="catboost_full_factors")
+    wr = app.run_what_if_projection(res["_trained_bundle"], manual_price=35.0, scenario_calc_mode="catboost_full_factors", price_guardrail_mode="economic_extrapolation")
+    _, daily_blob = app.build_manual_scenario_artifacts(res, wr)
+    daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
+    assert daily["scenario_price_gross"].iloc[0] == pytest.approx(35.0)
+    assert daily["applied_price_gross"].iloc[0] == pytest.approx(35.0)
+    assert daily["model_price_gross"].iloc[0] == pytest.approx(daily["safe_price_gross"].iloc[0])
+    assert daily["extrapolation_applied"].iloc[0] in [True, "True", "true", 1]

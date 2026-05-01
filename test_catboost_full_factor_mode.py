@@ -402,8 +402,8 @@ def test_catboost_holdout_metrics_are_recursive_mode():
     assert {"date", "actual_sales", "predicted_sales", "abs_error", "ape"}.issubset(set(hp.columns))
 
 
-def test_catboost_guardrail_modes_safe_clip_vs_exact_manual():
-    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+def test_safe_clip_and_extrapolation_have_different_financial_price_only():
+    from catboost_full_factor_engine import normalize_price_guardrail_mode, train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
 
     n = 100
     daily = pd.DataFrame(
@@ -425,15 +425,95 @@ def test_catboost_guardrail_modes_safe_clip_vs_exact_manual():
     cb = train_catboost_full_factor_bundle(daily, future, min_train_days=60)
     bundle = {"daily_base": daily, "future_dates": future, "base_ctx": {"price": 19.0, "discount": 0.0}, "catboost_full_factor_bundle": cb}
     wr_safe = predict_catboost_full_factor_projection(bundle, manual_price=35.0, horizon_days=5, price_guardrail_mode="safe_clip")
-    wr_exact = predict_catboost_full_factor_projection(bundle, manual_price=35.0, horizon_days=5, price_guardrail_mode="exact_manual")
+    wr_extra = predict_catboost_full_factor_projection(bundle, manual_price=35.0, horizon_days=5, price_guardrail_mode="economic_extrapolation")
     assert wr_safe["price_guardrail_mode"] == "safe_clip"
-    assert wr_safe["price_clipped"] is True
-    assert wr_safe["applied_price_gross"] < 35.0
-    assert wr_exact["price_guardrail_mode"] == "exact_manual"
-    assert wr_exact["applied_price_gross"] == pytest.approx(35.0)
-    assert wr_exact["price_clipped"] is False
-    assert wr_exact["price_out_of_range"] is True
-    assert wr_safe["revenue_total"] != pytest.approx(wr_exact["revenue_total"])
+    assert wr_extra["price_guardrail_mode"] == "economic_extrapolation"
+    assert wr_safe["model_price"] == pytest.approx(wr_safe["safe_price_gross"])
+    assert wr_extra["model_price"] == pytest.approx(wr_extra["safe_price_gross"])
+    assert wr_safe["applied_price_gross"] == pytest.approx(wr_safe["safe_price_gross"])
+    assert wr_extra["applied_price_gross"] == pytest.approx(35.0)
+    assert wr_safe["extrapolation_applied"] is False
+    assert wr_extra["extrapolation_applied"] is True
+    assert normalize_price_guardrail_mode("exact_manual") == "economic_extrapolation"
+    assert normalize_price_guardrail_mode("strict") == "economic_extrapolation"
+    assert normalize_price_guardrail_mode("manual") == "economic_extrapolation"
+
+
+def test_safe_clip_behavior_is_unchanged_for_out_of_range_price():
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+    n = 100
+    daily = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n), "sales": [20 + (i % 5) for i in range(n)], "price": [18.0 + (i % 2) for i in range(n)], "discount": [0.0] * n, "net_unit_price": [18.0 + (i % 2) for i in range(n)], "freight_value": [4.0] * n, "cost": [11.0] * n, "promotion": [0.0] * n, "review_score": [4.6] * n, "reviews_count": [10.0] * n, "stock": [999.0] * n})
+    future = pd.DataFrame({"date": pd.date_range("2024-05-01", periods=10)})
+    bundle = {"daily_base": daily, "future_dates": future, "base_ctx": {"price": 19.0, "discount": 0.0}, "catboost_full_factor_bundle": train_catboost_full_factor_bundle(daily, future, min_train_days=60)}
+    wr = predict_catboost_full_factor_projection(bundle, manual_price=40.99, horizon_days=5, price_guardrail_mode="safe_clip")
+    assert wr["price_guardrail_mode"] == "safe_clip"
+    assert wr["requested_price"] == pytest.approx(40.99)
+    assert wr["price_out_of_range"] is True
+    assert wr["price_clipped"] is True
+    assert wr["clip_applied"] is True
+    assert wr["extrapolation_applied"] is False
+    assert wr["model_price"] == pytest.approx(wr["safe_price_gross"])
+    assert wr["price_for_model"] == pytest.approx(wr["safe_price_gross"])
+    assert wr["applied_price_gross"] == pytest.approx(wr["safe_price_gross"])
+    assert wr["scenario_price_effect_source"] == "catboost_full_factor_reprediction"
+    assert not np.isfinite(wr.get("elasticity_used", np.nan))
+    assert wr.get("extrapolation_tail_multiplier", 1.0) == pytest.approx(1.0)
+
+
+def test_economic_extrapolation_inside_range_does_not_apply_extrapolation():
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+    n = 90
+    daily = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n), "sales": [10 + i % 3 for i in range(n)], "price": [20.0] * n, "discount": [0.0] * n, "net_unit_price": [20.0] * n, "freight_value": [2.0] * n, "cost": [12.0] * n, "promotion": [0.0] * n, "review_score": [4.5] * n, "reviews_count": [1.0] * n, "stock": [999.0] * n})
+    future = pd.DataFrame({"date": pd.date_range("2024-05-01", periods=3)})
+    wr = predict_catboost_full_factor_projection({"daily_base": daily, "future_dates": future, "base_ctx": {"price": 20.0}, "catboost_full_factor_bundle": train_catboost_full_factor_bundle(daily, future, min_train_days=60)}, manual_price=19.99, horizon_days=2, price_guardrail_mode="economic_extrapolation")
+    assert wr["price_guardrail_mode"] == "economic_extrapolation"
+    assert wr["price_out_of_range"] is False
+    assert wr["price_clipped"] is False
+    assert wr["extrapolation_applied"] is False
+    assert wr["model_price"] == pytest.approx(19.99)
+    assert wr["price_for_model"] == pytest.approx(19.99)
+    assert wr["applied_price_gross"] == pytest.approx(19.99)
+
+
+def test_catboost_daily_clip_applied_is_exported_for_safe_clip():
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+    n = 90
+    daily = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n), "sales": [10 + i % 3 for i in range(n)], "price": [20.0] * n, "discount": [0.0] * n, "net_unit_price": [20.0] * n, "freight_value": [2.0] * n, "cost": [12.0] * n, "promotion": [0.0] * n, "review_score": [4.5] * n, "reviews_count": [1.0] * n, "stock": [999.0] * n})
+    future = pd.DataFrame({"date": pd.date_range("2024-05-01", periods=3)})
+    wr = predict_catboost_full_factor_projection({"daily_base": daily, "future_dates": future, "base_ctx": {"price": 20.0}, "catboost_full_factor_bundle": train_catboost_full_factor_bundle(daily, future, min_train_days=60)}, manual_price=35.0, horizon_days=2, price_guardrail_mode="safe_clip")
+    assert wr["daily"]["clip_applied"].iloc[0] in [True, 1]
+
+
+def test_applied_path_summary_uses_financial_price_in_extrapolation():
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+    n = 120
+    daily = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n), "sales": [10 + i % 3 for i in range(n)], "price": [20.0] * n, "discount": [0.1] * n, "net_unit_price": [18.0] * n, "freight_value": [2.0] * n, "cost": [12.0] * n, "promotion": [0.0] * n, "review_score": [4.5] * n, "reviews_count": [1.0] * n, "stock": [999.0] * n})
+    future = pd.DataFrame({"date": pd.date_range("2024-05-01", periods=5)})
+    wr = predict_catboost_full_factor_projection({"daily_base": daily, "future_dates": future, "base_ctx": {"price": 20.0, "discount": 0.1}, "catboost_full_factor_bundle": train_catboost_full_factor_bundle(daily, future, min_train_days=60)}, manual_price=35.0, horizon_days=3, price_guardrail_mode="economic_extrapolation")
+    assert wr["applied_path_summary"]["price_net_avg"] == pytest.approx(wr["applied_price_net"])
+    assert wr["applied_path_summary"]["price_net_avg"] != pytest.approx(wr["model_price"] * (1.0 - 0.1))
+
+
+def test_low_price_extrapolation_increases_or_keeps_tail_multiplier_above_one():
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+    n = 120
+    daily = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n), "sales": [10 + i % 3 for i in range(n)], "price": [20.0] * n, "discount": [0.0] * n, "net_unit_price": [20.0] * n, "freight_value": [2.0] * n, "cost": [12.0] * n, "promotion": [0.0] * n, "review_score": [4.5] * n, "reviews_count": [1.0] * n, "stock": [999.0] * n})
+    future = pd.DataFrame({"date": pd.date_range("2024-05-01", periods=5)})
+    very_low_price = 5.0
+    wr = predict_catboost_full_factor_projection({"daily_base": daily, "future_dates": future, "base_ctx": {"price": 20.0}, "catboost_full_factor_bundle": train_catboost_full_factor_bundle(daily, future, min_train_days=60)}, manual_price=very_low_price, horizon_days=3, price_guardrail_mode="economic_extrapolation")
+    assert wr["extrapolation_applied"] is True
+    assert wr["applied_price_gross"] == pytest.approx(very_low_price)
+    assert wr["model_price"] == pytest.approx(wr["safe_price_gross"])
+    assert wr["extrapolation_tail_multiplier"] >= 1.0
+
+
+def test_high_price_extrapolation_reduces_or_keeps_tail_multiplier_below_one():
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+    n = 120
+    daily = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n), "sales": [10 + i % 3 for i in range(n)], "price": [20.0] * n, "discount": [0.0] * n, "net_unit_price": [20.0] * n, "freight_value": [2.0] * n, "cost": [12.0] * n, "promotion": [0.0] * n, "review_score": [4.5] * n, "reviews_count": [1.0] * n, "stock": [999.0] * n})
+    future = pd.DataFrame({"date": pd.date_range("2024-05-01", periods=5)})
+    wr = predict_catboost_full_factor_projection({"daily_base": daily, "future_dates": future, "base_ctx": {"price": 20.0}, "catboost_full_factor_bundle": train_catboost_full_factor_bundle(daily, future, min_train_days=60)}, manual_price=35.0, horizon_days=3, price_guardrail_mode="economic_extrapolation")
+    assert wr["extrapolation_tail_multiplier"] <= 1.0
 
 
 def test_default_price_guardrail_mode_is_safe_clip():
