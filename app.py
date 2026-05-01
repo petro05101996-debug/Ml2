@@ -6317,6 +6317,12 @@ if __name__ == "__main__":
         render_debug_expander,
         open_surface,
         close_surface,
+        render_page_header,
+        render_stepper,
+        render_help_callout,
+        render_kpi_strip,
+        render_decision_summary_card,
+        humanize_feature_name,
     )
 
     render_top_header()
@@ -6591,26 +6597,15 @@ def build_segment_paths(
 
 
 def render_upload_screen() -> dict[str, Any]:
-    st.markdown(
-        '<div class="section-title">Мастер запуска анализа</div>'
-        '<div class="section-subtitle">3 шага: загрузите файл → проверьте сопоставление колонок → выберите SKU и запустите расчёт</div>',
-        unsafe_allow_html=True,
-    )
+    render_page_header("Загрузка данных", "Загрузите историю продаж, проверьте поля и выберите SKU для анализа.")
+    upload_done = st.session_state.get("universal_file") is not None
     left, right = st.columns([1.2, 1], gap="large")
 
     with left:
         open_surface("Какие данные нужны")
-        st.markdown(
-            "- дата\n"
-            "- товар/серия\n"
-            "- продажи\n"
-            "- цена\n"
-            "- себестоимость (желательно)\n"
-            "- скидка/промо (желательно)\n"
-            "- логистика (желательно)\n"
-            "- остатки (желательно)"
-        )
-        st.caption("Чем больше в истории реальных изменений цены, скидок, промо и логистики, тем надёжнее сценарии.")
+        st.markdown("**Минимально нужно:** дата, SKU/товар, продажи (шт.), цена.")
+        st.markdown("**Для более точного сценария:** себестоимость, скидка, промо, логистика, остатки, внешние факторы.")
+        render_help_callout("Подсказка", "Чем больше реальных изменений цены/промо/логистики в истории, тем надёжнее результат.", "info")
         close_surface()
 
         open_surface("Шаг 1. Загрузка файла")
@@ -6664,15 +6659,32 @@ def render_upload_screen() -> dict[str, Any]:
                         quality_msgs.append("История цены почти плоская — ценовые сценарии будут оцениваться осторожно.")
                     if float(universal_quality.get("promo_share", 0.0)) < 0.05:
                         quality_msgs.append("Промо в истории почти не менялось — промо-эффект может быть ограничен guardrails.")
+                    quality_warnings = []
                     for qm in quality_msgs:
-                        st.caption(qm)
+                        if "осторожно" in qm or "огранич" in qm:
+                            quality_warnings.append(qm)
+                        render_help_callout("Качество данных", qm, "warning" if ("осторожно" in qm or "огранич" in qm) else "info")
                     for w in universal_quality.get("warnings", []):
-                        st.warning(w)
+                        quality_warnings.append(str(w))
+                        render_help_callout("Предупреждение", str(w), "warning")
+                    if schema_valid and not quality_warnings:
+                        render_help_callout("Готовность", "Готово к расчёту.", "info")
+                    elif schema_valid:
+                        render_help_callout("Готовность", "Можно запускать, но осторожно.", "warning")
                     st.caption("Предпросмотр нормализованных данных:")
                     st.dataframe(universal_txn.head(10), use_container_width=True, height=240)
         for err in schema_errors:
             st.error(err)
         close_surface()
+
+    columns_done = bool(schema_valid) if 'schema_valid' in locals() else False
+    sku_done = bool(st.session_state.get("input_target_category") and st.session_state.get("input_target_sku"))
+    render_stepper([
+        {"title": "Загрузка файла", "caption": "CSV/XLSX", "status": "done" if upload_done else "active"},
+        {"title": "Проверка колонок", "caption": "Сопоставление", "status": "done" if columns_done else ("active" if upload_done else "pending")},
+        {"title": "Выбор SKU", "caption": "Категория и товар", "status": "done" if sku_done else ("active" if columns_done else "pending")},
+        {"title": "Запуск анализа", "caption": "Старт расчёта", "status": "active" if sku_done else "pending"},
+    ], active_index=0)
 
     with right:
         open_surface("Шаг 3. Выбор объекта и запуск")
@@ -6687,14 +6699,15 @@ def render_upload_screen() -> dict[str, Any]:
                 skus = sorted(raw_for_select[raw_for_select[category_col].astype(str) == str(target_category)][sku_col].astype(str).dropna().unique())
                 target_sku = st.selectbox("SKU", skus, key="input_target_sku") if skus else None
         horizon_days = st.slider("Горизонт прогноза, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
-        analysis_calc_mode = st.radio(
-            "Тракт расчёта (до запуска анализа)",
-            options=list(SCENARIO_CALC_MODES.keys()),
-            format_func=lambda x: SCENARIO_CALC_MODES[x],
-            index=list(SCENARIO_CALC_MODES.keys()).index(DEFAULT_SCENARIO_CALC_MODE),
-            key="input_analysis_calc_mode",
-        )
-        st.caption("Этот выбор применяется к тракту расчёта после нажатия «Запустить анализ» и становится режимом по умолчанию в What-if.")
+        with st.expander("Дополнительно", expanded=False):
+            analysis_calc_mode = st.radio(
+                "Режим расчёта",
+                options=list(SCENARIO_CALC_MODES.keys()),
+                format_func=lambda x: SCENARIO_CALC_MODES[x],
+                index=list(SCENARIO_CALC_MODES.keys()).index(DEFAULT_SCENARIO_CALC_MODE),
+                key="input_analysis_calc_mode",
+            )
+            st.caption("Техническая настройка режима расчёта. Если не уверены — оставьте по умолчанию.")
         if target_category and target_sku:
             st.info(f"Будет рассчитан SKU: **{target_sku}** в категории **{target_category}**.")
         run_requested = st.button("Запустить анализ", type="primary", use_container_width=True)
@@ -6709,6 +6722,20 @@ def render_upload_screen() -> dict[str, Any]:
         "horizon_days": horizon_days,
         "analysis_calc_mode": analysis_calc_mode,
     }
+
+
+def build_ui_decision_summary(gate_ok_now: bool, profit_delta_pct: float, reliability_label_explicit: str) -> Dict[str, str]:
+    reliability_text_l = str(reliability_label_explicit).strip().lower()
+    reliability_risky = any(marker in reliability_text_l for marker in ["низк", "риск", "слаб", "недостат"])
+    if not gate_ok_now:
+        return {"decision_label": "Требует проверки", "tone": "warning", "reason": "Расчёт требует проверки: есть ограничения качества или параметры сценария выходят за надёжную область."}
+    if np.isfinite(profit_delta_pct) and profit_delta_pct < 0:
+        return {"decision_label": "Не рекомендуется", "tone": "danger", "reason": "Сценарий снижает прибыль относительно базового прогноза."}
+    if np.isfinite(profit_delta_pct) and profit_delta_pct > 0 and reliability_risky:
+        return {"decision_label": "Требует проверки", "tone": "warning", "reason": "Экономический эффект положительный, но надёжность расчёта ограничена."}
+    if np.isfinite(profit_delta_pct) and profit_delta_pct > 0:
+        return {"decision_label": "Можно рассмотреть", "tone": "success", "reason": "Сценарий повышает прибыль относительно базового прогноза без критичных сигналов риска."}
+    return {"decision_label": "Требует проверки", "tone": "warning", "reason": "Экономический эффект близок к нейтральному."}
 
 if __name__ == "__main__":
 
@@ -6794,18 +6821,30 @@ if __name__ == "__main__":
         st.toast("Активный сценарий отменён", icon="⊘")
         st.rerun()
     elif action_click == "compare":
-        st.session_state.active_workspace_tab = "Сценарий"
-        st.session_state["workspace_tab_radio"] = "Сценарий"
+        st.session_state.active_workspace_tab = "What-if сценарий"
+        st.session_state["workspace_tab_radio"] = "What-if сценарий"
         st.rerun()
     elif action_click == "export":
-        st.session_state.active_workspace_tab = "Отчет"
-        st.session_state["workspace_tab_radio"] = "Отчет"
+        st.session_state.active_workspace_tab = "Отчёт"
+        st.session_state["workspace_tab_radio"] = "Отчёт"
         st.rerun()
 
-    tabs = ["Дашборд", "Сценарий", "Факторы", "Диагностика", "Отчет"]
-    if "workspace_tab_radio" not in st.session_state or st.session_state["workspace_tab_radio"] not in tabs:
-        st.session_state["workspace_tab_radio"] = st.session_state.active_workspace_tab
-    active_tab = render_tabs(st.session_state.active_workspace_tab, tabs, key="workspace_tab_radio")
+    TAB_ALIASES = {
+        "Дашборд": "Обзор",
+        "Сценарий": "What-if сценарий",
+        "Диагностика": "Проверка качества",
+        "Отчет": "Отчёт",
+    }
+    tabs = ["Обзор", "What-if сценарий", "Факторы", "Проверка качества", "Отчёт"]
+    current_tab = TAB_ALIASES.get(str(st.session_state.get("active_workspace_tab", "Обзор")), str(st.session_state.get("active_workspace_tab", "Обзор")))
+    radio_tab = TAB_ALIASES.get(str(st.session_state.get("workspace_tab_radio", current_tab)), str(st.session_state.get("workspace_tab_radio", current_tab)))
+    if current_tab not in tabs:
+        current_tab = "Обзор"
+    if radio_tab not in tabs:
+        radio_tab = current_tab
+    st.session_state.active_workspace_tab = current_tab
+    st.session_state["workspace_tab_radio"] = radio_tab
+    active_tab = render_tabs(current_tab, tabs, key="workspace_tab_radio")
     st.session_state.active_workspace_tab = active_tab
 
     current_forecast_for_compare = align_forecasts_by_scenario_dates(current_forecast, scenario_forecast)
@@ -6817,8 +6856,23 @@ if __name__ == "__main__":
     sc_revenue = float(deltas["scenario_revenue"])
     sc_profit = float(deltas["scenario_profit"])
 
-    if active_tab == "Дашборд":
-        st.info("На всех графиках сравнение всегда одинаковое: **База (зелёный)** против **Сценария (фиолетовый)**.")
+    if active_tab == "Обзор":
+        render_page_header("Итог по текущему плану", "Бизнес-сводка по базовому прогнозу и текущему сценарию.")
+        recommendation = "Эффект нейтральный"
+        tone = "warning"
+        if sc_profit > base_profit:
+            recommendation, tone = "Сценарий улучшает прибыль", "success"
+        elif sc_profit < base_profit:
+            recommendation, tone = "Сценарий снижает прибыль", "danger"
+        render_help_callout("Краткая оценка", recommendation, tone)
+        base_margin = (base_profit / max(base_revenue, 1e-9)) * 100 if base_revenue else float("nan")
+        sc_margin = (sc_profit / max(sc_revenue, 1e-9)) * 100 if sc_revenue else float("nan")
+        render_kpi_strip([
+            {"label": "Спрос", "value": _fmt_units(sc_units), "delta": f"Δ {_fmt_units(sc_units-base_units)}", "base": f"База: {_fmt_units(base_units)}"},
+            {"label": "Выручка", "value": _fmt_money(sc_revenue), "delta": f"Δ {_fmt_money(sc_revenue-base_revenue)}", "base": f"База: {_fmt_money(base_revenue)}"},
+            {"label": "Прибыль", "value": _fmt_money(sc_profit), "delta": f"Δ {_fmt_money(sc_profit-base_profit)}", "base": f"База: {_fmt_money(base_profit)}"},
+            {"label": "Маржа", "value": fmt_pct_abs(sc_margin), "delta": fmt_pp_delta(sc_margin-base_margin), "base": f"База: {fmt_pct_abs(base_margin)}"},
+        ])
         fig_d = go.Figure()
         fig_d.add_trace(go.Scatter(x=current_forecast_for_compare["date"], y=current_forecast_for_compare["actual_sales"], name="База", line=dict(color="#9DCC84", width=2)))
         fig_d.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["actual_sales"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
@@ -6839,25 +6893,27 @@ if __name__ == "__main__":
         fig_p.update_layout(**_plot_layout("Прибыль"))
         render_chart_card("Прибыль", "Горизонт · ₽", fig_p, [("База", f"₽ {base_profit:,.0f}"), ("Сценарий", f"₽ {sc_profit:,.0f}"), ("Δ", f"₽ {sc_profit-base_profit:+,.0f}")])
         _render_chart_legend_help("Прибыль", "₽")
+        st.caption("Зелёная линия — базовый прогноз, фиолетовая — текущий сценарий.")
 
-        effect_pct = ((sc_units - base_units) / base_units * 100) if base_units else 0.0
-        render_metric_summary_card(
-            "Итог сценария",
-            f"{effect_pct:+.1f}%",
-            "Изменение спроса к базе",
-            [("База", f"{base_units:,.0f}"), ("Сценарий", f"{sc_units:,.0f}"), ("Δ", f"{sc_units-base_units:+,.0f}")],
-        )
-
-        recommendation = "применять" if sc_profit >= base_profit else "не применять"
-        render_insight_card([
-            f"Спрос: {effect_pct:+.1f}%",
-            f"Выручка: ₽ {sc_revenue-base_revenue:+,.0f}",
-            f"Прибыль: ₽ {sc_profit-base_profit:+,.0f}",
-            f"Рекомендация: {recommendation}",
-        ])
-
-    elif active_tab == "Сценарий":
+    elif active_tab == "What-if сценарий":
+        render_page_header("What-if сценарий", "Измените параметры и рассчитайте, как изменятся спрос, выручка и прибыль. Базовый прогноз не меняется.")
+        scenario_state_ui = str(st.session_state.get("scenario_ui_status", "as_is"))
         base_ctx = r["_trained_bundle"]["base_ctx"]
+        render_stepper([
+            {"title": "Базовый прогноз", "caption": "Точка сравнения", "status": "done"},
+            {"title": "Что меняем", "caption": "Параметры сценария", "status": "active"},
+            {"title": "Предпросмотр", "caption": "Что будет рассчитано", "status": "active" if scenario_state_ui in {"dirty", "as_is"} else "done"},
+            {"title": "Рассчитать", "caption": "Запуск сценария", "status": "active" if scenario_state_ui == "dirty" else "done" if scenario_state_ui in {"applied", "saved"} else "pending"},
+            {"title": "Итог", "caption": "Решение", "status": "active" if scenario_state_ui in {"applied", "saved"} else "pending"},
+        ], active_index=1)
+        render_kpi_strip([
+            {"label": "Текущая цена", "value": fmt_price(r.get("current_price", np.nan)), "delta": "", "base": "База"},
+            {"label": "Скидка", "value": fmt_pct_abs(float(base_ctx.get("discount", 0.0)) * 100.0), "delta": "", "base": "В истории"},
+            {"label": "Промо", "value": fmt_pct_abs(float(base_ctx.get("promotion", 0.0)) * 100.0), "delta": "", "base": "В истории"},
+            {"label": "Базовый спрос", "value": fmt_units(base_units), "delta": "", "base": "Точка сравнения"},
+            {"label": "Базовая выручка", "value": fmt_money_total(base_revenue), "delta": "", "base": "Точка сравнения"},
+            {"label": "Базовая прибыль", "value": fmt_money_total(base_profit), "delta": "", "base": "Точка сравнения"},
+        ])
         base_form = collect_current_form_values(
             float(r.get("current_price", 0.0)),
             float(base_ctx.get("discount", 0.0)),
@@ -6983,7 +7039,7 @@ if __name__ == "__main__":
         close_surface()
 
         st.markdown('<div class="scenario-shell">', unsafe_allow_html=True)
-        open_surface("Настройка сценария", "Измените параметры и рассчитайте, как они повлияют на спрос, выручку и прибыль.")
+        open_surface("Сценарный мастер", "Шаги: что меняем → предпросмотр → рассчитать → итог → сохранить и сравнить.")
         if st.session_state["what_if_promo"] > 0.70:
             st.session_state["what_if_promo"] = 0.70
         if "what_if_freight_change_pct" not in st.session_state:
@@ -6995,7 +7051,7 @@ if __name__ == "__main__":
         with left_col:
             st.markdown('<div class="scenario-card">', unsafe_allow_html=True)
             st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Период сценария</div><div class="scenario-card-caption">На этот период будут пересчитаны спрос, выручка и прибыль.</div></div><div class="scenario-step">1</div></div>', unsafe_allow_html=True)
-            hdays = st.slider("Период прогноза, дней", 7, 90, key="what_if_hdays", step=1)
+            hdays = st.slider("На сколько дней считаем сценарий", 7, 90, key="what_if_hdays", step=1)
             st.markdown('<div class="scenario-divider"></div>', unsafe_allow_html=True)
             st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Цена и скидка</div><div class="scenario-card-caption">Цена для расчёта спроса = новая цена × (1 − скидка).</div></div><div class="scenario-step">2</div></div>', unsafe_allow_html=True)
             st.metric("Текущая цена", fmt_price(r["current_price"]))
@@ -7004,12 +7060,12 @@ if __name__ == "__main__":
             st.caption(f"Цена после скидки: {fmt_price(manual_price * (1.0 - discount))}")
             st.markdown('<div class="scenario-divider"></div>', unsafe_allow_html=True)
             st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Промо</div><div class="scenario-card-caption">0% — промо нет. Чем выше значение, тем сильнее промо-поддержка.</div></div><div class="scenario-step">3</div></div>', unsafe_allow_html=True)
-            promo_value = percent_slider_to_share("Интенсивность промо, %", "what_if_promo", min_pct=0, max_pct=70, step=1, default_share=0.0)
+            promo_value = percent_slider_to_share("Промо-активность, %", "what_if_promo", min_pct=0, max_pct=70, step=1, default_share=0.0)
             st.markdown('<div class="scenario-divider"></div>', unsafe_allow_html=True)
             st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Логистика и внешний спрос</div><div class="scenario-card-caption">Изменяйте факторы в процентах.</div></div><div class="scenario-step">4</div></div>', unsafe_allow_html=True)
             freight_change_pct = st.slider("Изменение логистических затрат, %", -50.0, 50.0, key="what_if_freight_change_pct", step=1.0)
-            demand_shock_pct = st.slider("Внешний шок спроса, %", -30.0, 30.0, key="what_if_demand_shock_pct", step=1.0)
-            st.markdown('<div class="scenario-warning-inline">Внешний шок спроса — это ручное предположение пользователя, а не эффект, обученный моделью на истории.</div>', unsafe_allow_html=True)
+            demand_shock_pct = st.slider("Ручное изменение спроса, %", -30.0, 30.0, key="what_if_demand_shock_pct", step=1.0)
+            st.markdown('<div class="scenario-warning-inline">Это ручное допущение: например, сезонный всплеск, перебой поставок или внешний спад. Модель не обучает этот эффект автоматически.</div>', unsafe_allow_html=True)
             freight_mult = pct_to_multiplier(freight_change_pct)
             demand_mult = pct_to_multiplier(demand_shock_pct)
             st.session_state["what_if_freight_mult"] = float(freight_mult)
@@ -7346,7 +7402,21 @@ if __name__ == "__main__":
             )
             wr["economic_verdict"] = economic_label
             wr["reliability_verdict"] = reliability_label_explicit
+            gate_ok_now = bool((wr.get("validation_gate", {}) or {}).get("ok", True))
+            ui_decision = build_ui_decision_summary(gate_ok_now, float(profit_delta_pct) if np.isfinite(profit_delta_pct) else float("nan"), reliability_label_explicit)
             open_surface("Итог сценария", "Сравнение с базовым прогнозом на выбранный период.")
+            render_decision_summary_card(
+                decision_label=ui_decision["decision_label"],
+                tone=ui_decision["tone"],
+                reason=ui_decision["reason"],
+                metrics=[
+                    {"label": "Прибыль", "value": fmt_money_total(profit_delta), "delta": fmt_pct_delta(profit_delta_pct)},
+                    {"label": "Спрос", "value": fmt_units(demand_delta), "delta": fmt_pct_delta(demand_delta_pct)},
+                    {"label": "Выручка", "value": fmt_money_total(revenue_delta), "delta": fmt_pct_delta(revenue_delta_pct)},
+                ],
+                economy_label=economic_label,
+                reliability_label=reliability_label_explicit,
+            )
             kpi_payload = {
                 "Спрос": {"value": fmt_units(sc_units_local), "delta_text": f"{fmt_units(demand_delta)} / {fmt_pct(demand_delta_pct)}", "base_text": fmt_units(base_units_local), "delta_numeric": demand_delta},
                 "Выручка": {"value": fmt_money_total(sc_revenue_local), "delta_text": f"{fmt_money_total(revenue_delta)} / {fmt_pct_delta(revenue_delta_pct)}", "base_text": fmt_money_total(base_revenue_local), "delta_numeric": revenue_delta},
@@ -7354,19 +7424,6 @@ if __name__ == "__main__":
                 "Маржа": {"value": fmt_pct_abs(scenario_margin), "delta_text": fmt_pp_delta(margin_delta), "base_text": fmt_pct_abs(base_margin), "delta_numeric": margin_delta},
             }
             render_result_kpi_grid(kpi_payload)
-            quick_conclusion = "Сравните результат с целями бизнеса: прибыль, выручка и устойчивость спроса."
-            if np.isfinite(demand_delta_pct) and np.isfinite(profit_delta_pct) and demand_delta_pct > 0 and profit_delta_pct < 0:
-                quick_conclusion = "Сценарий увеличивает спрос, но ухудшает прибыль. Скидка слишком высокая относительно прироста спроса."
-            st.markdown(
-                (
-                    '<div class="scenario-card">'
-                    '<div class="scenario-card-title">Сценарий рассчитан</div>'
-                    f'<div class="scenario-card-caption">Спрос: {fmt_pct_delta(demand_delta_pct)} · Выручка: {fmt_pct_delta(revenue_delta_pct)} · Прибыль: {fmt_pct_delta(profit_delta_pct)}</div>'
-                    f'<div class="scenario-help">{quick_conclusion}</div>'
-                    '</div>'
-                ),
-                unsafe_allow_html=True,
-            )
             st.markdown(f'<div class="{economic_css}"><b>Экономический итог:</b> {economic_label}. {economic_text}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="{reliability_css_explicit}"><b>Надёжность расчёта:</b> {reliability_label_explicit}. {reliability_text}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="{assessment_css}"><b>Оценка сценария:</b> {assessment_label}. Используйте как ориентир для сравнения, а не как гарантию.</div>', unsafe_allow_html=True)
@@ -7492,7 +7549,7 @@ if __name__ == "__main__":
         fig_s.update_layout(**_plot_layout("Проверка соседних цен"))
         st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False})
         close_surface()
-        with st.expander("Технические детали расчёта", expanded=False):
+        with st.expander("Диагностика и технические детали", expanded=False):
             st.write(f"Режим расчёта: {wr.get('scenario_calc_mode_label', scenario_mode_label(str(wr.get('scenario_calc_mode', DEFAULT_SCENARIO_CALC_MODE)))) if wr else scenario_mode_label(str(st.session_state.get('what_if_calc_mode', DEFAULT_SCENARIO_CALC_MODE)))}")
             st.write(f"Контур расчёта: {wr.get('active_path_contract_label', scenario_contract_label(str(wr.get('active_path_contract', active_path_contract)))) if wr else scenario_contract_label(active_path_contract)}")
             st.write(f"Источник эффектов: {wr.get('effect_source_label', effect_source_label(str(wr.get('effect_source', '')))) if wr else '—'}")
@@ -7508,6 +7565,7 @@ if __name__ == "__main__":
         st.markdown("</div>", unsafe_allow_html=True)
 
     elif active_tab == "Факторы":
+        render_page_header("Факторы", "Здесь показано, какие параметры использовались в модели и какие из них можно менять в сценарии.")
         if str(r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)) == CATBOOST_FULL_FACTOR_MODE:
             factor_report = normalize_factor_report_for_ui(r.get("catboost_full_factor_report", pd.DataFrame()))
             used = factor_report[factor_report.get("used_in_active_model", False) == True]["feature"].tolist() if len(factor_report) else []
@@ -7535,20 +7593,46 @@ if __name__ == "__main__":
                 if k in c:
                     changed.append((k, c[k]))
 
-        render_report_card("Используемые факторы", used[:12] if used else ["Факторы будут показаны после расчета"]) 
-        if len(importances):
-            st.dataframe(importances.head(15), use_container_width=True, hide_index=True)
+        display_used = [humanize_feature_name(x) for x in used[:12]] if used else ["Факторы будут показаны после расчета"]
+        render_report_card("Использованные факторы", display_used)
+        render_report_card("Управляемые факторы What-if", [
+            "Цена — меняет цену до скидки и влияет на спрос, выручку и прибыль.",
+            "Скидка — снижает цену после скидки, может увеличить спрос, но уменьшить маржу.",
+            "Промо — ручная промо-активность в сценарии.",
+            "Логистика — меняет затраты и влияет на прибыль.",
+            "Ручное изменение спроса — внешнее допущение пользователя, не обученное моделью автоматически.",
+        ])
+        render_report_card("Внешние факторы", ["сезонность — сезонность", "внешний рынок — внешний спрос", "погода/праздники — календарные эффекты (если есть)"])
         if len(excluded):
-            st.dataframe(excluded, use_container_width=True, hide_index=True)
-        render_report_card("Управляемые факторы", ["цена — целевая цена", "промо — интенсивность промо", "внешний шок спроса — ручное допущение"]) 
-        render_report_card("Внешние факторы", ["сезонность — сезонность", "внешний рынок — внешний спрос", "погода/праздники — календарные эффекты (если есть)"]) 
+            st.caption("Некоторые факторы не использовались моделью, потому что в истории по ним мало изменений или они не прошли проверку качества.")
+            with st.expander("Технический список исключённых факторов", expanded=False):
+                ex = excluded.copy()
+                if "feature" in ex.columns:
+                    ex["feature"] = ex["feature"].astype(str).map(humanize_feature_name)
+                st.dataframe(ex, use_container_width=True, hide_index=True)
+        if len(importances):
+            with st.expander("Техническая важность факторов", expanded=False):
+                st.caption("Это диагностическая информация. Высокая важность не всегда означает причинное влияние.")
+                st.dataframe(importances.head(15), use_container_width=True, hide_index=True)
         render_report_card("Изменено в сценарии", [f"{k}: {v}" for k, v in changed] if changed else ["Изменений пока нет"]) 
 
-    elif active_tab == "Диагностика":
+    elif active_tab == "Проверка качества":
+        render_page_header("Проверка качества", "Показывает, насколько осторожно нужно интерпретировать прогноз и what-if сценарии.")
         holdout = r.get("holdout_metrics", pd.DataFrame())
-        c1, c2, c3, c4 = st.columns(4)
         wape = float(holdout.get("wape", pd.Series([np.nan])).iloc[0]) if len(holdout) else np.nan
         mape = float(holdout.get("mape", pd.Series([np.nan])).iloc[0]) if len(holdout) else np.nan
+        if np.isfinite(wape):
+            if wape <= 0.15:
+                quality_label, quality_tone, quality_text = "Высокое", "success", "Прогноз достаточно стабилен для сценарного анализа."
+            elif wape <= 0.30:
+                quality_label, quality_tone, quality_text = "Среднее", "warning", "Сценарии можно использовать как ориентир, но не как точную гарантию."
+            else:
+                quality_label, quality_tone, quality_text = "Низкое", "danger", "Сценарии нужно использовать осторожно: качество истории ограничивает точность."
+        else:
+            quality_label, quality_tone, quality_text = "Недостаточно данных", "warning", "Не удалось надёжно оценить качество прогноза."
+        render_help_callout(f"Качество прогноза: {quality_label}", quality_text, quality_tone)
+        st.caption("WAPE и MAPE: чем ниже, тем лучше. Высокая ошибка не означает, что сценарий бесполезен, но требует осторожной интерпретации.")
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.metric("WAPE", f"{wape:.3f}" if np.isfinite(wape) else "n/a")
         with c2:
@@ -7571,8 +7655,8 @@ if __name__ == "__main__":
         run_summary_ui = json.loads(r.get("analysis_run_summary_json", b"{}").decode("utf-8")) if r.get("analysis_run_summary_json") else {}
         render_debug_expander(run_summary_ui)
 
-    elif active_tab == "Отчет":
-        st.markdown("### Отчёт в 1 экране")
+    elif active_tab == "Отчёт":
+        render_page_header("Краткий вывод", "Сводка сценария: что проверяли, что изменится, насколько результат надёжен и что делать дальше.")
         wr = st.session_state.what_if_result or {}
         scenario_applied = wr != {} and r.get("scenario_forecast") is not None
         gate_ok = bool((wr.get("validation_gate", {}) or {}).get("ok", True)) if scenario_applied else False
@@ -7583,24 +7667,34 @@ if __name__ == "__main__":
         demand_delta = float(report_deltas.get("delta_units", np.nan)) if scenario_applied else np.nan
         revenue_delta = float(report_deltas.get("delta_revenue", np.nan)) if scenario_applied else np.nan
         profit_delta = float(report_deltas.get("delta_profit", np.nan)) if scenario_applied else np.nan
-        recommendation = build_user_recommendation(scenario_applied, float(profit_delta) if np.isfinite(profit_delta) else 0.0, warnings_count, confidence_label)
+        profit_delta_pct_report = float((profit_delta / max(base_profit, 1e-9)) * 100.0) if scenario_applied and np.isfinite(profit_delta) else float("nan")
+        ui_decision = build_ui_decision_summary(gate_ok, profit_delta_pct_report, str(wr.get("confidence_label", "")))
+        recommendation = ui_decision["decision_label"]
 
         if not scenario_applied:
-            st.info("Сценарий ещё не применён. Сейчас отчёт показывает только текущий базовый план.")
+            render_empty_state("Сценарий ещё не рассчитан", "Перейдите во вкладку «What-if сценарий», настройте параметры и нажмите «Рассчитать сценарий».")
         elif not gate_ok:
-            st.error("Сценарий не прошёл validation gate. Проверьте технические предупреждения перед экспортом.")
-        elif recommendation == "Рекомендуется к пилоту":
-            st.success("Рекомендуется к пилоту: сценарий повышает прибыль и не имеет критичных сигналов риска.")
-        elif recommendation == "Не рекомендуется":
-            st.error("Не рекомендуется: сценарий снижает прибыль относительно текущего плана.")
+            st.error("Сценарий пока требует проверки перед экспортом. Откройте блок диагностики и уточните входные параметры.")
+        elif ui_decision["tone"] == "success":
+            st.success(f'{ui_decision["decision_label"]}: {ui_decision["reason"]}')
+        elif ui_decision["tone"] == "danger":
+            st.error(f'{ui_decision["decision_label"]}: {ui_decision["reason"]}')
         else:
-            st.warning("Требует дополнительной проверки: эффект не отрицательный, но есть ограничения по надёжности/предупреждениям.")
+            st.warning(f'{ui_decision["decision_label"]}: {ui_decision["reason"]}')
 
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Решение", recommendation if scenario_applied else "—")
-        k2.metric("Δ спроса", _fmt_units(demand_delta) if scenario_applied else "—")
-        k3.metric("Δ выручки", _fmt_money(revenue_delta) if scenario_applied else "—")
-        k4.metric("Δ прибыли", _fmt_money(profit_delta) if scenario_applied else "—")
+        if scenario_applied:
+            render_decision_summary_card(
+                decision_label=ui_decision["decision_label"],
+                tone=ui_decision["tone"],
+                reason=ui_decision["reason"],
+                metrics=[
+                    {"label": "Прибыль", "value": _fmt_money(profit_delta), "delta": f"{profit_delta_pct_report:+.1f}%"},
+                    {"label": "Спрос", "value": _fmt_units(demand_delta), "delta": "Δ к базовому плану"},
+                    {"label": "Выручка", "value": _fmt_money(revenue_delta), "delta": "Δ к базовому плану"},
+                ],
+                economy_label=str(wr.get("economic_verdict", "—")),
+                reliability_label=str(wr.get("reliability_verdict", confidence_label)),
+            )
 
         snapshot = st.session_state.applied_scenario_snapshot
         open_surface("Что именно мы проверили")
@@ -7711,7 +7805,7 @@ if __name__ == "__main__":
             use_container_width=True,
         )
         if scenario_applied and not gate_ok:
-            st.caption("Экспорт сценария заблокирован: validation gate обнаружил расхождения.")
+            st.caption("Экспорт сценария временно недоступен: требуется дополнительная проверка сценария.")
         close_surface()
 
     st.caption("What-if Cloud")
