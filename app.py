@@ -7658,7 +7658,15 @@ if __name__ == "__main__":
             "Средняя": "Результат полезен как ориентир, но его лучше дополнительно проверить.",
             "Низкая": "В данных мало опоры для такого сценария. Используйте результат осторожно.",
         }
-        render_report_card("Надёжность оценки", [f"Уровень: {confidence_label}", reliability_text[confidence_label]] + [str(w) for w in trust.get("warnings", [])[:3]])
+        confidence_label_aliases = {
+            "high": "Высокая",
+            "medium": "Средняя",
+            "med": "Средняя",
+            "low": "Низкая",
+        }
+        confidence_key = confidence_label_aliases.get(str(confidence_label).strip().lower(), str(confidence_label).strip())
+        confidence_text = reliability_text.get(confidence_key, reliability_text["Средняя"])
+        render_report_card("Надёжность оценки", [f"Уровень: {confidence_key}", confidence_text] + [str(w) for w in trust.get("warnings", [])[:3]])
 
         next_steps = [
             "Сохраните сценарий в слот сравнения.",
