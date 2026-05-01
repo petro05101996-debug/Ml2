@@ -62,6 +62,18 @@ def test_formatters_price_and_percent_signs():
     assert app.fmt_pct_delta(-16.9) == "-16.9%"
 
 
+def test_safe_signed_pct_handles_negative_base():
+    assert app.safe_signed_pct(-200.0, -1000.0) == -20.0
+    assert app.safe_signed_pct(200.0, -1000.0) == 20.0
+
+
+def test_negative_base_profit_verdict_not_profitable():
+    pct = app.safe_signed_pct(-200.0, -1000.0)
+    label, _, _ = app.classify_economic_verdict(pct, 5.0, 1.0)
+    assert pct == -20.0
+    assert label == "Невыгоден"
+
+
 def test_validation_gate_passes_consistent_totals():
     as_is = pd.DataFrame({"date": ["2026-01-01", "2026-01-02"], "actual_sales": [10.0, 10.0], "revenue": [90.0, 90.0], "profit": [20.0, 20.0]})
     daily = pd.DataFrame(

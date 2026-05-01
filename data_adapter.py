@@ -67,6 +67,9 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
 
     if "freight_value" not in out.columns:
         out["freight_value"] = 0.0
+    out, unit_warnings, unit_stats = _normalize_unit_economics(out)
+    quality["warnings"].extend(unit_warnings)
+    quality["unit_economics"] = unit_stats
 
     if "discount" not in out.columns:
         out["discount"] = 0.0
@@ -82,6 +85,48 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
     quality["stats"] = checks.get("stats", {})
     quality["feature_eligibility"] = build_feature_eligibility_report(out)
     return out, quality
+
+
+def _normalize_unit_economics(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
+    out = df.copy()
+    warnings: List[str] = []
+    qty = pd.to_numeric(out.get("quantity", 1.0), errors="coerce").replace(0, np.nan)
+    price = pd.to_numeric(out.get("price", np.nan), errors="coerce")
+    revenue = pd.to_numeric(out.get("revenue", np.nan), errors="coerce")
+    has_multi_qty = bool((qty.fillna(1.0) > 1).any())
+
+    def _looks_like_total(col: str, ratio_to_price_threshold: float, ratio_to_revenue_band: Tuple[float, float], revenue_price_floor: float = 1.0) -> bool:
+        vals = pd.to_numeric(out.get(col, np.nan), errors="coerce")
+        ratio_price = (vals / price.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+        ratio_revenue = (vals / revenue.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+        med_price = float(ratio_price.median()) if len(ratio_price) else float("nan")
+        med_revenue = float(ratio_revenue.median()) if len(ratio_revenue) else float("nan")
+        revenue_in_band = np.isfinite(med_revenue) and ratio_to_revenue_band[0] <= med_revenue <= ratio_to_revenue_band[1]
+        return has_multi_qty and (
+            (np.isfinite(med_price) and med_price > ratio_to_price_threshold)
+            or (revenue_in_band and np.isfinite(med_price) and med_price > revenue_price_floor)
+        )
+
+    cost_is_total = _looks_like_total("cost", ratio_to_price_threshold=2.0, ratio_to_revenue_band=(0.05, 1.2))
+    freight_is_total = _looks_like_total("freight_value", ratio_to_price_threshold=1.0, ratio_to_revenue_band=(0.005, 0.4), revenue_price_floor=0.1)
+
+    if cost_is_total:
+        out["cost_total_input"] = pd.to_numeric(out["cost"], errors="coerce")
+        out["cost"] = (pd.to_numeric(out["cost"], errors="coerce") / qty).replace([np.inf, -np.inf], np.nan)
+        warnings.append("cost interpreted as total amount and converted to per-unit")
+    if freight_is_total:
+        out["freight_total_input"] = pd.to_numeric(out["freight_value"], errors="coerce")
+        out["freight_value"] = (pd.to_numeric(out["freight_value"], errors="coerce") / qty).replace([np.inf, -np.inf], np.nan)
+        warnings.append("freight interpreted as total amount and converted to per-unit")
+    if cost_is_total or freight_is_total:
+        warnings.append("cost/freight interpreted as total amount and converted to per-unit")
+    unit_stats = {
+        "cost_converted_from_total": bool(cost_is_total),
+        "freight_converted_from_total": bool(freight_is_total),
+        "cost_unit_median": float(pd.to_numeric(out.get("cost", np.nan), errors="coerce").median()),
+        "freight_unit_median": float(pd.to_numeric(out.get("freight_value", np.nan), errors="coerce").median()),
+    }
+    return out, warnings, unit_stats
 
 
 def run_data_quality_checks(df: pd.DataFrame) -> Dict[str, Any]:
@@ -161,8 +206,14 @@ def build_daily_from_transactions(
             rec["discount"] = _wavg(g, "discount")
         if "cost" in g.columns:
             rec["cost"] = _wavg(g, "cost")
+        if "cost_total_input" in g.columns:
+            total_cost = float(pd.to_numeric(g.get("cost_total_input"), errors="coerce").fillna(0.0).sum())
+            rec["cost"] = total_cost / max(rec["sales"], 1e-9) if rec["sales"] > 0 else rec.get("cost", float("nan"))
         if "freight_value" in g.columns:
             rec["freight_value"] = _wavg(g, "freight_value")
+        if "freight_total_input" in g.columns:
+            total_freight = float(pd.to_numeric(g.get("freight_total_input"), errors="coerce").fillna(0.0).sum())
+            rec["freight_value"] = total_freight / max(rec["sales"], 1e-9) if rec["sales"] > 0 else rec.get("freight_value", float("nan"))
         if "promotion" in g.columns:
             rec["promotion"] = float(pd.to_numeric(g["promotion"], errors="coerce").fillna(0.0).max())
         if "rating" in g.columns:
@@ -222,6 +273,17 @@ def build_daily_from_transactions(
         daily["price"] * (1.0 - daily["discount"]),
     )
     daily["net_unit_price"] = pd.to_numeric(daily["net_unit_price"], errors="coerce").fillna(daily["price"] * (1.0 - daily["discount"])).clip(lower=0.01)
+    cost_ratio = (daily["cost"] / daily["net_unit_price"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    daily["unit_econ_warning"] = ""
+    if np.isfinite(float(cost_ratio.median())) and float(cost_ratio.median()) > 2.0:
+        daily["unit_econ_warning"] = "cost may be in total units; verify source columns"
+    freight_ratio = (daily["freight_value"] / daily["net_unit_price"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    if np.isfinite(float(freight_ratio.median())) and float(freight_ratio.median()) > 1.0:
+        daily["unit_econ_warning"] = np.where(
+            daily["unit_econ_warning"] == "",
+            "freight may be in total units; verify source columns",
+            daily["unit_econ_warning"] + "; freight may be in total units; verify source columns",
+        )
     if include_extra_factors:
         factor_cols = [c for c in daily.columns if str(c).startswith("factor__")]
         for c in factor_cols:
