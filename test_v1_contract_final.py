@@ -612,3 +612,23 @@ def test_path_support_warnings_are_path_based():
     )
     info = build_scenario_support_info_from_paths(hist, scenario_daily, {})
     assert len(info.get("warnings", [])) > 0
+
+
+def test_price_guardrail_mode_change_marks_scenario_dirty():
+    import app
+
+    base_form = app.collect_current_form_values(100.0, 0.0, 0.0, 1.0, 1.0, 30, "catboost_full_factors", "safe_clip")
+    applied_snapshot = {
+        "manual_price_requested": 100.0,
+        "discount_requested": 0.0,
+        "promo_requested": 0.0,
+        "freight_mult": 1.0,
+        "demand_mult": 1.0,
+        "horizon_days": 30,
+        "scenario_calc_mode": "catboost_full_factors",
+        "price_guardrail_mode": "safe_clip",
+        "scenario_status": "computed",
+    }
+    current_form = app.collect_current_form_values(100.0, 0.0, 0.0, 1.0, 1.0, 30, "catboost_full_factors", "exact_manual")
+    status = app.get_user_scenario_status(current_form, base_form, applied_snapshot, "applied")
+    assert status == "dirty"

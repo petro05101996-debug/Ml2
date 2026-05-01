@@ -133,6 +133,18 @@ SCENARIO_CALC_MODES = {
     CATBOOST_FULL_FACTOR_MODE: "CatBoost full factors: модельный what-if по факторам",
 }
 DEFAULT_SCENARIO_CALC_MODE = "enhanced_local_factors"
+PRICE_GUARDRAIL_SAFE_CLIP = "safe_clip"
+PRICE_GUARDRAIL_EXACT_MANUAL = "exact_manual"
+DEFAULT_PRICE_GUARDRAIL_MODE = PRICE_GUARDRAIL_SAFE_CLIP
+
+
+def normalize_price_guardrail_mode(value: Any) -> str:
+    value = str(value or "").strip().lower()
+    if value in {PRICE_GUARDRAIL_SAFE_CLIP, "safe", "clip", "защитный"}:
+        return PRICE_GUARDRAIL_SAFE_CLIP
+    if value in {PRICE_GUARDRAIL_EXACT_MANUAL, "exact", "manual", "strict", "строгий"}:
+        return PRICE_GUARDRAIL_EXACT_MANUAL
+    return DEFAULT_PRICE_GUARDRAIL_MODE
 
 
 def scenario_mode_label(mode_code: str) -> str:
@@ -4129,7 +4141,9 @@ def run_what_if_projection(
     overrides: Optional[Dict[str, Any]] = None,
     factor_overrides: Optional[Dict[str, Any]] = None,
     scenario_calc_mode: Optional[str] = None,
+    price_guardrail_mode: str = DEFAULT_PRICE_GUARDRAIL_MODE,
 ) -> Dict[str, Any]:
+    price_guardrail_mode = normalize_price_guardrail_mode(price_guardrail_mode)
     if scenario_calc_mode is not None and str(scenario_calc_mode) not in SCENARIO_CALC_MODES:
         raise ValueError(f"Unknown scenario_calc_mode: {scenario_calc_mode}")
     selected_mode = scenario_calc_mode if scenario_calc_mode is not None else trained_bundle.get("analysis_scenario_calc_mode")
@@ -4146,6 +4160,7 @@ def run_what_if_projection(
             stock_cap=stock_cap,
             overrides=overrides,
             factor_overrides=factor_overrides,
+            price_guardrail_mode=price_guardrail_mode,
         )
     if mode == "legacy_current":
         result = _run_what_if_projection_legacy(
@@ -4343,6 +4358,19 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
     merged["support_label"] = str(what_if_result.get("support_label", ""))
     merged["date"] = pd.to_datetime(merged["date"]).dt.strftime("%Y-%m-%d")
     merged["series_id"] = str(result_dict.get("_trained_bundle", {}).get("base_ctx", {}).get("product_id", "unknown"))
+    for col in [
+        "price_guardrail_mode",
+        "requested_price_gross",
+        "safe_price_gross",
+        "applied_price_gross",
+        "applied_price_net",
+        "price_out_of_range",
+        "price_clipped",
+        "guardrail_warning_type",
+        "effect_breakdown_available",
+        "effect_breakdown_note",
+    ]:
+        merged[col] = scenario[col].values if col in scenario.columns else np.nan
     manual_daily = merged[
         [
             "date",
@@ -4376,6 +4404,16 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
             "scenario_freight_value",
             "scenario_cost",
             "lost_sales",
+            "price_guardrail_mode",
+            "requested_price_gross",
+            "safe_price_gross",
+            "applied_price_gross",
+            "applied_price_net",
+            "price_out_of_range",
+            "price_clipped",
+            "guardrail_warning_type",
+            "effect_breakdown_available",
+            "effect_breakdown_note",
         ]
     ].copy()
     scenario_cost_ratio = pd.to_numeric(manual_daily.get("scenario_cost", np.nan), errors="coerce") / pd.to_numeric(
@@ -4446,6 +4484,13 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "current_price_raw": float(what_if_result.get("current_price_raw", np.nan)),
         "clip_applied": bool(what_if_result.get("clip_applied", what_if_result.get("price_clipped", False))),
         "clip_reason": str(what_if_result.get("clip_reason", "")),
+        "price_guardrail_mode": str((what_if_result.get("effective_scenario", {}) or {}).get("price_guardrail_mode", what_if_result.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE))),
+        "requested_price_gross": float((what_if_result.get("effective_scenario", {}) or {}).get("requested_price_gross", what_if_result.get("requested_price", np.nan))),
+        "safe_price_gross": float((what_if_result.get("effective_scenario", {}) or {}).get("safe_price_gross", what_if_result.get("safe_price_gross", np.nan))),
+        "applied_price_gross": float((what_if_result.get("effective_scenario", {}) or {}).get("applied_price_gross", what_if_result.get("model_price", np.nan))),
+        "price_out_of_range": bool((what_if_result.get("effective_scenario", {}) or {}).get("price_out_of_range", what_if_result.get("price_out_of_range", False))),
+        "price_clipped": bool((what_if_result.get("effective_scenario", {}) or {}).get("price_clipped", what_if_result.get("price_clipped", False))),
+        "guardrail_warning_type": str((what_if_result.get("effective_scenario", {}) or {}).get("guardrail_warning_type", what_if_result.get("guardrail_warning_type", ""))),
         "scenario_price_effect_source": str(what_if_result.get("scenario_price_effect_source", "")),
         "ood_flag": bool(what_if_result.get("ood_flag", False)),
         "horizon_days": int(len(scenario)),
@@ -5477,6 +5522,7 @@ def collect_current_form_values(
     demand_mult: float,
     hdays: int,
     scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
+    price_guardrail_mode: str = DEFAULT_PRICE_GUARDRAIL_MODE,
 ) -> Dict[str, Any]:
     return {
         "manual_price": float(manual_price),
@@ -5486,6 +5532,7 @@ def collect_current_form_values(
         "demand_mult": float(demand_mult),
         "hdays": int(hdays),
         "scenario_calc_mode": str(scenario_calc_mode),
+        "price_guardrail_mode": normalize_price_guardrail_mode(price_guardrail_mode),
     }
 
 
@@ -5512,6 +5559,10 @@ def build_applied_scenario_snapshot(
         "freight_applied": float(effective.get("freight_value", np.nan)),
         "price_clipped": bool(effective.get("price_clipped", wr.get("price_clipped", False))),
         "clip_reason": str(effective.get("clip_reason", wr.get("clip_reason", ""))),
+        "price_guardrail_mode": str(effective.get("price_guardrail_mode", wr.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE))),
+        "requested_price_gross": float(effective.get("requested_price_gross", wr.get("requested_price", manual_price))),
+        "safe_price_gross": float(effective.get("safe_price_gross", wr.get("safe_price_gross", np.nan))),
+        "price_out_of_range": bool(effective.get("price_out_of_range", wr.get("price_out_of_range", False))),
         "freight_mult": float(freight_mult),
         "demand_mult": float(demand_mult),
         "horizon_days": int(hdays),
@@ -6094,6 +6145,7 @@ def get_user_scenario_status(
         "demand_mult": float(applied_snapshot.get("demand_mult", base_form["demand_mult"])),
         "hdays": int(applied_snapshot.get("horizon_days", base_form["hdays"])),
         "scenario_calc_mode": str(applied_snapshot.get("scenario_calc_mode", base_form["scenario_calc_mode"])),
+        "price_guardrail_mode": normalize_price_guardrail_mode(applied_snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
     }
     if _same(current_form, applied_form):
         return "saved" if current_status == "saved" else "applied"
@@ -6115,19 +6167,30 @@ def render_applied_scenario_block(snapshot: Optional[Dict[str, Any]]) -> None:
         return
     open_surface("Параметры рассчитанного сценария")
     c1, c2 = st.columns(2)
-    c1.metric("Новая цена до скидки", fmt_price(snapshot.get("manual_price_applied", np.nan)))
+    is_cb_full = str(snapshot.get("scenario_calc_mode", "")) == CATBOOST_FULL_FACTOR_MODE
+    if is_cb_full:
+        c1.metric("Введённая цена", fmt_price(snapshot.get("requested_price_gross", snapshot.get("manual_price_requested", np.nan))))
+        c1.metric("Безопасная цена модели", fmt_price(snapshot.get("safe_price_gross", np.nan)))
+        c1.metric("Фактически применена в расчёте", fmt_price(snapshot.get("manual_price_applied", np.nan)))
+    else:
+        c1.metric("Новая цена до скидки", fmt_price(snapshot.get("manual_price_applied", np.nan)))
     c1.metric("Скидка", fmt_pct_abs(float(snapshot.get("discount_applied", 0.0)) * 100.0))
     c1.metric("Цена после скидки", fmt_price(snapshot.get("net_price_applied", np.nan)))
     c1.metric("Промо", fmt_pct_abs(float(snapshot.get("promo_applied", 0.0)) * 100.0))
     c2.metric("Изменение логистики", fmt_pct_delta(multiplier_to_pct(snapshot.get("freight_mult", np.nan))))
     c2.metric("Внешний шок спроса", fmt_pct_delta(multiplier_to_pct(snapshot.get("demand_mult", np.nan))))
     c2.metric("Период", f"{int(snapshot.get('horizon_days', 0))} дней")
-    c2.metric("Ограничения цены", "Да" if bool(snapshot.get("price_clipped", False)) else "Нет")
-    if bool(snapshot.get("price_clipped", False)):
-        st.markdown(
-            f'<div class="scenario-warning-inline">Введённая цена была скорректирована guardrails: {snapshot.get("clip_reason", "ограничение диапазона")}</div>',
-            unsafe_allow_html=True,
-        )
+    if is_cb_full:
+        mode_code = str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE))
+        mode_label = {
+            PRICE_GUARDRAIL_SAFE_CLIP: "Защитный режим",
+            PRICE_GUARDRAIL_EXACT_MANUAL: "Строгий what-if",
+        }.get(mode_code, mode_code)
+        c2.metric("Режим проверки цены", mode_label)
+    if is_cb_full and str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_SAFE_CLIP and bool(snapshot.get("price_clipped", False)):
+        st.warning("Защитный режим: расчёт выполнен по безопасной цене, а не по введённой.")
+    if is_cb_full and str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_EXACT_MANUAL and bool(snapshot.get("price_out_of_range", False)):
+        st.error("Строгий what-if: расчёт выполнен по введённой цене, но прогноз рискованный (экстраполяция вне истории).")
     close_surface()
 
 
@@ -6153,6 +6216,7 @@ def reset_scenario_ui_state_to_base(results: Dict[str, Any], clear_saved_slot: b
     st.session_state["what_if_demand_shock_pct"] = 0.0
     st.session_state["what_if_hdays"] = int(CONFIG["HORIZON_DAYS_DEFAULT"])
     st.session_state["what_if_calc_mode"] = str(results.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
+    st.session_state["price_guardrail_mode"] = DEFAULT_PRICE_GUARDRAIL_MODE
     st.session_state["what_if_use_segments"] = False
     st.session_state.form_last_values = collect_current_form_values(
         st.session_state["what_if_price"],
@@ -6162,6 +6226,7 @@ def reset_scenario_ui_state_to_base(results: Dict[str, Any], clear_saved_slot: b
         st.session_state["what_if_demand_mult"],
         st.session_state["what_if_hdays"],
         st.session_state["what_if_calc_mode"],
+        st.session_state["price_guardrail_mode"],
     )
     return refresh_excel_export(results)
 
@@ -6944,6 +7009,7 @@ if __name__ == "__main__":
             1.0,
             int(CONFIG["HORIZON_DAYS_DEFAULT"]),
             DEFAULT_SCENARIO_CALC_MODE,
+            DEFAULT_PRICE_GUARDRAIL_MODE,
         )
         for key, val in {
             "what_if_price": base_form["manual_price"],
@@ -6968,6 +7034,7 @@ if __name__ == "__main__":
             demand_form_mult,
             int(st.session_state.get("what_if_hdays", base_form["hdays"])),
             str(st.session_state.get("what_if_calc_mode", base_form["scenario_calc_mode"])),
+            normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
         )
         st.session_state.form_last_values = current_form_top
         st.session_state.scenario_ui_status = get_user_scenario_status(
@@ -7107,6 +7174,20 @@ if __name__ == "__main__":
                     st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
                 st.caption("Детали технического контура доступны ниже в блоке диагностики.")
             scenario_calc_mode = str(st.session_state.get("what_if_calc_mode", r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)))
+            if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
+                st.radio(
+                    "Режим проверки цены",
+                    options=[PRICE_GUARDRAIL_SAFE_CLIP, PRICE_GUARDRAIL_EXACT_MANUAL],
+                    format_func=lambda x: {
+                        PRICE_GUARDRAIL_SAFE_CLIP: "Защитный: ограничивать цену безопасным диапазоном модели",
+                        PRICE_GUARDRAIL_EXACT_MANUAL: "Строгий what-if: считать строго по введённой цене",
+                    }[x],
+                    index=0 if normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_SAFE_CLIP else 1,
+                    help="Защитный режим ограничивает цену диапазоном истории. Строгий what-if считает введённую цену и снижает доверие при выходе за диапазон.",
+                    key="price_guardrail_mode",
+                )
+            else:
+                st.session_state["price_guardrail_mode"] = DEFAULT_PRICE_GUARDRAIL_MODE
             factor_overrides: Dict[str, Any] = {}
             if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
                 cb_bundle_ui = ((r.get("_trained_bundle", {}) or {}).get("catboost_full_factor_bundle", {}) or {})
@@ -7263,6 +7344,7 @@ if __name__ == "__main__":
                 float(demand_mult),
                 int(hdays),
                 str(scenario_calc_mode),
+                normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
             )
             st.session_state.form_last_values = current_form_after_widgets
             st.session_state.scenario_ui_status = get_user_scenario_status(
@@ -7313,6 +7395,7 @@ if __name__ == "__main__":
                 overrides=overrides_payload,
                 factor_overrides=factor_overrides,
                 scenario_calc_mode=str(scenario_calc_mode),
+                price_guardrail_mode=st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE),
             )
             wr = st.session_state.what_if_result
             try:
