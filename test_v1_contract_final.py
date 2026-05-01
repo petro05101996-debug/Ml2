@@ -629,6 +629,6 @@ def test_price_guardrail_mode_change_marks_scenario_dirty():
         "price_guardrail_mode": "safe_clip",
         "scenario_status": "computed",
     }
-    current_form = app.collect_current_form_values(100.0, 0.0, 0.0, 1.0, 1.0, 30, "catboost_full_factors", "exact_manual")
+    current_form = app.collect_current_form_values(100.0, 0.0, 0.0, 1.0, 1.0, 30, "catboost_full_factors", "economic_extrapolation")
     status = app.get_user_scenario_status(current_form, base_form, applied_snapshot, "applied")
     assert status == "dirty"

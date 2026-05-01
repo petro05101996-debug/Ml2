@@ -17,16 +17,59 @@ except Exception:
 
 CATBOOST_FULL_FACTOR_MODE = "catboost_full_factors"
 PRICE_GUARDRAIL_SAFE_CLIP = "safe_clip"
-PRICE_GUARDRAIL_EXACT_MANUAL = "exact_manual"
+PRICE_GUARDRAIL_EXTRAPOLATE = "economic_extrapolation"
+DEFAULT_PRICE_GUARDRAIL_MODE = PRICE_GUARDRAIL_SAFE_CLIP
+DEFAULT_PRICE_ELASTICITY = -1.2
+MIN_PRICE_ELASTICITY = -3.0
+MAX_PRICE_ELASTICITY = -0.3
+MIN_EXTRAPOLATION_TAIL_MULTIPLIER = 0.15
+MAX_EXTRAPOLATION_TAIL_MULTIPLIER = 2.0
+MODEL_ELASTICITY_WEIGHT = 0.5
 
 
 def normalize_price_guardrail_mode(value: Any) -> str:
     value = str(value or "").strip().lower()
-    if value in {PRICE_GUARDRAIL_SAFE_CLIP, "safe", "clip", "защитный"}:
+    if value in {PRICE_GUARDRAIL_SAFE_CLIP, "safe", "clip", "protective", "защитный"}:
         return PRICE_GUARDRAIL_SAFE_CLIP
-    if value in {PRICE_GUARDRAIL_EXACT_MANUAL, "exact", "manual", "strict", "строгий"}:
-        return PRICE_GUARDRAIL_EXACT_MANUAL
-    return PRICE_GUARDRAIL_SAFE_CLIP
+    if value in {
+        PRICE_GUARDRAIL_EXTRAPOLATE, "extrapolate", "extrapolation",
+        "manual", "exact", "strict", "exact_manual", "строгий", "экстраполяция",
+    }:
+        return PRICE_GUARDRAIL_EXTRAPOLATE
+    return DEFAULT_PRICE_GUARDRAIL_MODE
+
+
+def _clamp_price_elasticity(value: float) -> float:
+    if not np.isfinite(value):
+        return DEFAULT_PRICE_ELASTICITY
+    return float(np.clip(value, MIN_PRICE_ELASTICITY, MAX_PRICE_ELASTICITY))
+
+
+def _safe_log_ratio(a: float, b: float) -> float:
+    if not np.isfinite(a) or not np.isfinite(b) or a <= 0 or b <= 0:
+        return float("nan")
+    return float(np.log(a / b))
+
+
+def _estimate_model_price_elasticity(q_base: float, q_boundary: float, base_price: float, boundary_price: float) -> tuple[float, str]:
+    log_q = _safe_log_ratio(q_boundary, q_base)
+    log_p = _safe_log_ratio(boundary_price, base_price)
+    if not np.isfinite(log_q) or not np.isfinite(log_p) or abs(log_p) < 1e-6:
+        return DEFAULT_PRICE_ELASTICITY, "fallback_default"
+    model_elasticity = float(log_q / log_p)
+    if model_elasticity >= -0.05:
+        return DEFAULT_PRICE_ELASTICITY, "fallback_model_elasticity_non_negative_or_too_weak"
+    blended = MODEL_ELASTICITY_WEIGHT * model_elasticity + (1.0 - MODEL_ELASTICITY_WEIGHT) * DEFAULT_PRICE_ELASTICITY
+    return _clamp_price_elasticity(blended), "blended_model_and_default"
+
+
+def _price_extrapolation_tail_multiplier(requested_price: float, boundary_price: float, elasticity: float) -> float:
+    if not np.isfinite(requested_price) or not np.isfinite(boundary_price) or requested_price <= 0 or boundary_price <= 0:
+        return 1.0
+    raw = float((requested_price / boundary_price) ** elasticity)
+    if not np.isfinite(raw):
+        return 1.0
+    return float(np.clip(raw, MIN_EXTRAPOLATION_TAIL_MULTIPLIER, MAX_EXTRAPOLATION_TAIL_MULTIPLIER))
 
 
 CORE_FACTOR_COLUMNS = [
@@ -496,18 +539,29 @@ def predict_catboost_full_factor_projection(
     price_hi = max(price_lo, train_max * 1.10)
     safe_price = float(np.clip(requested_price, price_lo, price_hi))
     price_out_of_range = bool(abs(safe_price - requested_price) > 1e-9)
+    extrapolation_applied = False
     if price_guardrail_mode == PRICE_GUARDRAIL_SAFE_CLIP:
         model_price = safe_price
         applied_price_gross = safe_price
         price_clipped = bool(price_out_of_range)
+        extrapolation_applied = False
         clip_reason = "catboost_full_factor_price_guardrail" if price_clipped else ""
         guardrail_warning_type = "clipped" if price_clipped else ""
     else:
-        model_price = requested_price
-        applied_price_gross = requested_price
-        price_clipped = False
-        clip_reason = ""
-        guardrail_warning_type = "exact_manual_out_of_range" if price_out_of_range else ""
+        if price_out_of_range:
+            model_price = safe_price
+            applied_price_gross = requested_price
+            price_clipped = False
+            extrapolation_applied = True
+            clip_reason = ""
+            guardrail_warning_type = "economic_extrapolation_out_of_range"
+        else:
+            model_price = requested_price
+            applied_price_gross = requested_price
+            price_clipped = False
+            extrapolation_applied = False
+            clip_reason = ""
+            guardrail_warning_type = ""
 
     base_discount = float(current_ctx.get("discount", history["discount"].dropna().iloc[-1] if len(history) else 0.0))
     scenario_discount = float(scenario_overrides.get("discount", base_discount * float(discount_multiplier)))
@@ -562,12 +616,16 @@ def predict_catboost_full_factor_projection(
     for _, fd_row in future_dates.iterrows():
         dt = pd.Timestamp(fd_row["date"])
 
+        model_price_gross = float(model_price)
+        model_price_net = max(0.01, model_price_gross * (1.0 - scenario_discount))
+        financial_price_gross = float(applied_price_gross)
+        financial_price_net = max(0.01, financial_price_gross * (1.0 - scenario_discount))
         rec = {
             "date": dt,
             "sales": 0.0,
-            "price": applied_price_gross,
+            "price": model_price_gross,
             "discount": scenario_discount,
-            "net_unit_price": max(0.01, applied_price_gross * (1.0 - scenario_discount)),
+            "net_unit_price": model_price_net,
             "freight_value": scenario_freight,
             "cost": scenario_cost,
             "promotion": scenario_promo,
@@ -591,8 +649,32 @@ def predict_catboost_full_factor_projection(
             else:
                 x[col] = pd.to_numeric(x[col], errors="coerce").fillna(float(fill_values.get(col, 0.0)))
 
-        pred_sales = float(np.expm1(model.predict(x)[0]))
-        pred_sales = max(0.0, pred_sales)
+        boundary_pred_sales = max(0.0, float(np.expm1(model.predict(x)[0])))
+        pred_sales = boundary_pred_sales
+        elasticity_used = np.nan
+        elasticity_source = ""
+        tail_multiplier = 1.0
+        if extrapolation_applied:
+            rec_base = dict(rec)
+            rec_base["price"] = float(base_price)
+            rec_base["net_unit_price"] = max(0.01, float(base_price) * (1.0 - scenario_discount))
+            tmp_base = pd.concat([work_history, pd.DataFrame([rec_base])], ignore_index=True)
+            tmp_base_model = _build_model_frame(tmp_base)
+            x_base = tmp_base_model.tail(1)[feature_cols].copy()
+            for col in feature_cols:
+                if col in cat_feature_names:
+                    x_base[col] = x_base[col].astype(str).fillna(str(fill_values.get(col, "unknown")))
+                else:
+                    x_base[col] = pd.to_numeric(x_base[col], errors="coerce").fillna(float(fill_values.get(col, 0.0)))
+            base_pred_same_context = max(0.0, float(np.expm1(model.predict(x_base)[0])))
+            elasticity_used, elasticity_source = _estimate_model_price_elasticity(base_pred_same_context, boundary_pred_sales, base_price, model_price_gross)
+            tail_multiplier = _price_extrapolation_tail_multiplier(financial_price_gross, model_price_gross, elasticity_used)
+            if financial_price_gross > model_price_gross:
+                tail_multiplier = min(tail_multiplier, 1.0)
+            elif financial_price_gross < model_price_gross:
+                tail_multiplier = max(tail_multiplier, 1.0)
+            pred_sales = boundary_pred_sales * tail_multiplier
+
         pred_sales *= float(demand_multiplier)
 
         available_stock = rec["stock"]
@@ -604,22 +686,36 @@ def predict_catboost_full_factor_projection(
         rec["sales"] = pred_sales
         rec["actual_sales"] = pred_sales
         rec["lost_sales"] = lost_sales
-        rec["revenue"] = pred_sales * rec["net_unit_price"]
-        rec["gross_revenue"] = pred_sales * rec["price"]
+        rec["revenue"] = pred_sales * financial_price_net
+        rec["gross_revenue"] = pred_sales * financial_price_gross
         rec["profit"] = rec["revenue"] - pred_sales * rec["cost"] - pred_sales * rec["freight_value"]
         rec["margin"] = rec["profit"] / rec["revenue"] if rec["revenue"] > 0 else 0.0
         rec["price_guardrail_mode"] = price_guardrail_mode
         rec["requested_price_gross"] = requested_price
         rec["safe_price_gross"] = safe_price
+        rec["model_price_gross"] = model_price_gross
+        rec["model_price_net"] = model_price_net
+        rec["price_for_model"] = model_price_gross
         rec["applied_price_gross"] = applied_price_gross
+        rec["applied_price_net"] = financial_price_net
         rec["scenario_price_gross"] = applied_price_gross
-        rec["scenario_price_net"] = max(0.01, applied_price_gross * (1.0 - scenario_discount))
+        rec["scenario_price_net"] = financial_price_net
         rec["scenario_discount"] = scenario_discount
         rec["price_out_of_range"] = bool(price_out_of_range)
         rec["price_clipped"] = bool(price_clipped)
+        rec["clip_applied"] = bool(price_clipped)
         rec["clip_reason"] = clip_reason
         rec["guardrail_warning_type"] = guardrail_warning_type
-        rec["applied_price_net"] = max(0.01, applied_price_gross * (1.0 - scenario_discount))
+        rec["extrapolation_applied"] = bool(extrapolation_applied)
+        rec["model_boundary_price_gross"] = model_price_gross if extrapolation_applied else np.nan
+        rec["extrapolation_from_price_gross"] = model_price_gross if extrapolation_applied else np.nan
+        rec["extrapolation_to_price_gross"] = financial_price_gross if extrapolation_applied else np.nan
+        rec["extrapolation_price_ratio"] = (financial_price_gross / model_price_gross if extrapolation_applied and model_price_gross > 0 else 1.0)
+        rec["boundary_model_demand"] = boundary_pred_sales
+        rec["elasticity_used"] = elasticity_used if extrapolation_applied else np.nan
+        rec["elasticity_source"] = elasticity_source if extrapolation_applied else ""
+        rec["extrapolation_tail_multiplier"] = tail_multiplier if extrapolation_applied else 1.0
+        rec["scenario_price_effect_source"] = "catboost_boundary_plus_elasticity_extrapolation" if extrapolation_applied else "catboost_full_factor_reprediction"
         rec["shock_multiplier"] = float(demand_multiplier)
         rec["shock_units"] = 0.0
         rec["price_effect"] = np.nan
@@ -642,14 +738,21 @@ def predict_catboost_full_factor_projection(
     revenue_total = float(pd.to_numeric(daily["revenue"], errors="coerce").fillna(0.0).sum())
     profit_total = float(pd.to_numeric(daily["profit"], errors="coerce").fillna(0.0).sum())
     lost_sales_total = float(pd.to_numeric(daily["lost_sales"], errors="coerce").fillna(0.0).sum())
+    _price_net_public = (
+        pd.to_numeric(daily["scenario_price_net"], errors="coerce")
+        if "scenario_price_net" in daily.columns
+        else pd.to_numeric(daily["applied_price_net"], errors="coerce")
+        if "applied_price_net" in daily.columns
+        else pd.to_numeric(daily["net_unit_price"], errors="coerce")
+    )
 
     support_label = "medium"
     warnings = list(full_bundle.get("warnings", []))
     warnings.extend(guardrail_warnings)
     if price_guardrail_mode == PRICE_GUARDRAIL_SAFE_CLIP and price_clipped:
         warnings.append(f"Введённая цена вне безопасного диапазона модели. Расчёт выполнен по безопасной цене {applied_price_gross:.2f}, а не по введённой цене {requested_price:.2f}.")
-    if price_guardrail_mode == PRICE_GUARDRAIL_EXACT_MANUAL and price_out_of_range:
-        warnings.append(f"Цена {requested_price:.2f} вне исторического диапазона модели. Расчёт выполнен строго по введённой цене, но прогноз является рискованной экстраполяцией.")
+    if price_guardrail_mode == PRICE_GUARDRAIL_EXTRAPOLATE and price_out_of_range:
+        warnings.append("Цена вне безопасного диапазона. Введённая цена сохранена для финансового расчёта, но спрос рассчитан моделью только до безопасной границы. Участок дальше рассчитан через ценовую эластичность. Это стресс-сценарий, а не точная рекомендация.")
     metrics = full_bundle.get("holdout_metrics", {})
     wape = metrics.get("wape", np.nan)
     if np.isfinite(wape) and float(wape) > 40.0:
@@ -660,7 +763,7 @@ def predict_catboost_full_factor_projection(
         support_label = "low"
         confidence *= 0.7
     reliability_verdict = ""
-    if price_guardrail_mode == PRICE_GUARDRAIL_EXACT_MANUAL and price_out_of_range:
+    if price_guardrail_mode == PRICE_GUARDRAIL_EXTRAPOLATE and price_out_of_range:
         confidence = min(float(confidence), 0.45)
         support_label = "low"
         reliability_verdict = "Рискованная экстраполяция"
@@ -680,7 +783,7 @@ def predict_catboost_full_factor_projection(
         "confidence_scenario": confidence,
         "confidence_label": "medium" if confidence >= 0.5 else "low",
         "uncertainty": 1.0 - confidence,
-        "ood_flag": bool(price_clipped or (price_guardrail_mode == PRICE_GUARDRAIL_EXACT_MANUAL and price_out_of_range)),
+        "ood_flag": bool(price_clipped or (price_guardrail_mode == PRICE_GUARDRAIL_EXTRAPOLATE and price_out_of_range)),
         "price_guardrail_mode": price_guardrail_mode,
         "requested_price": requested_price,
         "model_price": model_price,
@@ -692,11 +795,19 @@ def predict_catboost_full_factor_projection(
         "current_price_raw": base_price,
         "price_clipped": price_clipped,
         "clip_applied": price_clipped,
+        "extrapolation_applied": bool(extrapolation_applied),
+        "model_boundary_price_gross": float(model_price) if extrapolation_applied else np.nan,
+        "extrapolation_from_price_gross": float(model_price) if extrapolation_applied else np.nan,
+        "extrapolation_to_price_gross": float(requested_price) if extrapolation_applied else np.nan,
+        "extrapolation_price_ratio": (float(requested_price / model_price) if extrapolation_applied and model_price > 0 else 1.0),
+        "elasticity_used": (float(np.nanmean(daily["elasticity_used"])) if extrapolation_applied and "elasticity_used" in daily else np.nan),
+        "extrapolation_tail_multiplier": (float(np.nanmean(daily["extrapolation_tail_multiplier"])) if extrapolation_applied and "extrapolation_tail_multiplier" in daily else 1.0),
+        "elasticity_source": (str(daily["elasticity_source"].dropna().mode().iloc[0]) if extrapolation_applied and "elasticity_source" in daily and not daily["elasticity_source"].dropna().empty else ""),
         "clip_reason": clip_reason,
         "guardrail_warning_type": guardrail_warning_type,
         "net_price_supported": True,
         "net_price_support": {},
-        "scenario_price_effect_source": "catboost_full_factor_reprediction",
+        "scenario_price_effect_source": "catboost_boundary_plus_elasticity_extrapolation" if extrapolation_applied else "catboost_full_factor_reprediction",
         "fallback_multiplier_used": False,
         "fallback_reason": "",
         "learned_uplift_active": False,
@@ -748,6 +859,12 @@ def predict_catboost_full_factor_projection(
             "applied_price_net": float(max(0.01, applied_price_gross * (1.0 - scenario_discount))),
             "price_out_of_range": bool(price_out_of_range),
             "price_clipped": bool(price_clipped),
+            "extrapolation_applied": bool(extrapolation_applied),
+            "model_price_gross": float(model_price),
+            "financial_price_gross": float(applied_price_gross),
+            "elasticity_used": float(np.nanmean(daily["elasticity_used"])) if extrapolation_applied else np.nan,
+            "extrapolation_tail_multiplier": float(np.nanmean(daily["extrapolation_tail_multiplier"])) if extrapolation_applied else 1.0,
+            "scenario_price_effect_source": "catboost_boundary_plus_elasticity_extrapolation" if extrapolation_applied else "catboost_full_factor_reprediction",
         },
         "scenario_inputs_contract": {
             "base_price": base_price,
@@ -767,6 +884,11 @@ def predict_catboost_full_factor_projection(
             "applied_price_net": max(0.01, applied_price_gross * (1.0 - scenario_discount)),
             "price_out_of_range": price_out_of_range,
             "price_clipped": price_clipped,
+            "financial_price_gross": applied_price_gross,
+            "model_price_gross": model_price,
+            "price_for_model": model_price,
+            "extrapolation_applied": bool(extrapolation_applied),
+            "scenario_price_effect_source": "catboost_boundary_plus_elasticity_extrapolation" if extrapolation_applied else "catboost_full_factor_reprediction",
         },
         "scenario_calc_mode": CATBOOST_FULL_FACTOR_MODE,
         "scenario_calc_mode_label": "CatBoost full factors: модельный what-if по факторам",
@@ -783,9 +905,9 @@ def predict_catboost_full_factor_projection(
         "applied_path_summary": {
             "mode": "CatBoost full factors: модельный what-if по факторам",
             "segment_count": 0,
-            "price_net_min": float(daily["net_unit_price"].min()) if len(daily) else np.nan,
-            "price_net_avg": float(daily["net_unit_price"].mean()) if len(daily) else np.nan,
-            "price_net_max": float(daily["net_unit_price"].max()) if len(daily) else np.nan,
+            "price_net_min": float(_price_net_public.min()) if len(daily) else np.nan,
+            "price_net_avg": float(_price_net_public.mean()) if len(daily) else np.nan,
+            "price_net_max": float(_price_net_public.max()) if len(daily) else np.nan,
             "promo_days": int((daily["promotion"] > 0).sum()) if "promotion" in daily else 0,
             "promo_share": float((daily["promotion"] > 0).mean()) if "promotion" in daily and len(daily) else 0.0,
             "avg_freight": float(daily["freight_value"].mean()) if len(daily) else 0.0,
@@ -803,6 +925,18 @@ def predict_catboost_full_factor_projection(
             "applied_price_net": max(0.01, applied_price_gross * (1.0 - scenario_discount)),
             "price_out_of_range": price_out_of_range,
             "price_clipped": price_clipped,
+            "model_price_gross": float(model_price),
+            "model_price_net": float(max(0.01, model_price * (1.0 - scenario_discount))),
+            "price_for_model": float(model_price),
+            "extrapolation_applied": bool(extrapolation_applied),
+            "model_boundary_price_gross": float(model_price) if extrapolation_applied else np.nan,
+            "extrapolation_from_price_gross": float(model_price) if extrapolation_applied else np.nan,
+            "extrapolation_to_price_gross": float(requested_price) if extrapolation_applied else np.nan,
+            "extrapolation_price_ratio": (float(requested_price / model_price) if extrapolation_applied and model_price > 0 else 1.0),
+            "elasticity_used": (float(np.nanmean(daily["elasticity_used"])) if extrapolation_applied and "elasticity_used" in daily else np.nan),
+            "elasticity_source": (str(daily["elasticity_source"].dropna().mode().iloc[0]) if extrapolation_applied and "elasticity_source" in daily and not daily["elasticity_source"].dropna().empty else ""),
+            "extrapolation_tail_multiplier": (float(np.nanmean(daily["extrapolation_tail_multiplier"])) if extrapolation_applied and "extrapolation_tail_multiplier" in daily else 1.0),
+            "scenario_price_effect_source": ("catboost_boundary_plus_elasticity_extrapolation" if extrapolation_applied else "catboost_full_factor_reprediction"),
             "promotion": scenario_promo,
             "freight_value": scenario_freight,
             "clip_reason": clip_reason,

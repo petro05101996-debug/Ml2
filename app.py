@@ -134,7 +134,7 @@ SCENARIO_CALC_MODES = {
 }
 DEFAULT_SCENARIO_CALC_MODE = "enhanced_local_factors"
 PRICE_GUARDRAIL_SAFE_CLIP = "safe_clip"
-PRICE_GUARDRAIL_EXACT_MANUAL = "exact_manual"
+PRICE_GUARDRAIL_EXTRAPOLATE = "economic_extrapolation"
 DEFAULT_PRICE_GUARDRAIL_MODE = PRICE_GUARDRAIL_SAFE_CLIP
 
 
@@ -142,8 +142,10 @@ def normalize_price_guardrail_mode(value: Any) -> str:
     value = str(value or "").strip().lower()
     if value in {PRICE_GUARDRAIL_SAFE_CLIP, "safe", "clip", "защитный"}:
         return PRICE_GUARDRAIL_SAFE_CLIP
-    if value in {PRICE_GUARDRAIL_EXACT_MANUAL, "exact", "manual", "strict", "строгий"}:
-        return PRICE_GUARDRAIL_EXACT_MANUAL
+    if value in {
+        PRICE_GUARDRAIL_EXTRAPOLATE, "extrapolate", "extrapolation", "manual", "exact", "strict", "exact_manual", "строгий", "экстраполяция"
+    }:
+        return PRICE_GUARDRAIL_EXTRAPOLATE
     return DEFAULT_PRICE_GUARDRAIL_MODE
 
 
@@ -170,8 +172,17 @@ def effect_source_label(effect_source: str) -> str:
         "scenario_engine_recompute_from_baseline": "Legacy scenario effects from baseline recompute",
         "baseline_daily_x_local_factor_layer": "Local factor layer over daily baseline",
         "catboost_full_factor_reprediction": "CatBoost повторно прогнозирует спрос по изменённым факторам",
+        "catboost_boundary_plus_elasticity_extrapolation": "CatBoost до безопасной границы + контролируемая ценовая эластичность за пределами диапазона",
     }
     return mapping.get(str(effect_source), str(effect_source))
+
+
+def safe_float_or_nan(value: Any) -> float:
+    try:
+        out = float(value)
+        return out if np.isfinite(out) else np.nan
+    except Exception:
+        return np.nan
 
 
 def resolve_scenario_calc_mode(mode: Optional[str]) -> str:
@@ -4295,6 +4306,23 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         scenario["profit"] = 0.0
     if "cost" not in scenario.columns:
         scenario["cost"] = np.nan
+    scenario_price_gross_export = (
+        scenario["scenario_price_gross"]
+        if "scenario_price_gross" in scenario.columns
+        else scenario["applied_price_gross"]
+        if "applied_price_gross" in scenario.columns
+        else scenario["price"]
+    )
+    scenario_price_net_export = (
+        scenario["scenario_price_net"]
+        if "scenario_price_net" in scenario.columns
+        else scenario["applied_price_net"]
+        if "applied_price_net" in scenario.columns
+        else scenario["net_unit_price"]
+    )
+    scenario = scenario.copy()
+    scenario["scenario_price_gross_export"] = pd.to_numeric(scenario_price_gross_export, errors="coerce")
+    scenario["scenario_price_net_export"] = pd.to_numeric(scenario_price_net_export, errors="coerce")
     merged = (
         as_is[["date", "actual_sales", "revenue", "profit"]]
         .rename(columns={"actual_sales": "as_is_demand", "revenue": "as_is_revenue", "profit": "as_is_profit"})
@@ -4305,9 +4333,9 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
                     "actual_sales",
                     "revenue",
                     "profit",
-                    "price",
+                    "scenario_price_gross_export",
                     "discount",
-                    "net_unit_price",
+                    "scenario_price_net_export",
                     "promotion",
                     "freight_value",
                     "cost",
@@ -4318,9 +4346,9 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
                     "actual_sales": "scenario_demand",
                     "revenue": "scenario_revenue",
                     "profit": "scenario_profit",
-                    "price": "scenario_price_gross",
+                    "scenario_price_gross_export": "scenario_price_gross",
                     "discount": "scenario_discount",
-                    "net_unit_price": "scenario_price_net",
+                    "scenario_price_net_export": "scenario_price_net",
                     "promotion": "scenario_promotion",
                     "freight_value": "scenario_freight_value",
                     "cost": "scenario_cost",
@@ -4369,8 +4397,26 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "guardrail_warning_type",
         "effect_breakdown_available",
         "effect_breakdown_note",
+        "model_price_gross",
+        "model_price_net",
+        "price_for_model",
+        "extrapolation_applied",
+        "model_boundary_price_gross",
+        "extrapolation_from_price_gross",
+        "extrapolation_to_price_gross",
+        "extrapolation_price_ratio",
+        "boundary_model_demand",
+        "elasticity_used",
+        "elasticity_source",
+        "extrapolation_tail_multiplier",
+        "scenario_price_effect_source",
+        "clip_applied",
     ]:
         merged[col] = scenario[col].values if col in scenario.columns else np.nan
+    merged["extrapolation_applied"] = merged["extrapolation_applied"].fillna(False).astype(bool)
+    merged["clip_applied"] = merged["clip_applied"].fillna(False).astype(bool)
+    merged["extrapolation_tail_multiplier"] = pd.to_numeric(merged["extrapolation_tail_multiplier"], errors="coerce").fillna(1.0)
+    merged["scenario_price_effect_source"] = merged["scenario_price_effect_source"].fillna("catboost_full_factor_reprediction")
     manual_daily = merged[
         [
             "date",
@@ -4414,6 +4460,20 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
             "guardrail_warning_type",
             "effect_breakdown_available",
             "effect_breakdown_note",
+            "model_price_gross",
+            "model_price_net",
+            "price_for_model",
+            "extrapolation_applied",
+            "model_boundary_price_gross",
+            "extrapolation_from_price_gross",
+            "extrapolation_to_price_gross",
+            "extrapolation_price_ratio",
+            "boundary_model_demand",
+            "elasticity_used",
+            "elasticity_source",
+            "extrapolation_tail_multiplier",
+            "scenario_price_effect_source",
+            "clip_applied",
         ]
     ].copy()
     scenario_cost_ratio = pd.to_numeric(manual_daily.get("scenario_cost", np.nan), errors="coerce") / pd.to_numeric(
@@ -4492,6 +4552,16 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "price_clipped": bool((what_if_result.get("effective_scenario", {}) or {}).get("price_clipped", what_if_result.get("price_clipped", False))),
         "guardrail_warning_type": str((what_if_result.get("effective_scenario", {}) or {}).get("guardrail_warning_type", what_if_result.get("guardrail_warning_type", ""))),
         "scenario_price_effect_source": str(what_if_result.get("scenario_price_effect_source", "")),
+        "extrapolation_applied": bool(what_if_result.get("extrapolation_applied", False)),
+        "model_price_gross": float(what_if_result.get("model_price", what_if_result.get("price_for_model", np.nan))),
+        "price_for_model": float(what_if_result.get("price_for_model", np.nan)),
+        "model_boundary_price_gross": float(what_if_result.get("model_boundary_price_gross", np.nan)),
+        "extrapolation_from_price_gross": float(what_if_result.get("extrapolation_from_price_gross", np.nan)),
+        "extrapolation_to_price_gross": float(what_if_result.get("extrapolation_to_price_gross", np.nan)),
+        "extrapolation_price_ratio": float(what_if_result.get("extrapolation_price_ratio", 1.0)),
+        "elasticity_used": float(what_if_result.get("elasticity_used", np.nan)),
+        "elasticity_source": str(what_if_result.get("elasticity_source", "")),
+        "extrapolation_tail_multiplier": float(what_if_result.get("extrapolation_tail_multiplier", 1.0)),
         "ood_flag": bool(what_if_result.get("ood_flag", False)),
         "horizon_days": int(len(scenario)),
         "scenario_demand_total": float(manual_daily["scenario_demand"].sum()),
@@ -6170,8 +6240,13 @@ def render_applied_scenario_block(snapshot: Optional[Dict[str, Any]]) -> None:
     is_cb_full = str(snapshot.get("scenario_calc_mode", "")) == CATBOOST_FULL_FACTOR_MODE
     if is_cb_full:
         c1.metric("Введённая цена", fmt_price(snapshot.get("requested_price_gross", snapshot.get("manual_price_requested", np.nan))))
-        c1.metric("Безопасная цена модели", fmt_price(snapshot.get("safe_price_gross", np.nan)))
-        c1.metric("Фактически применена в расчёте", fmt_price(snapshot.get("manual_price_applied", np.nan)))
+        c1.metric("Safe boundary", fmt_price(snapshot.get("safe_price_gross", np.nan)))
+        c1.metric("Цена для CatBoost", fmt_price(snapshot.get("price_for_model", snapshot.get("model_price_gross", np.nan))))
+        c1.metric("Цена для финансового расчёта", fmt_price(snapshot.get("applied_price_gross", snapshot.get("manual_price_applied", np.nan))))
+        elasticity_val = safe_float_or_nan(snapshot.get("elasticity_used", np.nan))
+        tail_val = safe_float_or_nan(snapshot.get("extrapolation_tail_multiplier", 1.0))
+        c2.metric("Эластичность", f"{elasticity_val:.2f}" if np.isfinite(elasticity_val) else "n/a")
+        c2.metric("Хвостовой множитель спроса", f"{tail_val:.3f}" if np.isfinite(tail_val) else "n/a")
     else:
         c1.metric("Новая цена до скидки", fmt_price(snapshot.get("manual_price_applied", np.nan)))
     c1.metric("Скидка", fmt_pct_abs(float(snapshot.get("discount_applied", 0.0)) * 100.0))
@@ -6183,14 +6258,14 @@ def render_applied_scenario_block(snapshot: Optional[Dict[str, Any]]) -> None:
     if is_cb_full:
         mode_code = str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE))
         mode_label = {
-            PRICE_GUARDRAIL_SAFE_CLIP: "Защитный режим",
-            PRICE_GUARDRAIL_EXACT_MANUAL: "Строгий what-if",
+            PRICE_GUARDRAIL_SAFE_CLIP: "Защитный: не выходить за безопасные границы",
+            PRICE_GUARDRAIL_EXTRAPOLATE: "Экстраполяция вне границ",
         }.get(mode_code, mode_code)
         c2.metric("Режим проверки цены", mode_label)
     if is_cb_full and str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_SAFE_CLIP and bool(snapshot.get("price_clipped", False)):
-        st.warning("Защитный режим: расчёт выполнен по безопасной цене, а не по введённой.")
-    if is_cb_full and str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_EXACT_MANUAL and bool(snapshot.get("price_out_of_range", False)):
-        st.error("Строгий what-if: расчёт выполнен по введённой цене, но прогноз рискованный (экстраполяция вне истории).")
+        st.warning("Цена была вне безопасного диапазона. В защитном режиме расчёт выполнен по безопасной границе.")
+    if is_cb_full and str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_EXTRAPOLATE and bool(snapshot.get("price_out_of_range", False)):
+        st.warning("Цена вне безопасного диапазона. Введённая цена сохранена для финансового расчёта, CatBoost рассчитал спрос только до безопасной границы, а участок дальше рассчитан через ценовую эластичность.")
     close_surface()
 
 
@@ -7184,13 +7259,13 @@ if __name__ == "__main__":
             if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
                 st.radio(
                     "Режим проверки цены",
-                    options=[PRICE_GUARDRAIL_SAFE_CLIP, PRICE_GUARDRAIL_EXACT_MANUAL],
+                    options=[PRICE_GUARDRAIL_SAFE_CLIP, PRICE_GUARDRAIL_EXTRAPOLATE],
                     format_func=lambda x: {
-                        PRICE_GUARDRAIL_SAFE_CLIP: "Защитный: ограничивать цену безопасным диапазоном модели",
-                        PRICE_GUARDRAIL_EXACT_MANUAL: "Строгий what-if: считать строго по введённой цене",
+                        PRICE_GUARDRAIL_SAFE_CLIP: "Защитный: не выходить за безопасные границы",
+                        PRICE_GUARDRAIL_EXTRAPOLATE: "Экстраполяция: сохранить мою цену и рассчитать хвост через эластичность",
                     }[x],
                     index=0 if normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_SAFE_CLIP else 1,
-                    help="Защитный режим ограничивает цену диапазоном истории. Строгий what-if считает введённую цену и снижает доверие при выходе за диапазон.",
+                    help="Защитный режим — если значение вне безопасной зоны, система применит ближайшую безопасную границу. Экстраполяция — введённая цена сохраняется для расчёта выручки и прибыли, но спрос за пределами безопасной зоны считается через контролируемую ценовую эластичность.",
                     key="price_guardrail_mode",
                 )
             else:
