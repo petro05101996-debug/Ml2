@@ -16,6 +16,17 @@ except Exception:
 
 
 CATBOOST_FULL_FACTOR_MODE = "catboost_full_factors"
+PRICE_GUARDRAIL_SAFE_CLIP = "safe_clip"
+PRICE_GUARDRAIL_EXACT_MANUAL = "exact_manual"
+
+
+def normalize_price_guardrail_mode(value: Any) -> str:
+    value = str(value or "").strip().lower()
+    if value in {PRICE_GUARDRAIL_SAFE_CLIP, "safe", "clip", "защитный"}:
+        return PRICE_GUARDRAIL_SAFE_CLIP
+    if value in {PRICE_GUARDRAIL_EXACT_MANUAL, "exact", "manual", "strict", "строгий"}:
+        return PRICE_GUARDRAIL_EXACT_MANUAL
+    return PRICE_GUARDRAIL_SAFE_CLIP
 
 
 CORE_FACTOR_COLUMNS = [
@@ -453,7 +464,9 @@ def predict_catboost_full_factor_projection(
     stock_cap: float = 0.0,
     overrides: Optional[Dict[str, Any]] = None,
     factor_overrides: Optional[Dict[str, Any]] = None,
+    price_guardrail_mode: str = PRICE_GUARDRAIL_SAFE_CLIP,
 ) -> Dict[str, Any]:
+    price_guardrail_mode = normalize_price_guardrail_mode(price_guardrail_mode)
     scenario_overrides = dict(overrides or {})
     scenario_overrides.update(dict(factor_overrides or {}))
     full_bundle = trained_bundle.get("catboost_full_factor_bundle", {})
@@ -481,8 +494,20 @@ def predict_catboost_full_factor_projection(
     train_max = float(train_prices.max()) if len(train_prices) else requested_price
     price_lo = max(0.01, train_min * 0.90)
     price_hi = max(price_lo, train_max * 1.10)
-    model_price = float(np.clip(requested_price, price_lo, price_hi))
-    price_clipped = bool(abs(model_price - requested_price) > 1e-9)
+    safe_price = float(np.clip(requested_price, price_lo, price_hi))
+    price_out_of_range = bool(abs(safe_price - requested_price) > 1e-9)
+    if price_guardrail_mode == PRICE_GUARDRAIL_SAFE_CLIP:
+        model_price = safe_price
+        applied_price_gross = safe_price
+        price_clipped = bool(price_out_of_range)
+        clip_reason = "catboost_full_factor_price_guardrail" if price_clipped else ""
+        guardrail_warning_type = "clipped" if price_clipped else ""
+    else:
+        model_price = requested_price
+        applied_price_gross = requested_price
+        price_clipped = False
+        clip_reason = ""
+        guardrail_warning_type = "exact_manual_out_of_range" if price_out_of_range else ""
 
     base_discount = float(current_ctx.get("discount", history["discount"].dropna().iloc[-1] if len(history) else 0.0))
     scenario_discount = float(scenario_overrides.get("discount", base_discount * float(discount_multiplier)))
@@ -540,9 +565,9 @@ def predict_catboost_full_factor_projection(
         rec = {
             "date": dt,
             "sales": 0.0,
-            "price": model_price,
+            "price": applied_price_gross,
             "discount": scenario_discount,
-            "net_unit_price": max(0.01, model_price * (1.0 - scenario_discount)),
+            "net_unit_price": max(0.01, applied_price_gross * (1.0 - scenario_discount)),
             "freight_value": scenario_freight,
             "cost": scenario_cost,
             "promotion": scenario_promo,
@@ -583,6 +608,30 @@ def predict_catboost_full_factor_projection(
         rec["gross_revenue"] = pred_sales * rec["price"]
         rec["profit"] = rec["revenue"] - pred_sales * rec["cost"] - pred_sales * rec["freight_value"]
         rec["margin"] = rec["profit"] / rec["revenue"] if rec["revenue"] > 0 else 0.0
+        rec["price_guardrail_mode"] = price_guardrail_mode
+        rec["requested_price_gross"] = requested_price
+        rec["safe_price_gross"] = safe_price
+        rec["applied_price_gross"] = applied_price_gross
+        rec["scenario_price_gross"] = applied_price_gross
+        rec["scenario_price_net"] = max(0.01, applied_price_gross * (1.0 - scenario_discount))
+        rec["scenario_discount"] = scenario_discount
+        rec["price_out_of_range"] = bool(price_out_of_range)
+        rec["price_clipped"] = bool(price_clipped)
+        rec["clip_reason"] = clip_reason
+        rec["guardrail_warning_type"] = guardrail_warning_type
+        rec["applied_price_net"] = max(0.01, applied_price_gross * (1.0 - scenario_discount))
+        rec["shock_multiplier"] = float(demand_multiplier)
+        rec["shock_units"] = 0.0
+        rec["price_effect"] = np.nan
+        rec["promo_effect"] = np.nan
+        rec["freight_effect"] = np.nan
+        rec["standard_multiplier"] = np.nan
+        rec["effect_breakdown_available"] = False
+        rec["effect_source"] = "catboost_full_factor_reprediction"
+        rec["effect_breakdown_note"] = (
+            "CatBoost full factor mode: price/promo/freight/factors are applied inside model reprediction; "
+            "separate legacy multipliers are not available."
+        )
 
         rows.append(rec)
         work_history = pd.concat([work_history, pd.DataFrame([rec])], ignore_index=True)
@@ -597,8 +646,10 @@ def predict_catboost_full_factor_projection(
     support_label = "medium"
     warnings = list(full_bundle.get("warnings", []))
     warnings.extend(guardrail_warnings)
-    if price_clipped:
-        warnings.append("Цена была ограничена guardrails CatBoost full factor mode.")
+    if price_guardrail_mode == PRICE_GUARDRAIL_SAFE_CLIP and price_clipped:
+        warnings.append(f"Введённая цена вне безопасного диапазона модели. Расчёт выполнен по безопасной цене {applied_price_gross:.2f}, а не по введённой цене {requested_price:.2f}.")
+    if price_guardrail_mode == PRICE_GUARDRAIL_EXACT_MANUAL and price_out_of_range:
+        warnings.append(f"Цена {requested_price:.2f} вне исторического диапазона модели. Расчёт выполнен строго по введённой цене, но прогноз является рискованной экстраполяцией.")
     metrics = full_bundle.get("holdout_metrics", {})
     wape = metrics.get("wape", np.nan)
     if np.isfinite(wape) and float(wape) > 40.0:
@@ -608,6 +659,11 @@ def predict_catboost_full_factor_projection(
     if ood_count >= 3:
         support_label = "low"
         confidence *= 0.7
+    reliability_verdict = ""
+    if price_guardrail_mode == PRICE_GUARDRAIL_EXACT_MANUAL and price_out_of_range:
+        confidence = min(float(confidence), 0.45)
+        support_label = "low"
+        reliability_verdict = "Рискованная экстраполяция"
 
     return {
         "daily": daily,
@@ -624,14 +680,20 @@ def predict_catboost_full_factor_projection(
         "confidence_scenario": confidence,
         "confidence_label": "medium" if confidence >= 0.5 else "low",
         "uncertainty": 1.0 - confidence,
-        "ood_flag": bool(price_clipped),
+        "ood_flag": bool(price_clipped or (price_guardrail_mode == PRICE_GUARDRAIL_EXACT_MANUAL and price_out_of_range)),
+        "price_guardrail_mode": price_guardrail_mode,
         "requested_price": requested_price,
         "model_price": model_price,
+        "applied_price_gross": applied_price_gross,
+        "applied_price_net": max(0.01, applied_price_gross * (1.0 - scenario_discount)),
+        "safe_price_gross": safe_price,
+        "price_out_of_range": price_out_of_range,
         "price_for_model": model_price,
         "current_price_raw": base_price,
         "price_clipped": price_clipped,
         "clip_applied": price_clipped,
-        "clip_reason": "catboost_full_factor_price_guardrail" if price_clipped else "",
+        "clip_reason": clip_reason,
+        "guardrail_warning_type": guardrail_warning_type,
         "net_price_supported": True,
         "net_price_support": {},
         "scenario_price_effect_source": "catboost_full_factor_reprediction",
@@ -665,6 +727,27 @@ def predict_catboost_full_factor_projection(
             "model_reprediction": True,
             "manual_shock_multiplier": float(demand_multiplier),
             "price_clipped": price_clipped,
+            "shock_multiplier_mean": float(demand_multiplier),
+            "effect_breakdown_available": False,
+            "effect_source": "catboost_full_factor_reprediction",
+            "price_guardrail_mode": price_guardrail_mode,
+            "price_out_of_range": bool(price_out_of_range),
+        },
+        "effect_breakdown": {
+            "available": False,
+            "effect_source": "catboost_full_factor_reprediction",
+            "reason": (
+                "CatBoost full factor mode does not expose separate price/promo/freight multipliers. "
+                "The scenario is computed by re-predicting demand from the changed feature vector."
+            ),
+            "manual_shock_multiplier": float(demand_multiplier),
+            "price_guardrail_mode": price_guardrail_mode,
+            "requested_price": float(requested_price),
+            "safe_price": float(safe_price),
+            "applied_price_gross": float(applied_price_gross),
+            "applied_price_net": float(max(0.01, applied_price_gross * (1.0 - scenario_discount))),
+            "price_out_of_range": bool(price_out_of_range),
+            "price_clipped": bool(price_clipped),
         },
         "scenario_inputs_contract": {
             "base_price": base_price,
@@ -678,6 +761,12 @@ def predict_catboost_full_factor_projection(
             "base_discount": base_discount,
             "scenario_discount": scenario_discount,
             "shock_multiplier": float(demand_multiplier),
+            "price_guardrail_mode": price_guardrail_mode,
+            "safe_price": safe_price,
+            "applied_price_gross": applied_price_gross,
+            "applied_price_net": max(0.01, applied_price_gross * (1.0 - scenario_discount)),
+            "price_out_of_range": price_out_of_range,
+            "price_clipped": price_clipped,
         },
         "scenario_calc_mode": CATBOOST_FULL_FACTOR_MODE,
         "scenario_calc_mode_label": "CatBoost full factors: модельный what-if по факторам",
@@ -689,6 +778,7 @@ def predict_catboost_full_factor_projection(
             "support_label": support_label,
             "warnings": warnings,
         },
+        "reliability_verdict": reliability_verdict,
         "legacy_or_enhanced_label": "catboost_full_factors",
         "applied_path_summary": {
             "mode": "CatBoost full factors: модельный what-if по факторам",
@@ -706,12 +796,17 @@ def predict_catboost_full_factor_projection(
         },
         "effective_scenario": {
             "requested_price_gross": requested_price,
-            "applied_price_gross": model_price,
+            "safe_price_gross": safe_price,
+            "price_guardrail_mode": price_guardrail_mode,
+            "applied_price_gross": applied_price_gross,
             "applied_discount": scenario_discount,
-            "applied_price_net": max(0.01, model_price * (1.0 - scenario_discount)),
+            "applied_price_net": max(0.01, applied_price_gross * (1.0 - scenario_discount)),
+            "price_out_of_range": price_out_of_range,
+            "price_clipped": price_clipped,
             "promotion": scenario_promo,
             "freight_value": scenario_freight,
-            "clip_reason": "catboost_full_factor_price_guardrail" if price_clipped else "",
+            "clip_reason": clip_reason,
+            "guardrail_warning_type": guardrail_warning_type,
         },
         "confidence_factors": {},
         "warnings": warnings,

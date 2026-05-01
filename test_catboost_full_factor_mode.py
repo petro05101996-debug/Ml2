@@ -2,6 +2,7 @@ import json
 
 import pandas as pd
 import numpy as np
+import pytest
 
 
 def _build_synthetic_txn(n: int = 140) -> pd.DataFrame:
@@ -399,3 +400,59 @@ def test_catboost_holdout_metrics_are_recursive_mode():
     assert bundle["holdout_metrics"]["mode"] == "recursive_daily_holdout"
     hp = bundle["holdout_predictions"]
     assert {"date", "actual_sales", "predicted_sales", "abs_error", "ape"}.issubset(set(hp.columns))
+
+
+def test_catboost_guardrail_modes_safe_clip_vs_exact_manual():
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+
+    n = 100
+    daily = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=n),
+            "sales": [20 + (i % 5) for i in range(n)],
+            "price": [18.0 + (i % 2) for i in range(n)],
+            "discount": [0.0] * n,
+            "net_unit_price": [18.0 + (i % 2) for i in range(n)],
+            "freight_value": [4.0] * n,
+            "cost": [11.0] * n,
+            "promotion": [0.0] * n,
+            "review_score": [4.6] * n,
+            "reviews_count": [10.0] * n,
+            "stock": [999.0] * n,
+        }
+    )
+    future = pd.DataFrame({"date": pd.date_range("2024-05-01", periods=10)})
+    cb = train_catboost_full_factor_bundle(daily, future, min_train_days=60)
+    bundle = {"daily_base": daily, "future_dates": future, "base_ctx": {"price": 19.0, "discount": 0.0}, "catboost_full_factor_bundle": cb}
+    wr_safe = predict_catboost_full_factor_projection(bundle, manual_price=35.0, horizon_days=5, price_guardrail_mode="safe_clip")
+    wr_exact = predict_catboost_full_factor_projection(bundle, manual_price=35.0, horizon_days=5, price_guardrail_mode="exact_manual")
+    assert wr_safe["price_guardrail_mode"] == "safe_clip"
+    assert wr_safe["price_clipped"] is True
+    assert wr_safe["applied_price_gross"] < 35.0
+    assert wr_exact["price_guardrail_mode"] == "exact_manual"
+    assert wr_exact["applied_price_gross"] == pytest.approx(35.0)
+    assert wr_exact["price_clipped"] is False
+    assert wr_exact["price_out_of_range"] is True
+    assert wr_safe["revenue_total"] != pytest.approx(wr_exact["revenue_total"])
+
+
+def test_default_price_guardrail_mode_is_safe_clip():
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+
+    n = 90
+    daily = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n), "sales": [10 + i % 3 for i in range(n)], "price": [20.0] * n, "discount": [0.0] * n, "net_unit_price": [20.0] * n, "freight_value": [2.0] * n, "cost": [12.0] * n, "promotion": [0.0] * n, "review_score": [4.5] * n, "reviews_count": [1.0] * n, "stock": [999.0] * n})
+    future = pd.DataFrame({"date": pd.date_range("2024-05-01", periods=3)})
+    cb = train_catboost_full_factor_bundle(daily, future, min_train_days=60)
+    wr = predict_catboost_full_factor_projection({"daily_base": daily, "future_dates": future, "base_ctx": {"price": 20.0}, "catboost_full_factor_bundle": cb}, manual_price=35.0, horizon_days=2)
+    assert wr["price_guardrail_mode"] == "safe_clip"
+
+
+def test_catboost_daily_preserves_shock_multiplier():
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle, predict_catboost_full_factor_projection
+
+    n = 90
+    daily = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n), "sales": [10 + i % 3 for i in range(n)], "price": [20.0] * n, "discount": [0.0] * n, "net_unit_price": [20.0] * n, "freight_value": [2.0] * n, "cost": [12.0] * n, "promotion": [0.0] * n, "review_score": [4.5] * n, "reviews_count": [1.0] * n, "stock": [999.0] * n})
+    future = pd.DataFrame({"date": pd.date_range("2024-05-01", periods=3)})
+    cb = train_catboost_full_factor_bundle(daily, future, min_train_days=60)
+    wr = predict_catboost_full_factor_projection({"daily_base": daily, "future_dates": future, "base_ctx": {"price": 20.0}, "catboost_full_factor_bundle": cb}, manual_price=20.0, horizon_days=2, demand_multiplier=0.87)
+    assert wr["daily"]["shock_multiplier"].iloc[0] == pytest.approx(0.87)

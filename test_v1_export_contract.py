@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from app import build_excel_export_buffer, run_full_pricing_analysis_universal, run_what_if_projection
 
@@ -208,3 +209,44 @@ def test_excel_contains_catboost_and_override_alias_sheets():
         assert "D_catboost_feature_importance" in xls.sheet_names
         assert "D_catboost_holdout" in xls.sheet_names
         assert "D_what_if_applied_overrides" in xls.sheet_names
+
+
+def test_manual_export_contains_guardrail_fields():
+    import json
+    import app
+
+    txn = _make_txn()
+    res = app.run_full_pricing_analysis_universal(txn, "cat-contract", "sku-contract", scenario_calc_mode="catboost_full_factors")
+    bundle = res["_trained_bundle"]
+    wr = app.run_what_if_projection(bundle, manual_price=35.0, scenario_calc_mode="catboost_full_factors", price_guardrail_mode="exact_manual", demand_multiplier=0.87)
+    summary_blob, daily_blob = app.build_manual_scenario_artifacts(res, wr)
+    summary = json.loads(summary_blob.decode("utf-8"))
+    daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
+    assert summary["price_guardrail_mode"] == "exact_manual"
+    assert summary["requested_price_gross"] == pytest.approx(35.0)
+    assert summary["applied_price_gross"] == pytest.approx(35.0)
+    assert summary["price_out_of_range"] is True
+    assert summary["price_clipped"] is False
+    assert daily["price_guardrail_mode"].iloc[0] == "exact_manual"
+    assert daily["requested_price_gross"].iloc[0] == pytest.approx(35.0)
+    assert daily["applied_price_gross"].iloc[0] == pytest.approx(35.0)
+    assert daily["shock_multiplier"].mean() == pytest.approx(0.87)
+
+
+def test_manual_export_safe_clip_applies_safe_price():
+    import json
+    import app
+
+    txn = _make_txn()
+    res = app.run_full_pricing_analysis_universal(txn, "cat-contract", "sku-contract", scenario_calc_mode="catboost_full_factors")
+    bundle = res["_trained_bundle"]
+    wr = app.run_what_if_projection(bundle, manual_price=35.0, scenario_calc_mode="catboost_full_factors", price_guardrail_mode="safe_clip", demand_multiplier=0.87)
+    summary_blob, daily_blob = app.build_manual_scenario_artifacts(res, wr)
+    summary = json.loads(summary_blob.decode("utf-8"))
+    daily = pd.read_csv(pd.io.common.BytesIO(daily_blob))
+    assert summary["price_guardrail_mode"] == "safe_clip"
+    assert summary["requested_price_gross"] == pytest.approx(35.0)
+    assert summary["safe_price_gross"] != pytest.approx(35.0)
+    assert summary["applied_price_gross"] == pytest.approx(summary["safe_price_gross"])
+    assert summary["price_clipped"] is True
+    assert daily["applied_price_gross"].iloc[0] == pytest.approx(daily["safe_price_gross"].iloc[0])
