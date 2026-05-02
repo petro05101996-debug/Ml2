@@ -68,6 +68,7 @@ def build_sensitivity_grid(
     runner: Callable[..., Dict[str, Any]],
     price_steps: int = 9,
     demand_steps: int = 9,
+    horizon_days: int = 30,
     runner_kwargs: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     price_grid = np.linspace(base_price * 0.85, base_price * 1.15, price_steps)
@@ -75,7 +76,7 @@ def build_sensitivity_grid(
     rows: List[Dict[str, Any]] = []
     for p in price_grid:
         for d in demand_grid:
-            r = runner(trained_bundle, manual_price=float(p), horizon_days=30, demand_multiplier=float(d), **(runner_kwargs or {}))
+            r = runner(trained_bundle, manual_price=float(p), horizon_days=int(horizon_days), demand_multiplier=float(d), **(runner_kwargs or {}))
             rows.append({
                 "price": p,
                 "demand_multiplier": d,

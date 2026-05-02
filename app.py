@@ -2154,6 +2154,7 @@ def run_full_pricing_analysis_universal(
     channel: Optional[str] = None,
     segment: Optional[str] = None,
     scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
+    horizon_days: int = CONFIG["HORIZON_DAYS_DEFAULT"],
 ):
     analysis_scenario_calc_mode = resolve_scenario_calc_mode(scenario_calc_mode)
     if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
@@ -2164,6 +2165,7 @@ def run_full_pricing_analysis_universal(
             region=region,
             channel=channel,
             segment=segment,
+            horizon_days=int(horizon_days),
         )
     return _run_existing_legacy_enhanced_analysis_universal(
         normalized_txn=normalized_txn,
@@ -2173,6 +2175,7 @@ def run_full_pricing_analysis_universal(
         channel=channel,
         segment=segment,
         scenario_calc_mode=analysis_scenario_calc_mode,
+        horizon_days=int(horizon_days),
     )
 
 
@@ -2183,6 +2186,7 @@ def _run_catboost_full_factor_analysis_universal(
     region: Optional[str] = None,
     channel: Optional[str] = None,
     segment: Optional[str] = None,
+    horizon_days: int = CONFIG["HORIZON_DAYS_DEFAULT"],
 ) -> Dict[str, Any]:
     analysis_scenario_calc_mode = CATBOOST_FULL_FACTOR_MODE
     txn = normalized_txn.copy()
@@ -2199,7 +2203,7 @@ def _run_catboost_full_factor_analysis_universal(
     )
     daily_base = robust_clean_dirty_data(daily_base)
     daily_base = build_feature_matrix(daily_base).dropna(subset=["sales", "price"]).reset_index(drop=True)
-    future_dates = forecast_future_dates(pd.Timestamp(daily_base["date"].max()))
+    future_dates = forecast_future_dates(pd.Timestamp(daily_base["date"].max()), n_days=int(horizon_days))
     base_ctx = current_price_context(daily_base)
     base_ctx["category"] = target_category
     base_ctx["product_id"] = target_sku
@@ -2261,7 +2265,7 @@ def _run_catboost_full_factor_analysis_universal(
     as_is_sim = predict_catboost_full_factor_projection(
         provisional_bundle,
         manual_price=float(base_ctx.get("price")),
-        horizon_days=int(CONFIG["HORIZON_DAYS_DEFAULT"]),
+        horizon_days=int(horizon_days),
         overrides={
             "discount": float(base_ctx.get("discount", 0.0)),
             "promotion": float(base_ctx.get("promotion", 0.0)),
@@ -2272,7 +2276,7 @@ def _run_catboost_full_factor_analysis_universal(
     baseline_sim = predict_catboost_full_factor_projection(
         provisional_bundle,
         manual_price=baseline_price,
-        horizon_days=int(CONFIG["HORIZON_DAYS_DEFAULT"]),
+        horizon_days=int(horizon_days),
         overrides=neutral_overrides,
     )
     run_summary = {
@@ -2360,6 +2364,7 @@ def _run_existing_legacy_enhanced_analysis_universal(
     channel: Optional[str] = None,
     segment: Optional[str] = None,
     scenario_calc_mode: str = DEFAULT_SCENARIO_CALC_MODE,
+    horizon_days: int = CONFIG["HORIZON_DAYS_DEFAULT"],
 ):
     analysis_scenario_calc_mode = resolve_scenario_calc_mode(scenario_calc_mode)
     assert analysis_scenario_calc_mode in {"legacy_current", "enhanced_local_factors"}
@@ -2922,7 +2927,7 @@ def _run_existing_legacy_enhanced_analysis_universal(
     base_ctx["product_id"] = target_sku
     latest_row = dict(base_ctx)
     latest_row["requested_price"] = float(base_ctx.get("price", safe_median(daily_base["price"], 1.0)))
-    future_dates = forecast_future_dates(pd.Timestamp(daily_base["date"].max()))
+    future_dates = forecast_future_dates(pd.Timestamp(daily_base["date"].max()), n_days=int(horizon_days))
     catboost_full_factor_bundle = None
     baseline_price = float(safe_median(daily_base["price"], float(base_ctx.get("price", 1.0))))
     neutral_overrides = {"discount": 0.0, "promotion": 0.0, "freight_value": float(safe_median(daily_base.get("freight_value", pd.Series([0.0])), 0.0))}
@@ -6923,6 +6928,7 @@ if __name__ == "__main__":
                         ctx["target_category"],
                         ctx["target_sku"],
                         scenario_calc_mode=str(ctx.get("analysis_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+                        horizon_days=int(ctx.get("horizon_days", CONFIG["HORIZON_DAYS_DEFAULT"])),
                     )
                     st.session_state.results = copy.deepcopy(results)
                     st.session_state["what_if_calc_mode"] = str(results.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
@@ -6979,7 +6985,7 @@ if __name__ == "__main__":
         st.session_state["what_if_demand_mult"] = 1.0
         st.session_state["what_if_freight_change_pct"] = 0.0
         st.session_state["what_if_demand_shock_pct"] = 0.0
-        st.session_state["what_if_hdays"] = int(CONFIG["HORIZON_DAYS_DEFAULT"])
+        st.session_state["what_if_hdays"] = int(len(r.get("as_is_forecast", pd.DataFrame())) or CONFIG["HORIZON_DAYS_DEFAULT"])
         st.session_state["what_if_calc_mode"] = str(r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
         st.session_state["what_if_use_segments"] = False
         st.toast("Форма сброшена к базовым значениям", icon="⟲")
@@ -7089,7 +7095,7 @@ if __name__ == "__main__":
             float(np.clip(base_ctx.get("promotion", 0.0), 0.0, 1.0)),
             1.0,
             1.0,
-            int(CONFIG["HORIZON_DAYS_DEFAULT"]),
+            int(len(r.get("as_is_forecast", pd.DataFrame())) or CONFIG["HORIZON_DAYS_DEFAULT"]),
             DEFAULT_SCENARIO_CALC_MODE,
             DEFAULT_PRICE_GUARDRAIL_MODE,
         )
@@ -7184,7 +7190,7 @@ if __name__ == "__main__":
             st.session_state["what_if_demand_shock_pct"] = 0.0
             st.session_state["what_if_freight_mult"] = 1.0
             st.session_state["what_if_demand_mult"] = 1.0
-            st.session_state["what_if_hdays"] = int(CONFIG["HORIZON_DAYS_DEFAULT"])
+            st.session_state["what_if_hdays"] = int(len(r.get("as_is_forecast", pd.DataFrame())) or CONFIG["HORIZON_DAYS_DEFAULT"])
             st.session_state["what_if_use_segments"] = False
             if preset_clicked == "discount_5":
                 st.session_state["what_if_discount"] = 0.05
@@ -7730,6 +7736,7 @@ if __name__ == "__main__":
             r["_trained_bundle"],
             base_price=float(r["current_price"]),
             runner=run_what_if_projection,
+            horizon_days=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])),
             runner_kwargs={"scenario_calc_mode": st.session_state["what_if_calc_mode"]},
         ).head(5)
         fig_s = px.bar(sens, x="price", y="profit_adjusted", color_discrete_sequence=["#6F70FF"])
