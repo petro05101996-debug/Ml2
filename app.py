@@ -5893,7 +5893,7 @@ def render_scenario_preview(
         ("Статус изменений", "Есть неприменённые изменения" if scenario_changed else "Без новых изменений"),
     ]
     st.markdown('<div class="scenario-preview">', unsafe_allow_html=True)
-    st.markdown('<div class="scenario-card-title">Предпросмотр сценария</div>', unsafe_allow_html=True)
+    st.markdown('<div class="scenario-card-title">Черновик сценария</div>', unsafe_allow_html=True)
     for label, val in rows:
         st.markdown(
             f'<div class="preview-row"><div class="preview-label">{label}</div><div class="preview-value">{val}</div></div>',
@@ -6245,13 +6245,7 @@ def render_applied_scenario_block(snapshot: Optional[Dict[str, Any]]) -> None:
     is_cb_full = str(snapshot.get("scenario_calc_mode", "")) == CATBOOST_FULL_FACTOR_MODE
     if is_cb_full:
         c1.metric("Введённая цена", fmt_price(snapshot.get("requested_price_gross", snapshot.get("manual_price_requested", np.nan))))
-        c1.metric("Safe boundary", fmt_price(snapshot.get("safe_price_gross", np.nan)))
-        c1.metric("Цена для CatBoost", fmt_price(snapshot.get("price_for_model", snapshot.get("model_price_gross", np.nan))))
         c1.metric("Цена для финансового расчёта", fmt_price(snapshot.get("applied_price_gross", snapshot.get("manual_price_applied", np.nan))))
-        elasticity_val = safe_float_or_nan(snapshot.get("elasticity_used", np.nan))
-        tail_val = safe_float_or_nan(snapshot.get("extrapolation_tail_multiplier", 1.0))
-        c2.metric("Эластичность", f"{elasticity_val:.2f}" if np.isfinite(elasticity_val) else "n/a")
-        c2.metric("Хвостовой множитель спроса", f"{tail_val:.3f}" if np.isfinite(tail_val) else "n/a")
     else:
         c1.metric("Новая цена до скидки", fmt_price(snapshot.get("manual_price_applied", np.nan)))
     c1.metric("Скидка", fmt_pct_abs(float(snapshot.get("discount_applied", 0.0)) * 100.0))
@@ -6263,14 +6257,22 @@ def render_applied_scenario_block(snapshot: Optional[Dict[str, Any]]) -> None:
     if is_cb_full:
         mode_code = str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE))
         mode_label = {
-            PRICE_GUARDRAIL_SAFE_CLIP: "Защитный: не выходить за безопасные границы",
+            PRICE_GUARDRAIL_SAFE_CLIP: "Осторожно: считать по ближайшей безопасной цене",
             PRICE_GUARDRAIL_EXTRAPOLATE: "Экстраполяция вне границ",
         }.get(mode_code, mode_code)
-        c2.metric("Режим проверки цены", mode_label)
+        c2.metric("Что делать, если цена вне прошлой истории?", mode_label)
     if is_cb_full and str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_SAFE_CLIP and bool(snapshot.get("price_clipped", False)):
         st.warning("Цена была вне безопасного диапазона. В защитном режиме расчёт выполнен по безопасной границе.")
     if is_cb_full and str(snapshot.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_EXTRAPOLATE and bool(snapshot.get("price_out_of_range", False)):
         st.warning("Цена вне безопасного диапазона. Введённая цена сохранена для финансового расчёта, CatBoost рассчитал спрос только до безопасной границы, а участок дальше рассчитан через ценовую эластичность.")
+    if is_cb_full:
+        with st.expander("Технические детали сценария", expanded=False):
+            st.metric("Безопасная граница", fmt_price(snapshot.get("safe_price_gross", np.nan)))
+            st.metric("Цена для модели", fmt_price(snapshot.get("price_for_model", snapshot.get("model_price_gross", np.nan))))
+            elasticity_val = safe_float_or_nan(snapshot.get("elasticity_used", np.nan))
+            tail_val = safe_float_or_nan(snapshot.get("extrapolation_tail_multiplier", 1.0))
+            st.metric("Эластичность", f"{elasticity_val:.2f}" if np.isfinite(elasticity_val) else "n/a")
+            st.metric("Хвостовой множитель спроса", f"{tail_val:.3f}" if np.isfinite(tail_val) else "n/a")
     close_surface()
 
 
@@ -6446,24 +6448,27 @@ if __name__ == "__main__":
     if query_page == "landing":
         from ui.components import (
             render_landing_nav,
-            render_landing_hero_v2,
-            render_landing_proof_strip,
-            render_landing_controls_and_outputs,
+            render_landing_hero,
+            render_landing_decisions,
             render_landing_pipeline,
-            render_landing_trust_v2,
-            render_landing_cta_v2,
+            render_landing_outputs,
+            render_landing_data_requirements,
+            render_landing_limits,
+            render_landing_cta,
             render_landing_footer,
         )
 
         render_landing_nav()
-        hero_action = render_landing_hero_v2()
-        render_landing_proof_strip()
-        render_landing_controls_and_outputs()
+        nav_start_action = bool(st.session_state.get("landing_nav_start", False))
+        hero_action = render_landing_hero()
+        render_landing_decisions()
         render_landing_pipeline()
-        render_landing_trust_v2()
-        cta_action = render_landing_cta_v2()
+        render_landing_outputs()
+        render_landing_data_requirements()
+        render_landing_limits()
+        cta_action = render_landing_cta()
         render_landing_footer()
-        if hero_action == "app" or cta_action == "app" or st.button("Перейти в приложение", type="primary", use_container_width=True, key="to_app"):
+        if hero_action == "app" or cta_action == "app" or nav_start_action:
             _set_page("app", rerun=False)
             query_page = "app"
         else:
@@ -6873,7 +6878,7 @@ def render_upload_screen() -> dict[str, Any]:
                 skus = sorted(raw_for_select[raw_for_select[category_col].astype(str) == str(target_category)][sku_col].astype(str).dropna().unique())
                 target_sku = st.selectbox("SKU", skus, key="input_target_sku") if skus else None
         horizon_days = st.slider("Горизонт прогноза, дней", 7, 90, int(CONFIG["HORIZON_DAYS_DEFAULT"]), 1)
-        with st.expander("Дополнительно", expanded=False):
+        with st.expander("Дополнительные допущения", expanded=False):
             analysis_calc_mode = st.radio(
                 "Режим расчёта",
                 options=list(SCENARIO_CALC_MODES.keys()),
@@ -6996,8 +7001,8 @@ if __name__ == "__main__":
         st.toast("Активный сценарий отменён", icon="⊘")
         st.rerun()
     elif action_click == "compare":
-        st.session_state.active_workspace_tab = "What-if сценарий"
-        st.session_state["workspace_tab_radio"] = "What-if сценарий"
+        st.session_state.active_workspace_tab = "Сравнить варианты"
+        st.session_state["workspace_tab_radio"] = "Сравнить варианты"
         st.rerun()
     elif action_click == "export":
         st.session_state.active_workspace_tab = "Отчёт"
@@ -7005,16 +7010,18 @@ if __name__ == "__main__":
         st.rerun()
 
     TAB_ALIASES = {
-        "Дашборд": "Обзор",
-        "Сценарий": "What-if сценарий",
-        "Диагностика": "Проверка качества",
+        "Дашборд": "Итог",
+        "Обзор": "Итог",
+        "Сценарий": "Проверить цену и промо",
+        "What-if сценарий": "Проверить цену и промо",
+        "Диагностика": "Отчёт",
         "Отчет": "Отчёт",
     }
-    tabs = ["Обзор", "What-if сценарий", "Факторы", "Проверка качества", "Отчёт"]
-    current_tab = TAB_ALIASES.get(str(st.session_state.get("active_workspace_tab", "Обзор")), str(st.session_state.get("active_workspace_tab", "Обзор")))
+    tabs = ["Итог", "Проверить цену и промо", "Сравнить варианты", "Отчёт"]
+    current_tab = TAB_ALIASES.get(str(st.session_state.get("active_workspace_tab", "Итог")), str(st.session_state.get("active_workspace_tab", "Итог")))
     radio_tab = TAB_ALIASES.get(str(st.session_state.get("workspace_tab_radio", current_tab)), str(st.session_state.get("workspace_tab_radio", current_tab)))
     if current_tab not in tabs:
-        current_tab = "Обзор"
+        current_tab = "Итог"
     if radio_tab not in tabs:
         radio_tab = current_tab
     st.session_state.active_workspace_tab = current_tab
@@ -7031,64 +7038,72 @@ if __name__ == "__main__":
     sc_revenue = float(deltas["scenario_revenue"])
     sc_profit = float(deltas["scenario_profit"])
 
-    if active_tab == "Обзор":
+    if active_tab == "Итог":
         render_page_header("Итог по текущему плану", "Бизнес-сводка по базовому прогнозу и текущему сценарию.")
-        recommendation = "Эффект нейтральный"
-        tone = "warning"
-        if sc_profit > base_profit:
-            recommendation, tone = "Сценарий улучшает прибыль", "success"
-        elif sc_profit < base_profit:
-            recommendation, tone = "Сценарий снижает прибыль", "danger"
-        render_help_callout("Краткая оценка", recommendation, tone)
+        render_help_callout("Статус", "Базовый прогноз готов. Теперь можно проверить сценарий изменения цены, скидки или промо.", "info")
         base_margin = (base_profit / max(base_revenue, 1e-9)) * 100 if base_revenue else float("nan")
         sc_margin = (sc_profit / max(sc_revenue, 1e-9)) * 100 if sc_revenue else float("nan")
         render_kpi_strip([
-            {"label": "Спрос", "value": _fmt_units(sc_units), "delta": f"Δ {_fmt_units(sc_units-base_units)}", "base": f"База: {_fmt_units(base_units)}"},
-            {"label": "Выручка", "value": _fmt_money(sc_revenue), "delta": f"Δ {_fmt_money(sc_revenue-base_revenue)}", "base": f"База: {_fmt_money(base_revenue)}"},
-            {"label": "Прибыль", "value": _fmt_money(sc_profit), "delta": f"Δ {_fmt_money(sc_profit-base_profit)}", "base": f"База: {_fmt_money(base_profit)}"},
-            {"label": "Маржа", "value": fmt_pct_abs(sc_margin), "delta": fmt_pp_delta(sc_margin-base_margin), "base": f"База: {fmt_pct_abs(base_margin)}"},
+            {"label": "Спрос", "value": _fmt_units(base_units), "delta": "", "base": "Текущий план"},
+            {"label": "Выручка", "value": _fmt_money(base_revenue), "delta": "", "base": "Текущий план"},
+            {"label": "Прибыль", "value": _fmt_money(base_profit), "delta": "", "base": "Текущий план"},
+            {"label": "Маржа", "value": fmt_pct_abs(base_margin), "delta": "", "base": "Текущий план"},
         ])
+        if has_applied_scenario:
+            st.info("Есть рассчитанный сценарий. Посмотрите сравнение во вкладке «Сравнить варианты».")
+            delta_units = sc_units - base_units
+            delta_revenue = sc_revenue - base_revenue
+            delta_profit = sc_profit - base_profit
+            delta_profit_pct = safe_signed_pct(delta_profit, base_profit)
+            rel = str((st.session_state.what_if_result or {}).get("confidence_label", "н/д"))
+            recommendation = "Можно пилотировать" if delta_profit > 0 and "низ" not in rel.lower() else ("Требует проверки" if delta_profit > 0 else "Не рекомендуется")
+            open_surface("Кратко по сценарию")
+            st.markdown(f"**Прибыль:** {fmt_money_total(delta_profit)} ({fmt_signed_pct(delta_profit_pct) if np.isfinite(delta_profit_pct) else '—'})")
+            st.markdown(f"**Спрос:** {fmt_units(delta_units)}")
+            st.markdown(f"**Выручка:** {fmt_money_total(delta_revenue)}")
+            st.markdown(f"**Надёжность:** {rel}")
+            st.markdown(f"**Рекомендация:** {recommendation}")
+            if st.button("Открыть сравнение", key="open_compare_from_summary", use_container_width=True):
+                st.session_state.active_workspace_tab = "Сравнить варианты"
+                st.session_state["workspace_tab_radio"] = "Сравнить варианты"
+                st.rerun()
+            close_surface()
         fig_d = go.Figure()
         fig_d.add_trace(go.Scatter(x=current_forecast_for_compare["date"], y=current_forecast_for_compare["actual_sales"], name="База", line=dict(color="#9DCC84", width=2)))
-        fig_d.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["actual_sales"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
         fig_d.update_layout(**_plot_layout("Спрос"))
-        render_chart_card("Спрос", "Горизонт · шт", fig_d, [("База", f"{base_units:,.0f}"), ("Сценарий", f"{sc_units:,.0f}"), ("Δ", f"{sc_units-base_units:+,.0f}")])
+        render_chart_card("Спрос", "Горизонт · шт", fig_d, [("Базовый прогноз", f"{base_units:,.0f}")])
         _render_chart_legend_help("Спрос", "шт")
 
-        fig_r = go.Figure()
-        fig_r.add_trace(go.Scatter(x=current_forecast_for_compare["date"], y=current_forecast_for_compare["revenue"], name="База", line=dict(color="#9DCC84", width=2)))
-        fig_r.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["revenue"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
-        fig_r.update_layout(**_plot_layout("Выручка"))
-        render_chart_card("Выручка", "Горизонт · ₽", fig_r, [("База", f"₽ {base_revenue:,.0f}"), ("Сценарий", f"₽ {sc_revenue:,.0f}"), ("Δ", f"₽ {sc_revenue-base_revenue:+,.0f}")])
-        _render_chart_legend_help("Выручка", "₽")
+        st.caption("Основной график: факт и базовый прогноз. Подробные технические графики доступны в отчёте.")
+        open_surface("Что сделать дальше")
+        a1, a2, a3 = st.columns(3)
+        if a1.button("Проверить цену и промо", key="go_scenario_from_summary", use_container_width=True):
+            st.session_state.active_workspace_tab = "Проверить цену и промо"
+            st.session_state["workspace_tab_radio"] = "Проверить цену и промо"
+            st.rerun()
+        if has_applied_scenario and a2.button("Сравнить варианты", key="go_compare_from_summary_2", use_container_width=True):
+            st.session_state.active_workspace_tab = "Сравнить варианты"
+            st.session_state["workspace_tab_radio"] = "Сравнить варианты"
+            st.rerun()
+        if has_applied_scenario and a3.button("Открыть отчёт", key="go_report_from_summary", use_container_width=True):
+            st.session_state.active_workspace_tab = "Отчёт"
+            st.session_state["workspace_tab_radio"] = "Отчёт"
+            st.rerun()
+        close_surface()
 
-        fig_p = go.Figure()
-        fig_p.add_trace(go.Scatter(x=current_forecast_for_compare["date"], y=current_forecast_for_compare["profit"], name="База", line=dict(color="#9DCC84", width=2), fill="tozeroy"))
-        fig_p.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["profit"], name="Сценарий", line=dict(color="#6F70FF", width=2.4)))
-        fig_p.update_layout(**_plot_layout("Прибыль"))
-        render_chart_card("Прибыль", "Горизонт · ₽", fig_p, [("База", f"₽ {base_profit:,.0f}"), ("Сценарий", f"₽ {sc_profit:,.0f}"), ("Δ", f"₽ {sc_profit-base_profit:+,.0f}")])
-        _render_chart_legend_help("Прибыль", "₽")
-        st.caption("Зелёная линия — базовый прогноз, фиолетовая — текущий сценарий.")
 
-    elif active_tab == "What-if сценарий":
-        render_page_header("What-if сценарий", "Измените параметры и рассчитайте, как изменятся спрос, выручка и прибыль. Базовый прогноз не меняется.")
+    elif active_tab == "Проверить цену и промо":
+        render_page_header("Проверить цену и промо", "Измените ключевые параметры и нажмите «Рассчитать сценарий».")
+        st.info("Изменения не применяются автоматически. Настройте параметры и нажмите «Рассчитать сценарий»." )
         scenario_state_ui = str(st.session_state.get("scenario_ui_status", "as_is"))
         base_ctx = r["_trained_bundle"]["base_ctx"]
-        render_stepper([
-            {"title": "Базовый прогноз", "caption": "Точка сравнения", "status": "done"},
-            {"title": "Что меняем", "caption": "Параметры сценария", "status": "active"},
-            {"title": "Предпросмотр", "caption": "Что будет рассчитано", "status": "active" if scenario_state_ui in {"dirty", "as_is"} else "done"},
-            {"title": "Рассчитать", "caption": "Запуск сценария", "status": "active" if scenario_state_ui == "dirty" else "done" if scenario_state_ui in {"applied", "saved"} else "pending"},
-            {"title": "Итог", "caption": "Решение", "status": "active" if scenario_state_ui in {"applied", "saved"} else "pending"},
-        ], active_index=1)
-        render_kpi_strip([
-            {"label": "Текущая цена", "value": fmt_price(r.get("current_price", np.nan)), "delta": "", "base": "База"},
-            {"label": "Скидка", "value": fmt_pct_abs(float(base_ctx.get("discount", 0.0)) * 100.0), "delta": "", "base": "В истории"},
-            {"label": "Промо", "value": fmt_pct_abs(float(base_ctx.get("promotion", 0.0)) * 100.0), "delta": "", "base": "В истории"},
-            {"label": "Базовый спрос", "value": fmt_units(base_units), "delta": "", "base": "Точка сравнения"},
-            {"label": "Базовая выручка", "value": fmt_money_total(base_revenue), "delta": "", "base": "Точка сравнения"},
-            {"label": "Базовая прибыль", "value": fmt_money_total(base_profit), "delta": "", "base": "Точка сравнения"},
-        ])
+        st.caption("Точка сравнения: используйте базовый прогноз как отправную точку и изменяйте только нужные параметры сценария.")
+        current_analysis_mode = str(r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
+        analysis_mode_key = f"{st.session_state.get('selected_sku_for_results', '')}:{current_analysis_mode}"
+        if st.session_state.get("what_if_calc_mode_initialized_for") != analysis_mode_key:
+            st.session_state["what_if_calc_mode"] = current_analysis_mode
+            st.session_state["what_if_calc_mode_initialized_for"] = analysis_mode_key
+
         base_form = collect_current_form_values(
             float(r.get("current_price", 0.0)),
             float(base_ctx.get("discount", 0.0)),
@@ -7096,7 +7111,7 @@ if __name__ == "__main__":
             1.0,
             1.0,
             int(len(r.get("as_is_forecast", pd.DataFrame())) or CONFIG["HORIZON_DAYS_DEFAULT"]),
-            DEFAULT_SCENARIO_CALC_MODE,
+            current_analysis_mode,
             DEFAULT_PRICE_GUARDRAIL_MODE,
         )
         for key, val in {
@@ -7162,23 +7177,31 @@ if __name__ == "__main__":
             except Exception:
                 active_path_contract = "legacy_baseline+scenario_recompute"
 
-        open_surface("Быстрая проверка", "Выберите готовый вариант, затем нажмите «Рассчитать сценарий».")
-        preset_buttons = [
+        open_surface("Быстрый старт", "Выберите готовый вариант, затем нажмите «Рассчитать сценарий».")
+        primary_preset_buttons = [
             ("Скидка 5%", "discount_5"),
             ("Скидка 10%", "discount_10"),
             ("Цена +5%", "price_plus_5"),
             ("Цена -5%", "price_minus_5"),
             ("Промо-акция", "promo"),
+        ]
+        extra_preset_buttons = [
             ("Логистика +10%", "freight_plus_10"),
             ("Спрос -10%", "demand_minus_10"),
             ("Спрос +10%", "demand_plus_10"),
         ]
-        preset_cols = st.columns(4)
+        preset_cols = st.columns(5)
         preset_clicked = None
-        for idx, (label, code) in enumerate(preset_buttons):
-            with preset_cols[idx % 4]:
+        for idx, (label, code) in enumerate(primary_preset_buttons):
+            with preset_cols[idx % 5]:
                 if st.button(label, key=f"preset_{code}", use_container_width=True):
                     preset_clicked = code
+        with st.expander("Больше вариантов", expanded=False):
+            extra_cols = st.columns(3)
+            for idx, (label, code) in enumerate(extra_preset_buttons):
+                with extra_cols[idx % 3]:
+                    if st.button(label, key=f"preset_{code}", use_container_width=True):
+                        preset_clicked = code
         if st.button("Сбросить к базовому сценарию", key="preset_reset_to_base", use_container_width=True):
             preset_clicked = "reset"
         if preset_clicked:
@@ -7226,204 +7249,210 @@ if __name__ == "__main__":
         st.markdown('<div class="scenario-grid">', unsafe_allow_html=True)
         left_col, right_col = st.columns([1.2, 0.8])
         with left_col:
-            st.markdown('<div class="scenario-card">', unsafe_allow_html=True)
-            st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Период сценария</div><div class="scenario-card-caption">На этот период будут пересчитаны спрос, выручка и прибыль.</div></div><div class="scenario-step">1</div></div>', unsafe_allow_html=True)
-            hdays = st.slider("На сколько дней считаем сценарий", 7, 90, key="what_if_hdays", step=1)
-            st.markdown('<div class="scenario-divider"></div>', unsafe_allow_html=True)
-            st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Цена и скидка</div><div class="scenario-card-caption">Цена для расчёта спроса = новая цена × (1 − скидка).</div></div><div class="scenario-step">2</div></div>', unsafe_allow_html=True)
-            st.metric("Текущая цена", fmt_price(r["current_price"]))
-            manual_price = st.number_input("Новая цена до скидки, ₽", min_value=0.01, step=1.0, key="what_if_price")
-            discount = percent_slider_to_share("Скидка, %", "what_if_discount", min_pct=0, max_pct=95, step=1, default_share=0.0)
-            st.caption(f"Цена после скидки: {fmt_price(manual_price * (1.0 - discount))}")
-            st.markdown('<div class="scenario-divider"></div>', unsafe_allow_html=True)
-            st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Промо</div><div class="scenario-card-caption">0% — промо нет. Чем выше значение, тем сильнее промо-поддержка.</div></div><div class="scenario-step">3</div></div>', unsafe_allow_html=True)
-            promo_value = percent_slider_to_share("Промо-активность, %", "what_if_promo", min_pct=0, max_pct=70, step=1, default_share=0.0)
-            st.markdown('<div class="scenario-divider"></div>', unsafe_allow_html=True)
-            st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Логистика и внешний спрос</div><div class="scenario-card-caption">Изменяйте факторы в процентах.</div></div><div class="scenario-step">4</div></div>', unsafe_allow_html=True)
-            freight_change_pct = st.slider("Изменение логистических затрат, %", -50.0, 50.0, key="what_if_freight_change_pct", step=1.0)
-            demand_shock_pct = st.slider("Ручное изменение спроса, %", -30.0, 30.0, key="what_if_demand_shock_pct", step=1.0)
-            st.markdown('<div class="scenario-warning-inline">Это ручное допущение: например, сезонный всплеск, перебой поставок или внешний спад. Модель не обучает этот эффект автоматически.</div>', unsafe_allow_html=True)
-            freight_mult = pct_to_multiplier(freight_change_pct)
-            demand_mult = pct_to_multiplier(demand_shock_pct)
-            st.session_state["what_if_freight_mult"] = float(freight_mult)
-            st.session_state["what_if_demand_mult"] = float(demand_mult)
-            with st.expander("Дополнительно: технические настройки", expanded=False):
-                current_analysis_mode = str(r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
-                st.session_state["what_if_calc_mode"] = str(
-                    st.session_state.get("what_if_calc_mode", current_analysis_mode)
-                )
-                st.caption(f"Метод расчёта: {scenario_mode_label(st.session_state['what_if_calc_mode'])}")
-                if st.session_state["what_if_calc_mode"] == CATBOOST_FULL_FACTOR_MODE:
-                    st.caption(
-                        "В этом режиме сценарий пересчитывается через повторный прогноз CatBoost "
-                        "на изменённых факторах. Ручной внешний шок применяется как отдельный overlay."
+            with st.form("scenario_form"):
+                st.markdown('<div class="scenario-card">', unsafe_allow_html=True)
+                st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Период сценария</div><div class="scenario-card-caption">На этот период будут пересчитаны спрос, выручка и прибыль.</div></div><div class="scenario-step">1</div></div>', unsafe_allow_html=True)
+                hdays = st.slider("На сколько дней считаем сценарий", 7, 90, key="what_if_hdays", step=1)
+                st.markdown('<div class="scenario-divider"></div>', unsafe_allow_html=True)
+                st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Цена и скидка</div><div class="scenario-card-caption">Цена для расчёта спроса = новая цена × (1 − скидка).</div></div><div class="scenario-step">2</div></div>', unsafe_allow_html=True)
+                st.metric("Текущая цена", fmt_price(r["current_price"]))
+                manual_price = st.number_input("Новая цена до скидки, ₽", min_value=0.01, step=1.0, key="what_if_price")
+                discount = percent_slider_to_share("Скидка, %", "what_if_discount", min_pct=0, max_pct=95, step=1, default_share=0.0)
+                st.caption(f"Цена после скидки: {fmt_price(manual_price * (1.0 - discount))}")
+                st.markdown('<div class="scenario-divider"></div>', unsafe_allow_html=True)
+                st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Промо</div><div class="scenario-card-caption">0% — промо нет. Чем выше значение, тем сильнее промо-поддержка.</div></div><div class="scenario-step">3</div></div>', unsafe_allow_html=True)
+                promo_value = percent_slider_to_share("Сила промо / акции, %", "what_if_promo", min_pct=0, max_pct=70, step=1, default_share=0.0)
+                st.markdown('<div class="scenario-divider"></div>', unsafe_allow_html=True)
+                st.markdown('<div class="scenario-card-header"><div><div class="scenario-card-title">Дополнительно</div><div class="scenario-card-caption">Дополнительные параметры сценария.</div></div><div class="scenario-step">4</div></div>', unsafe_allow_html=True)
+                with st.expander("Дополнительные допущения", expanded=False):
+                    freight_change_pct = st.slider("Изменение затрат на логистику, %", -50.0, 50.0, key="what_if_freight_change_pct", step=1.0)
+                    demand_shock_pct = st.slider("Внешнее изменение спроса, %", -30.0, 30.0, key="what_if_demand_shock_pct", step=1.0)
+                    st.markdown('<div class="scenario-warning-inline">Используйте, если ожидаете внешний рост или спад спроса: сезонность, перебой поставок, реклама, изменение рынка. Это ручное допущение, а не автоматически найденный эффект модели.</div>', unsafe_allow_html=True)
+                st.caption(f"Дополнительно: логистика {freight_change_pct:+.0f}%, внешний спрос {demand_shock_pct:+.0f}%")
+                freight_mult = pct_to_multiplier(freight_change_pct)
+                demand_mult = pct_to_multiplier(demand_shock_pct)
+                st.session_state["what_if_freight_mult"] = float(freight_mult)
+                st.session_state["what_if_demand_mult"] = float(demand_mult)
+                with st.expander("Расширенные настройки", expanded=False):
+                    st.caption("Оставьте без изменений, если не уверены. Эти настройки нужны для продвинутых сценариев.")
+                    current_analysis_mode = str(r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
+                    st.session_state["what_if_calc_mode"] = str(
+                        st.session_state.get("what_if_calc_mode", current_analysis_mode)
+                    )
+                    st.session_state["what_if_calc_mode"] = current_analysis_mode
+                    st.caption(f"Режим расчёта: {scenario_mode_label(current_analysis_mode)}")
+                    if st.session_state["what_if_calc_mode"] == CATBOOST_FULL_FACTOR_MODE:
+                        st.caption(
+                            "В этом режиме сценарий пересчитывается через повторный прогноз CatBoost "
+                            "на изменённых факторах. Ручной внешний шок применяется как отдельный overlay."
+                        )
+                    else:
+                        st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
+                    st.caption("Детали технического контура доступны ниже в блоке диагностики.")
+                scenario_calc_mode = str(st.session_state.get("what_if_calc_mode", r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)))
+                if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
+                    st.radio(
+                        "Что делать, если цена вне прошлой истории?",
+                        options=[PRICE_GUARDRAIL_SAFE_CLIP, PRICE_GUARDRAIL_EXTRAPOLATE],
+                        format_func=lambda x: {
+                            PRICE_GUARDRAIL_SAFE_CLIP: "Осторожно: считать по ближайшей безопасной цене",
+                            PRICE_GUARDRAIL_EXTRAPOLATE: "Проверить мою цену: оценить риск за пределами истории",
+                        }[x],
+                        index=0 if normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_SAFE_CLIP else 1,
+                        help="Осторожный режим снижает риск ошибки, если новая цена сильно отличается от прошлых цен. Второй режим сохраняет введённую цену для экономики сценария, но оценка спроса становится менее надёжной.",
+                        key="price_guardrail_mode",
                     )
                 else:
-                    st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
-                st.caption("Детали технического контура доступны ниже в блоке диагностики.")
-            scenario_calc_mode = str(st.session_state.get("what_if_calc_mode", r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)))
-            if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
-                st.radio(
-                    "Режим проверки цены",
-                    options=[PRICE_GUARDRAIL_SAFE_CLIP, PRICE_GUARDRAIL_EXTRAPOLATE],
-                    format_func=lambda x: {
-                        PRICE_GUARDRAIL_SAFE_CLIP: "Защитный: не выходить за безопасные границы",
-                        PRICE_GUARDRAIL_EXTRAPOLATE: "Экстраполяция: сохранить мою цену и рассчитать хвост через эластичность",
-                    }[x],
-                    index=0 if normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)) == PRICE_GUARDRAIL_SAFE_CLIP else 1,
-                    help="Защитный режим — если значение вне безопасной зоны, система применит ближайшую безопасную границу. Экстраполяция — введённая цена сохраняется для расчёта выручки и прибыли, но спрос за пределами безопасной зоны считается через контролируемую ценовую эластичность.",
-                    key="price_guardrail_mode",
-                )
-            else:
-                st.session_state["price_guardrail_mode"] = DEFAULT_PRICE_GUARDRAIL_MODE
-            factor_overrides: Dict[str, Any] = {}
-            if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
-                cb_bundle_ui = ((r.get("_trained_bundle", {}) or {}).get("catboost_full_factor_bundle", {}) or {})
-                factor_catalog_ui = cb_bundle_ui.get("factor_catalog", pd.DataFrame()) if isinstance(cb_bundle_ui, dict) else pd.DataFrame()
-                with st.expander("Дополнительные факторы CatBoost", expanded=False):
-                    if isinstance(factor_catalog_ui, pd.DataFrame) and len(factor_catalog_ui):
-                        if "editable" not in factor_catalog_ui.columns:
-                            factor_catalog_ui["editable"] = True
-                        editable = factor_catalog_ui[
-                            factor_catalog_ui["feature"].astype(str).str.startswith("factor__")
-                            & factor_catalog_ui["editable"].astype(bool)
-                        ].copy()
-                        if len(editable) == 0:
-                            st.caption("Дополнительные факторы для ручного изменения не найдены.")
-                        else:
-                            st.caption("CatBoost учёл внешние факторы в baseline; ниже можно задать overrides для what-if.")
-                            for _, fr in editable.iterrows():
-                                feature_name = str(fr.get("feature"))
-                                ui_key = f"what_if_factor_{feature_name.replace('factor__', '').replace(' ', '_')}"
-                                dtype = str(fr.get("dtype", "numeric"))
-                                if dtype == "numeric":
-                                    default_val = float(pd.to_numeric(fr.get("current_value", fr.get("fill_value", 0.0)), errors="coerce"))
-                                    lo = pd.to_numeric(fr.get("train_min", np.nan), errors="coerce")
-                                    hi = pd.to_numeric(fr.get("train_max", np.nan), errors="coerce")
-                                    if np.isfinite(lo) and np.isfinite(hi) and lo < hi:
-                                        val = st.slider(
-                                            f"{feature_name}",
-                                            min_value=float(lo),
-                                            max_value=float(hi),
-                                            value=float(np.clip(default_val, float(lo), float(hi))),
-                                            key=ui_key,
-                                        )
+                    st.session_state["price_guardrail_mode"] = DEFAULT_PRICE_GUARDRAIL_MODE
+                factor_overrides: Dict[str, Any] = {}
+                if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
+                    cb_bundle_ui = ((r.get("_trained_bundle", {}) or {}).get("catboost_full_factor_bundle", {}) or {})
+                    factor_catalog_ui = cb_bundle_ui.get("factor_catalog", pd.DataFrame()) if isinstance(cb_bundle_ui, dict) else pd.DataFrame()
+                    with st.expander("Для экспертов: дополнительные факторы модели", expanded=False):
+                        if isinstance(factor_catalog_ui, pd.DataFrame) and len(factor_catalog_ui):
+                            if "editable" not in factor_catalog_ui.columns:
+                                factor_catalog_ui["editable"] = True
+                            editable = factor_catalog_ui[
+                                factor_catalog_ui["feature"].astype(str).str.startswith("factor__")
+                                & factor_catalog_ui["editable"].astype(bool)
+                            ].copy()
+                            if len(editable) == 0:
+                                st.caption("Дополнительные факторы для ручного изменения не найдены.")
+                            else:
+                                st.caption("Эти параметры нужны, если вы хотите вручную изменить дополнительные факторы, которые были в загруженных данных. Ниже можно задать значения для сценария.")
+                                for _, fr in editable.iterrows():
+                                    feature_name = str(fr.get("feature"))
+                                    ui_key = f"what_if_factor_{feature_name.replace('factor__', '').replace(' ', '_')}"
+                                    dtype = str(fr.get("dtype", "numeric"))
+                                    if dtype == "numeric":
+                                        default_val = float(pd.to_numeric(fr.get("current_value", fr.get("fill_value", 0.0)), errors="coerce"))
+                                        lo = pd.to_numeric(fr.get("train_min", np.nan), errors="coerce")
+                                        hi = pd.to_numeric(fr.get("train_max", np.nan), errors="coerce")
+                                        if np.isfinite(lo) and np.isfinite(hi) and lo < hi:
+                                            val = st.slider(
+                                                f"{feature_name}",
+                                                min_value=float(lo),
+                                                max_value=float(hi),
+                                                value=float(np.clip(default_val, float(lo), float(hi))),
+                                                key=ui_key,
+                                            )
+                                        else:
+                                            val = st.number_input(f"{feature_name}", value=float(default_val), key=ui_key)
                                     else:
-                                        val = st.number_input(f"{feature_name}", value=float(default_val), key=ui_key)
-                                else:
-                                    choices = []
-                                    if feature_name in r["_trained_bundle"]["daily_base"].columns:
-                                        choices = sorted(r["_trained_bundle"]["daily_base"][feature_name].dropna().astype(str).unique().tolist())
-                                    if not choices:
-                                        choices = [str(fr.get("current_value", "unknown"))]
-                                    default_choice = str(fr.get("current_value", choices[0]))
-                                    idx = choices.index(default_choice) if default_choice in choices else 0
-                                    val = st.selectbox(f"{feature_name}", options=choices, index=idx, key=ui_key)
-                                factor_overrides[feature_name] = val
-                    else:
-                        st.caption("Каталог факторов CatBoost недоступен.")
-            segments_payload: Dict[str, Any] = {}
-            segment_errors: List[str] = []
-            segment_count_ui = 0
-            with st.expander("Экспертный режим: разные параметры по периодам", expanded=False):
-                use_segments = st.checkbox("Использовать разные параметры по периодам", key="what_if_use_segments")
-                segments: List[Dict[str, Any]] = []
-                if use_segments and scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
-                    st.info("Сегменты для CatBoost full factors будут добавлены отдельным патчем. Сейчас применяется единый сценарий на весь горизонт.")
-                if use_segments and scenario_calc_mode == "enhanced_local_factors":
-                    seg_count = st.selectbox("Количество сегментов", options=[1, 2, 3], index=1)
-                    segment_count_ui = int(seg_count)
-                    fdates = r["_trained_bundle"]["future_dates"]
-                    start_default = pd.to_datetime(fdates["date"]).min().date() if len(fdates) else pd.Timestamp.utcnow().date()
-                    end_default = pd.to_datetime(fdates["date"]).max().date() if len(fdates) else start_default
-                    full_dates = pd.date_range(start_default, end_default, freq="D")
-                    if len(full_dates) == 0:
-                        full_dates = pd.DatetimeIndex([pd.Timestamp(start_default)])
-                    chunk = int(np.ceil(len(full_dates) / max(int(seg_count), 1)))
-                    for i in range(int(seg_count)):
-                        st.markdown(f"**Сегмент {i+1}**")
-                        idx_start = min(i * chunk, len(full_dates) - 1)
-                        idx_end = min(((i + 1) * chunk) - 1, len(full_dates) - 1)
-                        if i == int(seg_count) - 1:
-                            idx_end = len(full_dates) - 1
-                        default_seg_start = full_dates[idx_start].date()
-                        default_seg_end = full_dates[idx_end].date()
-                        start_key = f"seg_start_{i}"
-                        end_key = f"seg_end_{i}"
-                        if start_key not in st.session_state:
-                            st.session_state[start_key] = default_seg_start
-                        if end_key not in st.session_state:
-                            st.session_state[end_key] = default_seg_end
-                        s1, s2 = st.columns(2)
-                        seg_start = s1.date_input("Дата начала", value=st.session_state[start_key], key=start_key)
-                        seg_end = s2.date_input("Дата окончания", value=st.session_state[end_key], key=end_key)
-                        s3, s4, s5, s8 = st.columns(4)
-                        seg_price = s3.number_input("Цена до скидки, ₽", min_value=0.01, value=float(manual_price), key=f"seg_price_{i}")
-                        seg_discount_pct = s4.slider("Скидка, %", 0, 95, int(round(float(discount) * 100.0)), step=1, key=f"seg_discount_pct_{i}", format="%d%%")
-                        seg_promo_pct = s5.slider("Промо, %", 0, 70, int(round(float(min(promo_value, 0.70)) * 100.0)), step=1, key=f"seg_promo_pct_{i}", format="%d%%")
-                        s6, s7, s9 = st.columns(3)
-                        seg_freight_change_pct = s6.slider("Изменение логистики, %", -50.0, 50.0, float(freight_change_pct), step=1.0, key=f"seg_freight_pct_{i}")
-                        seg_demand_shock_pct = s7.slider("Внешний шок спроса, %", -30.0, 30.0, float(demand_shock_pct), step=1.0, key=f"seg_demand_pct_{i}")
-                        seg_units = s9.number_input("Дополнительные продажи, шт.", value=0.0, step=1.0, key=f"seg_units_{i}")
-                        segments.append(
-                            {
-                                "start_date": str(seg_start),
-                                "end_date": str(seg_end),
-                                "price": float(seg_price),
-                                "discount": float(seg_discount_pct) / 100.0,
-                                "promotion": float(seg_promo_pct) / 100.0,
-                                "freight_multiplier": float(pct_to_multiplier(seg_freight_change_pct)),
-                                "demand_multiplier": float(pct_to_multiplier(seg_demand_shock_pct)),
-                                "shock_units": float(seg_units),
-                            }
-                        )
-                    segment_ranges = []
-                    seg_validation_errors: List[str] = []
-                    for s in segments:
-                        start_dt = pd.to_datetime(s.get("start_date"), errors="coerce")
-                        end_dt = pd.to_datetime(s.get("end_date"), errors="coerce")
-                        if pd.isna(start_dt) or pd.isna(end_dt) or start_dt > end_dt:
-                            seg_validation_errors.append("В сегментах найдены пустые или некорректные интервалы дат.")
-                            continue
-                        segment_ranges.append((start_dt, end_dt))
-                    for i in range(len(segment_ranges)):
-                        for j in range(i + 1, len(segment_ranges)):
-                            a_start, a_end = segment_ranges[i]
-                            b_start, b_end = segment_ranges[j]
-                            if max(a_start, b_start) <= min(a_end, b_end):
-                                seg_validation_errors.append("Сегменты не должны пересекаться по датам.")
-                                break
-                    if seg_validation_errors:
-                        segment_errors = sorted(set(seg_validation_errors))
-                        for msg in segment_errors:
-                            st.error(msg)
-                    else:
-                        segment_paths, segment_warnings = build_segment_paths(
-                            r["_trained_bundle"]["future_dates"].head(int(hdays)),
-                            {
-                                "price": float(manual_price),
-                                "promotion": float(promo_value),
-                                "discount": float(discount),
-                                "freight_multiplier": float(freight_mult),
-                                "demand_multiplier": float(demand_mult),
-                                "freight_value": float(r["_trained_bundle"]["base_ctx"].get("freight_value", 0.0)),
-                            },
-                            segments,
-                        )
-                        segments_payload = segment_paths
-                        for sw in segment_warnings:
-                            st.warning(sw)
-            has_segment_errors = len(segment_errors) > 0
-            apply_btn = st.button("Рассчитать сценарий", type="primary", use_container_width=True, disabled=has_segment_errors)
-            st.caption("После расчёта сценарий будет сравнен с текущим планом.")
-            if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
-                st.caption("Метод: CatBoost повторно прогнозирует спрос по изменённым факторам (без legacy/enhanced multiplier).")
-            else:
-                st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
-            if has_segment_errors:
-                st.error("Сценарий нельзя рассчитать: исправьте ошибки в периодах сегментов.")
-            st.markdown("</div>", unsafe_allow_html=True)
+                                        choices = []
+                                        if feature_name in r["_trained_bundle"]["daily_base"].columns:
+                                            choices = sorted(r["_trained_bundle"]["daily_base"][feature_name].dropna().astype(str).unique().tolist())
+                                        if not choices:
+                                            choices = [str(fr.get("current_value", "unknown"))]
+                                        default_choice = str(fr.get("current_value", choices[0]))
+                                        idx = choices.index(default_choice) if default_choice in choices else 0
+                                        val = st.selectbox(f"{feature_name}", options=choices, index=idx, key=ui_key)
+                                    factor_overrides[feature_name] = val
+                        else:
+                            st.caption("Каталог факторов CatBoost недоступен.")
+                segments_payload: Dict[str, Any] = {}
+                segment_errors: List[str] = []
+                segment_count_ui = 0
+                with st.expander("Для экспертов: разные условия по периодам", expanded=False):
+                    use_segments = st.checkbox("Использовать разные параметры по периодам", key="what_if_use_segments")
+                    segments: List[Dict[str, Any]] = []
+                    if use_segments and scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
+                        st.info("Для выбранного режима пока применяется единый сценарий на весь период.")
+                    if use_segments and scenario_calc_mode == "enhanced_local_factors":
+                        seg_count = st.selectbox("Количество сегментов", options=[1, 2, 3], index=1)
+                        segment_count_ui = int(seg_count)
+                        fdates = r["_trained_bundle"]["future_dates"]
+                        start_default = pd.to_datetime(fdates["date"]).min().date() if len(fdates) else pd.Timestamp.utcnow().date()
+                        end_default = pd.to_datetime(fdates["date"]).max().date() if len(fdates) else start_default
+                        full_dates = pd.date_range(start_default, end_default, freq="D")
+                        if len(full_dates) == 0:
+                            full_dates = pd.DatetimeIndex([pd.Timestamp(start_default)])
+                        chunk = int(np.ceil(len(full_dates) / max(int(seg_count), 1)))
+                        for i in range(int(seg_count)):
+                            st.markdown(f"**Сегмент {i+1}**")
+                            idx_start = min(i * chunk, len(full_dates) - 1)
+                            idx_end = min(((i + 1) * chunk) - 1, len(full_dates) - 1)
+                            if i == int(seg_count) - 1:
+                                idx_end = len(full_dates) - 1
+                            default_seg_start = full_dates[idx_start].date()
+                            default_seg_end = full_dates[idx_end].date()
+                            start_key = f"seg_start_{i}"
+                            end_key = f"seg_end_{i}"
+                            if start_key not in st.session_state:
+                                st.session_state[start_key] = default_seg_start
+                            if end_key not in st.session_state:
+                                st.session_state[end_key] = default_seg_end
+                            s1, s2 = st.columns(2)
+                            seg_start = s1.date_input("Дата начала", value=st.session_state[start_key], key=start_key)
+                            seg_end = s2.date_input("Дата окончания", value=st.session_state[end_key], key=end_key)
+                            s3, s4, s5, s8 = st.columns(4)
+                            seg_price = s3.number_input("Цена до скидки, ₽", min_value=0.01, value=float(manual_price), key=f"seg_price_{i}")
+                            seg_discount_pct = s4.slider("Скидка, %", 0, 95, int(round(float(discount) * 100.0)), step=1, key=f"seg_discount_pct_{i}", format="%d%%")
+                            seg_promo_pct = s5.slider("Промо, %", 0, 70, int(round(float(min(promo_value, 0.70)) * 100.0)), step=1, key=f"seg_promo_pct_{i}", format="%d%%")
+                            s6, s7, s9 = st.columns(3)
+                            seg_freight_change_pct = s6.slider("Изменение логистики, %", -50.0, 50.0, float(freight_change_pct), step=1.0, key=f"seg_freight_pct_{i}")
+                            seg_demand_shock_pct = s7.slider("Внешний шок спроса, %", -30.0, 30.0, float(demand_shock_pct), step=1.0, key=f"seg_demand_pct_{i}")
+                            seg_units = s9.number_input("Дополнительные продажи, шт.", value=0.0, step=1.0, key=f"seg_units_{i}")
+                            segments.append(
+                                {
+                                    "start_date": str(seg_start),
+                                    "end_date": str(seg_end),
+                                    "price": float(seg_price),
+                                    "discount": float(seg_discount_pct) / 100.0,
+                                    "promotion": float(seg_promo_pct) / 100.0,
+                                    "freight_multiplier": float(pct_to_multiplier(seg_freight_change_pct)),
+                                    "demand_multiplier": float(pct_to_multiplier(seg_demand_shock_pct)),
+                                    "shock_units": float(seg_units),
+                                }
+                            )
+                        segment_ranges = []
+                        seg_validation_errors: List[str] = []
+                        for s in segments:
+                            start_dt = pd.to_datetime(s.get("start_date"), errors="coerce")
+                            end_dt = pd.to_datetime(s.get("end_date"), errors="coerce")
+                            if pd.isna(start_dt) or pd.isna(end_dt) or start_dt > end_dt:
+                                seg_validation_errors.append("В сегментах найдены пустые или некорректные интервалы дат.")
+                                continue
+                            segment_ranges.append((start_dt, end_dt))
+                        for i in range(len(segment_ranges)):
+                            for j in range(i + 1, len(segment_ranges)):
+                                a_start, a_end = segment_ranges[i]
+                                b_start, b_end = segment_ranges[j]
+                                if max(a_start, b_start) <= min(a_end, b_end):
+                                    seg_validation_errors.append("Сегменты не должны пересекаться по датам.")
+                                    break
+                        if seg_validation_errors:
+                            segment_errors = sorted(set(seg_validation_errors))
+                            for msg in segment_errors:
+                                st.error(msg)
+                        else:
+                            segment_paths, segment_warnings = build_segment_paths(
+                                r["_trained_bundle"]["future_dates"].head(int(hdays)),
+                                {
+                                    "price": float(manual_price),
+                                    "promotion": float(promo_value),
+                                    "discount": float(discount),
+                                    "freight_multiplier": float(freight_mult),
+                                    "demand_multiplier": float(demand_mult),
+                                    "freight_value": float(r["_trained_bundle"]["base_ctx"].get("freight_value", 0.0)),
+                                },
+                                segments,
+                            )
+                            segments_payload = segment_paths
+                            for sw in segment_warnings:
+                                st.warning(sw)
+                has_segment_errors = len(segment_errors) > 0
+                apply_btn = st.form_submit_button("Рассчитать сценарий", type="primary", use_container_width=True, disabled=has_segment_errors)
+                st.caption("После расчёта сценарий будет сравнен с текущим планом.")
+                if scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
+                    st.caption("Метод: CatBoost повторно прогнозирует спрос по изменённым факторам (без legacy/enhanced multiplier).")
+                else:
+                    st.caption("Метод: базовый прогноз + сценарный пересчёт факторов.")
+                if has_segment_errors:
+                    st.error("Сценарий нельзя рассчитать: исправьте ошибки в периодах сегментов.")
+                st.markdown("</div>", unsafe_allow_html=True)
         with right_col:
+            st.caption("Черновик сценария. Значения обновятся после нажатия «Рассчитать сценарий».")
             current_form_after_widgets = collect_current_form_values(
                 float(manual_price),
                 float(discount),
@@ -7671,183 +7700,143 @@ if __name__ == "__main__":
         else:
             st.caption("Сначала рассчитайте сценарий.")
 
-        compare_base = current_forecast
-        if r.get("scenario_forecast") is not None:
-            compare_base = align_forecasts_by_scenario_dates(current_forecast, r.get("scenario_forecast"))
-        compare_df = build_user_friendly_comparison_table(compare_base, r.get("scenario_forecast"), st.session_state.saved_scenarios, True)
-        open_surface("Сравнение сценариев")
-        compare_enriched = compare_df.copy()
-        if len(compare_enriched):
-            compare_enriched["Итог"] = np.where(
-                pd.to_numeric(compare_enriched.get("Δ прибыли", 0.0), errors="coerce").fillna(0.0) > 0,
-                "выгоден",
-                np.where(
-                    pd.to_numeric(compare_enriched.get("Δ прибыли", 0.0), errors="coerce").fillna(0.0) < 0,
-                    "рискован",
-                    "нейтрален",
-                ),
-            )
-            risk_rank_map = {"выгоден": 0, "нейтрален": 1, "требует осторожности": 2, "рискован": 3}
-            compare_enriched["risk_rank"] = compare_enriched["Итог"].map(risk_rank_map).fillna(2)
-            best_profit_idx = pd.to_numeric(compare_enriched.get("Прибыль", pd.Series([np.nan] * len(compare_enriched))), errors="coerce").idxmax()
-            best_revenue_idx = pd.to_numeric(compare_enriched.get("Выручка", pd.Series([np.nan] * len(compare_enriched))), errors="coerce").idxmax()
-            best_demand_idx = pd.to_numeric(compare_enriched.get("Спрос", pd.Series([np.nan] * len(compare_enriched))), errors="coerce").idxmax()
-            highlights = []
-            if pd.notna(best_profit_idx):
-                highlights.append(f"Лучший по прибыли: {compare_enriched.loc[best_profit_idx, 'Сценарий']}")
-            if pd.notna(best_revenue_idx):
-                highlights.append(f"Лучший по выручке: {compare_enriched.loc[best_revenue_idx, 'Сценарий']}")
-            if pd.notna(best_demand_idx):
-                highlights.append(f"Максимальный спрос: {compare_enriched.loc[best_demand_idx, 'Сценарий']}")
-            ranked = compare_enriched.sort_values(["risk_rank", "Прибыль"], ascending=[True, False])
-            if len(ranked):
-                highlights.append(f"Минимальный риск: {ranked.iloc[0]['Сценарий']}")
-            st.caption(" · ".join(highlights))
-            compare_display = compare_enriched.copy()
-            money_cols = ["Выручка", "Прибыль", "Δ выручки", "Δ прибыли"]
-            units_cols = ["Спрос", "Δ спроса"]
-            pct_cols = ["Маржа"]
-            pct_abs_cols = ["Скидка", "Промо"]
-            for col in money_cols:
-                if col in compare_display.columns:
-                    compare_display[col] = pd.to_numeric(compare_display[col], errors="coerce").apply(fmt_money_total)
-            for col in units_cols:
-                if col in compare_display.columns:
-                    compare_display[col] = pd.to_numeric(compare_display[col], errors="coerce").apply(fmt_units)
-            for col in pct_cols:
-                if col in compare_display.columns:
-                    compare_display[col] = pd.to_numeric(compare_display[col], errors="coerce").apply(fmt_pct_abs)
-            for col in pct_abs_cols:
-                if col in compare_display.columns:
-                    compare_display[col] = (pd.to_numeric(compare_display[col], errors="coerce") * 100.0).apply(fmt_pct_abs)
-            if "risk_rank" in compare_display.columns:
-                compare_display = compare_display.drop(columns=["risk_rank"])
-            st.dataframe(compare_display, use_container_width=True, hide_index=True)
-        else:
-            st.dataframe(compare_enriched, use_container_width=True, hide_index=True)
-        st.caption("В таблице всегда есть текущий план и текущий сценарий (если он применён), даже без сохранения в слот.")
-        close_surface()
+        st.info("Сравнить с текущим планом можно во вкладке «Сравнить варианты».")
 
         open_surface("Проверка соседних цен")
         st.caption("График показывает, как могла бы измениться прибыль при нескольких ценах рядом с текущей. Это вспомогательная проверка, а не автоматический выбор оптимальной цены.")
         if wr is not None and str(wr.get("support_label", "")) == "low":
             st.warning("Низкая историческая поддержка сценария: проверку соседних цен интерпретируйте осторожно.")
-        sens = build_sensitivity_grid(
-            r["_trained_bundle"],
-            base_price=float(r["current_price"]),
-            runner=run_what_if_projection,
-            horizon_days=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])),
-            runner_kwargs={"scenario_calc_mode": st.session_state["what_if_calc_mode"]},
-        ).head(5)
-        fig_s = px.bar(sens, x="price", y="profit_adjusted", color_discrete_sequence=["#6F70FF"])
-        fig_s.update_layout(**_plot_layout("Проверка соседних цен"))
-        st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False})
+        sens_signature = {
+            "base_price": float(r["current_price"]),
+            "horizon_days": int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])),
+            "scenario_calc_mode": str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+            "price_guardrail_mode": str(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+            "price": float(st.session_state.get("what_if_price", r.get("current_price", 0.0))),
+            "discount": float(st.session_state.get("what_if_discount", 0.0)),
+            "promo": float(st.session_state.get("what_if_promo", 0.0)),
+            "freight_change_pct": float(st.session_state.get("what_if_freight_change_pct", 0.0)),
+            "demand_shock_pct": float(st.session_state.get("what_if_demand_shock_pct", 0.0)),
+        }
+        if st.button("Построить проверку соседних цен", key="build_sens_grid_btn", use_container_width=True):
+            sensitivity_raw = build_sensitivity_grid(
+                r["_trained_bundle"],
+                base_price=float(r["current_price"]),
+                runner=run_what_if_projection,
+                horizon_days=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])),
+                price_steps=5,
+                demand_steps=3,
+                runner_kwargs={
+                    "scenario_calc_mode": st.session_state["what_if_calc_mode"],
+                    "price_guardrail_mode": normalize_price_guardrail_mode(
+                        st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)
+                    ),
+                    "freight_multiplier": float(
+                        pct_to_multiplier(st.session_state.get("what_if_freight_change_pct", 0.0))
+                    ),
+                    "overrides": {
+                        "promotion": float(st.session_state.get("what_if_promo", 0.0)),
+                        "discount": float(st.session_state.get("what_if_discount", 0.0)),
+                    },
+                },
+            )
+            st.session_state.sensitivity_df = sensitivity_raw[
+                np.isclose(pd.to_numeric(sensitivity_raw["demand_multiplier"], errors="coerce"), 1.0)
+            ].head(5)
+            st.session_state["sensitivity_signature"] = sens_signature
+        sens = st.session_state.get("sensitivity_df")
+        if sens is not None and st.session_state.get("sensitivity_signature") == sens_signature:
+            fig_s = px.bar(sens, x="price", y="profit_adjusted", color_discrete_sequence=["#6F70FF"])
+            fig_s.update_layout(**_plot_layout("Проверка соседних цен"))
+            st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False})
+        else:
+            st.info("Нажмите кнопку, чтобы построить проверку соседних цен.")
         close_surface()
-        with st.expander("Диагностика и технические детали", expanded=False):
-            st.write(f"Режим расчёта: {wr.get('scenario_calc_mode_label', scenario_mode_label(str(wr.get('scenario_calc_mode', DEFAULT_SCENARIO_CALC_MODE)))) if wr else scenario_mode_label(str(st.session_state.get('what_if_calc_mode', DEFAULT_SCENARIO_CALC_MODE)))}")
-            st.write(f"Контур расчёта: {wr.get('active_path_contract_label', scenario_contract_label(str(wr.get('active_path_contract', active_path_contract)))) if wr else scenario_contract_label(active_path_contract)}")
-            st.write(f"Источник эффектов: {wr.get('effect_source_label', effect_source_label(str(wr.get('effect_source', '')))) if wr else '—'}")
-            st.write(f"Надёжность: {wr.get('confidence_label', '—') if wr else '—'}")
-            st.write(f"Поддержка историей: {wr.get('support_label', '—') if wr else '—'}")
-            st.write(f"Предупреждений: {len(wr.get('warnings', [])) if wr and isinstance(wr.get('warnings', []), list) else 0}")
-            st.write(f"active_path_contract (raw): {wr.get('active_path_contract', active_path_contract) if wr else active_path_contract}")
-            st.write(f"scenario_calc_mode (raw): {wr.get('scenario_calc_mode', st.session_state.get('what_if_calc_mode', DEFAULT_SCENARIO_CALC_MODE)) if wr else st.session_state.get('what_if_calc_mode', DEFAULT_SCENARIO_CALC_MODE)}")
-            st.write(f"export_scope: {export_scope}")
-            st.write(f"analysis_state: {analysis_state}")
-            st.write(f"scenario_state: {scenario_state}")
-            _render_mechanics_explainer(r, st.session_state.what_if_result)
+        st.caption("Технические детали доступны во вкладке «Отчёт».")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    elif active_tab == "Факторы":
-        render_page_header("Факторы", "Здесь показано, какие параметры использовались в модели и какие из них можно менять в сценарии.")
-        if str(r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)) == CATBOOST_FULL_FACTOR_MODE:
-            factor_report = normalize_factor_report_for_ui(r.get("catboost_full_factor_report", pd.DataFrame()))
-            used = factor_report[factor_report.get("used_in_active_model", False) == True]["feature"].tolist() if len(factor_report) else []
-            excluded = factor_report[factor_report.get("used_in_active_model", False) != True][["feature", "reason"]] if len(factor_report) else pd.DataFrame()
-            importances = r.get("catboost_full_factor_importances", pd.DataFrame())
-            cb_bundle = ((r.get("_trained_bundle", {}) or {}).get("catboost_full_factor_bundle", {}) or {})
-            holdout = cb_bundle.get("holdout_metrics", {}) if isinstance(cb_bundle, dict) else {}
-            st.markdown("**Режим: CatBoost full factors**")
-            st.caption(f"Статус модели: {'активна' if bool(cb_bundle.get('enabled', False)) else 'не активна'}")
-            st.caption(f"Использованных факторов: {len(used)}")
-            if holdout:
-                st.caption(f"Holdout WAPE: {holdout.get('wape', float('nan')):.2f} | MAE: {holdout.get('mae', float('nan')):.2f}")
-            top_feats = [str(x.get("feature", "")) for x in list(cb_bundle.get("feature_importances", []))[:5]]
-            if top_feats and all("sales_lag" in f or "sales_roll" in f for f in top_feats):
-                st.warning("Модель в основном опирается на лаги продаж; влияние внешних факторов в сценарии может быть ограничено.")
+    elif active_tab == "Сравнить варианты":
+        render_page_header("Сравнить варианты", "Сравните текущий план, ваш сценарий и сохранённые варианты.")
+        compare_base = current_forecast
+        if r.get("scenario_forecast") is not None:
+            compare_base = align_forecasts_by_scenario_dates(current_forecast, r.get("scenario_forecast"))
+        compare_df = build_user_friendly_comparison_table(compare_base, r.get("scenario_forecast"), st.session_state.saved_scenarios, True)
+        wr_local = st.session_state.what_if_result or {}
+        snap_local = st.session_state.applied_scenario_snapshot or {}
+        if len(compare_df) and "Сценарий" in compare_df.columns:
+            mask_current = compare_df["Сценарий"].astype(str).eq("Текущий сценарий")
+            if mask_current.any():
+                compare_df.loc[mask_current, "Цена gross"] = float(
+                    snap_local.get("manual_price_applied")
+                    or wr_local.get("requested_price")
+                    or wr_local.get("applied_price_gross")
+                    or np.nan
+                )
+                compare_df.loc[mask_current, "Цена net"] = float(
+                    snap_local.get("net_price_applied")
+                    or wr_local.get("applied_price_net")
+                    or np.nan
+                )
+                compare_df.loc[mask_current, "Confidence"] = str(wr_local.get("confidence_label", ""))
+                compare_df.loc[mask_current, "Support"] = str(wr_local.get("support_label", ""))
+        def _display_value(value: Any, formatter) -> str:
+            if value is None:
+                return "—"
+            if isinstance(value, str):
+                cleaned = value.strip()
+                return cleaned if cleaned and cleaned != "—" else "—"
+            num = safe_float_or_nan(value)
+            if np.isfinite(num):
+                try:
+                    return str(formatter(num))
+                except Exception:
+                    return str(num)
+            return "—"
+
+        if len(compare_df):
+            cols = st.columns(min(5, len(compare_df)))
+            for i, (_, row) in enumerate(compare_df.head(5).iterrows()):
+                with cols[i % len(cols)]:
+                    scenario_name = str(row.get("Сценарий", "Сценарий"))
+                    price_value = row.get("Цена", None)
+                    if price_value in [None, "—", ""]:
+                        price_value = row.get("Цена net", row.get("Цена gross", "—"))
+                    if scenario_name == "Текущий план":
+                        price_value = fmt_price(r.get("current_price", np.nan))
+                    if scenario_name == "Текущий сценарий" and price_value in [None, "—", ""]:
+                        snap = st.session_state.applied_scenario_snapshot or {}
+                        wr_local = st.session_state.what_if_result or {}
+                        price_value = (
+                            snap.get("manual_price_applied")
+                            or wr_local.get("requested_price")
+                            or wr_local.get("applied_price_gross")
+                            or wr_local.get("model_price")
+                            or price_value
+                        )
+                    open_surface(str(row.get("Сценарий", "Сценарий")))
+                    st.markdown(f"**Цена:** {_display_value(price_value, fmt_price)}")
+                    st.markdown(f"**Спрос:** {_display_value(row.get('Спрос', np.nan), fmt_units)}")
+                    st.markdown(f"**Выручка:** {_display_value(row.get('Выручка', np.nan), fmt_money_total)}")
+                    st.markdown(f"**Прибыль:** {_display_value(row.get('Прибыль', np.nan), fmt_money_total)}")
+                    st.markdown(f"**Изм. прибыли:** {_display_value(row.get('Δ прибыли', np.nan), fmt_money_total)}")
+                    delta_profit = pd.to_numeric(pd.Series([row.get("Δ прибыли", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+                    row_conf = str(row.get("Confidence", "")).strip().lower()
+                    reliability = row_conf
+                    if scenario_name == "Текущий план":
+                        status = "База сравнения"
+                    elif delta_profit < 0:
+                        status = "Хуже"
+                    elif delta_profit > 0:
+                        status = "Требует проверки" if ("низ" in reliability or reliability == "low") else "Лучше"
+                    else:
+                        status = "Без изменений"
+                    reliability_text_ui = row.get("Confidence") if str(row.get("Confidence", "")).strip() else "н/д"
+                    st.markdown(f"**Надёжность:** {reliability_text_ui}")
+                    st.markdown(f"**Статус:** {status}")
+                    close_surface()
+            with st.expander("Показать подробную таблицу", expanded=False):
+                st.dataframe(compare_df, use_container_width=True, hide_index=True)
         else:
-            factor_report = normalize_factor_report_for_ui(r.get("feature_report", pd.DataFrame()))
-            used = factor_report[factor_report.get("used_in_active_model", False) == True]["feature"].tolist() if len(factor_report) else []
-            excluded = pd.DataFrame()
-            importances = pd.DataFrame()
-        changed = []
-        if st.session_state.what_if_result is not None:
-            c = st.session_state.what_if_result.get("scenario_inputs_contract", {})
-            for k in ["base_price", "scenario_price", "base_promo", "scenario_promo", "base_freight", "scenario_freight"]:
-                if k in c:
-                    changed.append((k, c[k]))
-
-        display_used = [humanize_feature_name(x) for x in used[:12]] if used else ["Факторы будут показаны после расчета"]
-        render_report_card("Использованные факторы", display_used)
-        render_report_card("Управляемые факторы What-if", [
-            "Цена — меняет цену до скидки и влияет на спрос, выручку и прибыль.",
-            "Скидка — снижает цену после скидки, может увеличить спрос, но уменьшить маржу.",
-            "Промо — ручная промо-активность в сценарии.",
-            "Логистика — меняет затраты и влияет на прибыль.",
-            "Ручное изменение спроса — внешнее допущение пользователя, не обученное моделью автоматически.",
-        ])
-        render_report_card("Внешние факторы", ["сезонность — сезонность", "внешний рынок — внешний спрос", "погода/праздники — календарные эффекты (если есть)"])
-        if len(excluded):
-            st.caption("Некоторые факторы не использовались моделью, потому что в истории по ним мало изменений или они не прошли проверку качества.")
-            with st.expander("Технический список исключённых факторов", expanded=False):
-                ex = excluded.copy()
-                if "feature" in ex.columns:
-                    ex["feature"] = ex["feature"].astype(str).map(humanize_feature_name)
-                st.dataframe(ex, use_container_width=True, hide_index=True)
-        if len(importances):
-            with st.expander("Техническая важность факторов", expanded=False):
-                st.caption("Это диагностическая информация. Высокая важность не всегда означает причинное влияние.")
-                st.dataframe(importances.head(15), use_container_width=True, hide_index=True)
-        render_report_card("Изменено в сценарии", [f"{k}: {v}" for k, v in changed] if changed else ["Изменений пока нет"]) 
-
-    elif active_tab == "Проверка качества":
-        render_page_header("Проверка качества", "Показывает, насколько осторожно нужно интерпретировать прогноз и what-if сценарии.")
-        holdout = r.get("holdout_metrics", pd.DataFrame())
-        wape = float(holdout.get("wape", pd.Series([np.nan])).iloc[0]) if len(holdout) else np.nan
-        mape = float(holdout.get("mape", pd.Series([np.nan])).iloc[0]) if len(holdout) else np.nan
-        if np.isfinite(wape):
-            if wape <= 0.15:
-                quality_label, quality_tone, quality_text = "Высокое", "success", "Прогноз достаточно стабилен для сценарного анализа."
-            elif wape <= 0.30:
-                quality_label, quality_tone, quality_text = "Среднее", "warning", "Сценарии можно использовать как ориентир, но не как точную гарантию."
-            else:
-                quality_label, quality_tone, quality_text = "Низкое", "danger", "Сценарии нужно использовать осторожно: качество истории ограничивает точность."
-        else:
-            quality_label, quality_tone, quality_text = "Недостаточно данных", "warning", "Не удалось надёжно оценить качество прогноза."
-        render_help_callout(f"Качество прогноза: {quality_label}", quality_text, quality_tone)
-        st.caption("WAPE и MAPE: чем ниже, тем лучше. Высокая ошибка не означает, что сценарий бесполезен, но требует осторожной интерпретации.")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("WAPE", f"{wape:.3f}" if np.isfinite(wape) else "n/a")
-        with c2:
-            st.metric("MAPE", f"{mape:.3f}" if np.isfinite(mape) else "n/a")
-        with c3:
-            st.metric("holdout", "ok" if len(holdout) else "n/a")
-        with c4:
-            st.metric("Качество", str(build_trust_block(r, st.session_state.what_if_result).get("data_sufficiency", "n/a")))
-
-        render_warning_card(r.get("warnings", []))
-
-        open_surface("Диагностический график")
-        fig_h = go.Figure()
-        fig_h.add_trace(go.Scatter(x=history_daily["date"], y=history_daily["sales"], name="Факт", line=dict(color="#9DCC84", width=2)))
-        fig_h.add_trace(go.Scatter(x=scenario_forecast["date"], y=scenario_forecast["actual_sales"], name="Прогноз", line=dict(color="#6F70FF", width=2.4)))
-        fig_h.update_layout(**_plot_layout("Факт vs прогноз"))
-        st.plotly_chart(fig_h, use_container_width=True, config={"displayModeBar": False})
-        close_surface()
-
-        run_summary_ui = json.loads(r.get("analysis_run_summary_json", b"{}").decode("utf-8")) if r.get("analysis_run_summary_json") else {}
-        render_debug_expander(run_summary_ui)
+            st.info("Пока нет сценариев для сравнения.")
 
     elif active_tab == "Отчёт":
         render_page_header("Краткий вывод", "Сводка сценария: что проверяли, что изменится, насколько результат надёжен и что делать дальше.")
@@ -7866,7 +7855,7 @@ if __name__ == "__main__":
         recommendation = ui_decision["decision_label"]
 
         if not scenario_applied:
-            render_empty_state("Сценарий ещё не рассчитан", "Перейдите во вкладку «What-if сценарий», настройте параметры и нажмите «Рассчитать сценарий».")
+            render_empty_state("Сценарий ещё не рассчитан", "Перейдите во вкладку «Проверить цену и промо», настройте параметры и нажмите «Рассчитать сценарий».")
         elif not gate_ok:
             st.error("Сценарий пока требует проверки перед экспортом. Откройте блок диагностики и уточните входные параметры.")
         elif ui_decision["tone"] == "success":
@@ -7902,7 +7891,17 @@ if __name__ == "__main__":
                 f"- Горизонт: **{int(snapshot.get('horizon_days', 0))} дней**"
             )
             if bool(snapshot.get("price_clipped", False)):
-                st.warning("Введённая цена была скорректирована моделью.")
+                guard_mode = normalize_price_guardrail_mode(
+                    snapshot.get("price_guardrail_mode", (st.session_state.what_if_result or {}).get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE))
+                )
+                requested_price = float(snapshot.get("manual_price_input", snapshot.get("manual_price_applied", r.get("current_price", 0.0))))
+                applied_price = float(snapshot.get("manual_price_applied", requested_price))
+                if guard_mode == PRICE_GUARDRAIL_SAFE_CLIP:
+                    st.warning("Цена вышла за безопасный исторический диапазон. В защитном режиме система использовала ближайшую безопасную цену для оценки спроса. Это снижает риск нереалистичного прогноза.")
+                    st.caption(f"Введённая цена: {fmt_price(requested_price)} · Безопасная граница: {fmt_price(applied_price)} · Режим проверки: защитный")
+                else:
+                    st.warning("Цена вышла за безопасный исторический диапазон. Спрос за пределами диапазона оценён через контролируемую экстраполяцию, поэтому надёжность ниже.")
+                    st.caption(f"Введённая цена: {fmt_price(requested_price)} · Безопасная граница: {fmt_price(applied_price)} · Режим проверки: экстраполяция")
         else:
             st.info("Пока нет применённого сценария.")
         close_surface()
@@ -7921,7 +7920,7 @@ if __name__ == "__main__":
             st.dataframe(quick_compare, use_container_width=True, hide_index=True)
             close_surface()
         else:
-            st.info("Ваш сценарий пока не применён — блок сравнения появится после Apply.")
+            st.info("Ваш сценарий пока не рассчитан — блок сравнения появится после нажатия «Рассчитать сценарий».")
 
         effects = wr.get("effects", {}) if isinstance(wr, dict) else {}
         reasons: List[str] = []
@@ -7938,7 +7937,7 @@ if __name__ == "__main__":
             reasons.append("Дополнительный множитель спроса усиливает прогноз." if se > 1 else "Дополнительный множитель спроса снижает прогноз.")
             reasons.append(f"Эффект цены: {pe:.2f}x; промо: {pp:.2f}x; логистика: {fe:.2f}x; доп. множитель: {se:.2f}x.")
         else:
-            reasons.append("Чтобы получить объяснение причин, сначала примените сценарий.")
+            reasons.append("Чтобы получить объяснение причин, сначала рассчитайте сценарий.")
         render_report_card("Почему получился такой результат", reasons)
 
         reliability_text = {
@@ -7954,7 +7953,7 @@ if __name__ == "__main__":
         }
         confidence_key = confidence_label_aliases.get(str(confidence_label).strip().lower(), str(confidence_label).strip())
         confidence_text = reliability_text.get(confidence_key, reliability_text["Средняя"])
-        render_report_card("Надёжность оценки", [f"Уровень: {confidence_key}", confidence_text] + [str(w) for w in trust.get("warnings", [])[:3]])
+        render_report_card("Надёжность результата", [f"Уровень: {confidence_key}", confidence_text] + [str(w) for w in trust.get("warnings", [])[:3]])
 
         next_steps = [
             "Сохраните сценарий в слот сравнения.",
@@ -7968,7 +7967,7 @@ if __name__ == "__main__":
         render_report_card("Что делать дальше", next_steps)
 
         with st.expander("Пояснение терминов", expanded=False):
-            st.markdown("- Текущий план — прогноз без ручных изменений.\n- Ваш сценарий — прогноз после нажатия «Применить сценарий».")
+            st.markdown("- Текущий план — прогноз без ручных изменений.\n- Ваш сценарий — прогноз после нажатия «Рассчитать сценарий».")
 
         open_surface("Экспорт")
         has_results = st.session_state.results is not None
@@ -7989,7 +7988,7 @@ if __name__ == "__main__":
             use_container_width=True,
         )
         if not scenario_applied:
-            st.caption("CSV станет доступен после применения сценария.")
+            st.caption("CSV станет доступен после расчёта сценария.")
         st.download_button(
             "Сводка",
             data=_download_blob(st.session_state.results.get("manual_scenario_summary_json", b"{}") if has_results else b"", b"{}"),
