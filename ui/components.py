@@ -201,111 +201,50 @@ def render_debug_expander(payload: Any) -> None:
 # Landing components
 
 def render_landing_nav() -> None:
-    st.markdown(
-        """
-<div class="landing-nav">
-  <div class="top-header-title">What-if <span class="accent">Cloud</span></div>
-  <div class="muted">Возможности · Как работает · Интерфейс · Кейсы · Войти · <b>Начать</b></div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+    c1, c2 = st.columns([0.7, 0.3])
+    with c1:
+        st.markdown('<div class="top-header-title">What-if <span class="accent">Cloud</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="muted">Как работает · Что получите · Какие данные нужны · Ограничения</div>', unsafe_allow_html=True)
+    with c2:
+        st.button("Начать анализ", key="landing_nav_start", type="primary", use_container_width=True)
 
 
-def render_landing_hero_v2() -> str | None:
+def render_landing_hero() -> str | None:
     st.markdown(
         """
 <div class="hero-grid" style="margin-top:18px;">
   <div class="surface-card">
-    <div class="eyebrow">Проверка коммерческих решений</div>
-    <div class="hero-headline">What-if анализ цены, промо и спроса</div>
-    <div class="muted">Загрузите историю продаж и проверьте, как изменение цены, скидки, промо, логистики или внешнего спроса повлияет на спрос, выручку, прибыль и маржу.</div>
-    <div class="chip-row">
-      <span class="floating-chip">Цена</span>
-      <span class="floating-chip">Промо</span>
-      <span class="floating-chip">Логистика</span>
-      <span class="floating-chip">Внешние факторы</span>
-    </div>
+    <div class="eyebrow">Сценарный анализ</div>
+    <div class="hero-headline">Проверьте цену до запуска акции</div>
+    <div class="muted">Загрузите историю продаж и посмотрите, как изменение цены, скидки или промо может повлиять на спрос, выручку, прибыль и маржу.</div>
   </div>
-  <div class="surface-card hero-visual">
-    <div class="hero-chart-title">База vs Сценарий</div>
-    <svg viewBox="0 0 560 250" class="hero-chart-svg">
-      <polyline points="20,188 120,178 220,190 320,170 430,160 540,148" fill="none" stroke="#9DCC84" stroke-width="4"/>
-      <polyline points="20,188 120,172 220,168 320,146 430,128 540,112" fill="none" stroke="#6F70FF" stroke-width="5"/>
-    </svg>
-    <div class="floating-chip chip-a">Цена -5%</div>
-    <div class="floating-chip chip-b">Промо +20%</div>
-    <div class="floating-chip chip-c">Логистика 1.1x</div>
-    <div class="metric-float metric-a"><span>Спрос</span><b>+8.4%</b></div>
-    <div class="metric-float metric-b"><span>Выручка</span><b>+124k</b></div>
-    <div class="metric-float metric-c"><span>Прибыль</span><b>+48k</b></div>
-    <div class="report-badge">Рекомендуется к пилоту</div>
+  <div class="surface-card hero-preview-card">
+    <div class="card-title">Пример результата</div>
+    <div class="mini">Пример результата, не расчёт по вашим данным</div>
+    <div class="preview-row"><div class="preview-label">Цена</div><div class="preview-value">1 290 ₽ → 1 390 ₽</div></div>
+    <div class="preview-row"><div class="preview-label">Спрос</div><div class="preview-value">-12%</div></div>
+    <div class="preview-row"><div class="preview-label">Выручка</div><div class="preview-value">+4%</div></div>
+    <div class="preview-row"><div class="preview-label">Прибыль</div><div class="preview-value">+18%</div></div>
+    <div class="preview-row"><div class="preview-label">Надёжность</div><div class="preview-value">Средняя</div></div>
+    <div class="scenario-help">Вывод: можно проверить как пилот.</div>
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
-    b1, b2 = st.columns(2)
-    if b1.button("Загрузить данные", type="primary", use_container_width=True, key="landing_try_v2"):
-        return "app"
-    if b2.button("Открыть приложение", use_container_width=True, key="landing_demo_v2"):
+    if st.button("Загрузить данные", type="primary", use_container_width=True, key="landing_try"):
         return "app"
     return None
 
 
-def render_landing_proof_strip() -> None:
+def render_landing_decisions() -> None:
     st.markdown(
         """
-<div class="proof-strip">
-  <div class="proof-item">⚡ Воспроизводимые расчёты</div>
-  <div class="proof-item">🏷️ Цена / скидка / промо / логистика</div>
-  <div class="proof-item">📈 Спрос / выручка / прибыль / маржа</div>
-  <div class="proof-item">📄 Отчёт для руководителя</div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-def render_landing_controls_and_outputs() -> None:
-    st.markdown(
-        """
-<div class="split-showcase">
-  <div class="surface-card">
-    <div class="card-title">Какие решения можно проверить</div>
-    <ul class="landing-list">
-      <li>Стоит ли делать скидку</li>
-      <li>Что будет при изменении цены</li>
-      <li>Окупится ли промо</li>
-      <li>Что если вырастет логистика</li>
-      <li>Что если спрос резко изменится</li>
-    </ul>
-    <div class="mini-control-panel">
-      <div>Цена: <b>1290 ₽</b></div>
-      <div class="mini-slider"><span>Промо</span><div></div></div>
-      <div class="mini-slider"><span>Логистика</span><div></div></div>
-      <div class="floating-chip">Шок +5%</div>
-      <button>Рассчитать сценарий</button>
-    </div>
-  </div>
-  <div class="surface-card">
-    <div class="card-title">Что пользователь получает</div>
-    <ul class="landing-list">
-      <li>Базовый прогноз и сценарный прогноз</li>
-      <li>Сравнение вариантов A/B/C</li>
-      <li>Экономика прибыли и маржи</li>
-      <li>Надёжность и предупреждения</li>
-      <li>XLSX/CSV/JSON экспорт</li>
-    </ul>
-    <div class="mini-dashboard">
-      <div class="mini-dashboard-grid">
-        <div><span>Спрос</span><b>+8.4%</b></div>
-        <div><span>Выручка</span><b>+124k</b></div>
-        <div><span>Прибыль</span><b>+48k</b></div>
-      </div>
-      <div class="report-badge">Надёжность: Средняя</div>
-    </div>
-  </div>
+<div class="section-title">Какие решения можно проверить</div>
+<div class="grid-3">
+  <div class="surface-card"><div class="card-title">Цена</div><div class="muted">Что будет, если повысить или снизить цену.</div></div>
+  <div class="surface-card"><div class="card-title">Скидка и промо</div><div class="muted">Окупится ли акция, скидка или промо-поддержка.</div></div>
+  <div class="surface-card"><div class="card-title">Затраты и внешний спрос</div><div class="muted">Как изменится прибыль при росте логистики или ручной поправке спроса.</div></div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -317,62 +256,59 @@ def render_landing_pipeline() -> None:
         """
 <div class="section-title">Как это работает</div>
 <div class="pipeline-row">
-  <div class="pipeline-step"><span>🧾</span><b>Загрузите данные</b></div>
+  <div class="pipeline-step"><span>🧾</span><b>Загрузите файл продаж</b></div>
   <div class="pipeline-arrow">→</div>
-  <div class="pipeline-step"><span>📈</span><b>Система строит базовый прогноз</b></div>
+  <div class="pipeline-step"><span>📦</span><b>Выберите товар</b></div>
   <div class="pipeline-arrow">→</div>
-  <div class="pipeline-step"><span>🎛️</span><b>Настройте сценарий</b></div>
+  <div class="pipeline-step"><span>🎛️</span><b>Измените цену, скидку или промо</b></div>
   <div class="pipeline-arrow">→</div>
-  <div class="pipeline-step"><span>✅</span><b>Сравните и сохраните отчёт</b></div>
+  <div class="pipeline-step"><span>✅</span><b>Сравните сценарий с текущим планом</b></div>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
 
-def render_landing_trust_v2() -> None:
-    st.markdown('<div class="section-title">Почему можно доверять</div>', unsafe_allow_html=True)
+def render_landing_outputs() -> None:
+    st.markdown('<div class="section-title">Что вы получите после расчёта</div>', unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
-    c1.markdown('<div class="surface-card"><div class="card-title">Прозрачный сценарий</div><div class="muted">Видно, какие параметры попали в расчёт.</div></div>', unsafe_allow_html=True)
-    c2.markdown('<div class="surface-card"><div class="card-title">Понятный результат</div><div class="muted">Сразу видно, как меняются спрос, выручка и прибыль.</div></div>', unsafe_allow_html=True)
-    c3.markdown('<div class="surface-card"><div class="card-title">Надёжность оценки</div><div class="muted">Отчёт показывает уровень уверенности и предупреждения.</div></div>', unsafe_allow_html=True)
+    c1.markdown('<div class="surface-card"><div class="card-title">Текущий план</div><div class="muted">Оценка спроса, выручки, прибыли и маржи на выбранный период.</div></div>', unsafe_allow_html=True)
+    c2.markdown('<div class="surface-card"><div class="card-title">Сценарий</div><div class="muted">Сравнение текущего плана с вашим сценарием.</div></div>', unsafe_allow_html=True)
+    c3.markdown('<div class="surface-card"><div class="card-title">Отчёт</div><div class="muted">Excel/CSV/JSON с результатами для проверки и обсуждения.</div></div>', unsafe_allow_html=True)
     st.markdown(
         """
 <div class="surface-card mini-report-preview">
-  <div class="mini">Итог отчёта</div>
-  <div class="report-badge">Рекомендуется к пилоту</div>
-  <div class="mini-dashboard-grid">
-    <div><span>Δ спроса</span><b>+8.4%</b></div>
-    <div><span>Δ выручки</span><b>+124k</b></div>
-    <div><span>Δ прибыли</span><b>+48k</b></div>
-  </div>
-  <div class="mini">Почему результат такой: цена и промо усиливают прогноз, логистика сдерживает рост.</div>
+  <div class="card-title">Краткий вывод</div>
+  <div class="muted">Сценарий повышает прибыль, но снижает спрос. Надёжность средняя: цену стоит проверять пилотом.</div>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
+def render_landing_data_requirements() -> None:
+    st.markdown('<div class="section-title">Какие данные нужны</div>', unsafe_allow_html=True)
+    st.markdown("""<div class="grid-3"><div class="surface-card"><div class="card-title">Минимально</div><ul class="landing-list"><li>Дата</li><li>Товар / SKU</li><li>Продажи в штуках</li><li>Цена</li></ul></div>
+<div class="surface-card"><div class="card-title">Желательно</div><ul class="landing-list"><li>Себестоимость</li><li>Скидка</li><li>Промо</li><li>Логистика</li><li>Остатки</li></ul></div>
+<div class="surface-card"><div class="card-title">Дополнительно</div><ul class="landing-list"><li>Трафик</li><li>Спрос</li><li>Сезонность</li><li>Конкуренты</li><li>Погода и праздники</li></ul></div></div>""", unsafe_allow_html=True)
+    st.markdown('<div class="muted">Чем больше в истории реальных изменений цены, скидок и промо, тем надёжнее сценарный анализ.</div>', unsafe_allow_html=True)
 
-def render_landing_cta_v2() -> str | None:
+def render_landing_limits() -> None:
+    st.markdown('<div class="surface-card"><div class="section-title">Что важно понимать</div><div class="muted">Инструмент не обещает идеальную цену автоматически. Он сравнивает сценарии на основе вашей истории продаж. Если данных мало или новая цена сильно отличается от прошлых значений, система покажет предупреждение и снизит уровень надёжности.</div></div>', unsafe_allow_html=True)
+
+def render_landing_cta() -> str | None:
     st.markdown(
         """
-<div class="surface-card" style="text-align:center; position:relative;">
-<div class="section-title">Не просто прогноз продаж. Проверка решения до потери денег</div>
-  <div class="muted">LLM может объяснить идею. Этот инструмент считает сценарии на ваших данных, фиксирует формулы, сравнивает варианты и формирует отчёт.</div>
-  <div class="cta-float cta-a">Scenario applied</div>
-  <div class="cta-float cta-b">Profit +48k</div>
-  <div class="cta-float cta-c">High confidence</div>
+<div class="surface-card" style="text-align:center;">
+<div class="section-title">Проверьте сценарий на своих данных</div>
+  <div class="muted">Загрузите файл продаж и получите понятное сравнение текущего плана и вашего сценария.</div>
 </div>
 """,
         unsafe_allow_html=True,
     )
-    c1, c2 = st.columns(2)
-    if c1.button("Перейти в приложение", type="primary", use_container_width=True, key="landing_cta_start_v2"):
-        return "app"
-    if c2.button("Посмотреть интерфейс", use_container_width=True, key="landing_cta_demo_v2"):
+    if st.button("Начать анализ", type="primary", use_container_width=True, key="landing_cta_start"):
         return "app"
     return None
 
 
 def render_landing_footer() -> None:
-    st.markdown('<div class="mini" style="text-align:center;padding:20px 0;">What-if Cloud</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mini" style="text-align:center;padding:20px 0;">What-if Cloud · Сценарный анализ цены, спроса и прибыли</div>', unsafe_allow_html=True)
