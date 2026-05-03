@@ -41,10 +41,12 @@ from v1_runtime_helpers import (
     select_weekly_baseline_candidate,
 )
 from what_if import build_sensitivity_grid, run_scenario_set
+from price_optimizer import analyze_price_optimization, build_price_optimizer_signature
 from ui.theme import apply_theme
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+ACTIONABLE_PRICE_OPT_STATUSES = {"price_increase_recommended", "price_decrease_recommended"}
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -5695,6 +5697,81 @@ def fmt_pct_delta(value: Any) -> str:
     return f"{v:+.1f}%"
 
 
+def render_price_optimizer_summary(opt: Dict[str, Any]) -> None:
+    if not isinstance(opt, dict) or len(opt) == 0:
+        render_empty_state("Оптимальная цена ещё не рассчитана", "Нажмите кнопку ниже, чтобы проверить несколько цен через текущий механизм what-if.")
+        return
+    title = str(opt.get("recommendation_title", "Результат анализа цены"))
+    text = str(opt.get("recommendation_text", ""))
+    status = str(opt.get("status", ""))
+    css = "scenario-info-inline"
+    if status in {"price_increase_recommended", "price_decrease_recommended"}:
+        css = "scenario-success-inline"
+    elif status in {"insufficient_support", "risky_only", "no_valid_candidates", "optimizer_error"}:
+        css = "scenario-warning-inline"
+    elif status in {"no_profit_data"}:
+        css = "scenario-danger-inline"
+    st.markdown(f'<div class="{css}"><b>{title}</b><br>{text}</div>', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Текущая цена", fmt_price(opt.get("current_price", np.nan)))
+    price_label = "Рекомендуемая цена" if str(opt.get("status", "")) in ACTIONABLE_PRICE_OPT_STATUSES else "Лучший расчётный кандидат"
+    c2.metric(price_label, fmt_price(opt.get("recommended_price", np.nan)))
+    c3.metric("Ожидаемая прибыль", fmt_money_total(opt.get("recommended_profit", np.nan)), fmt_pct_delta(opt.get("profit_delta_pct", np.nan)))
+    conf = float(opt.get("confidence", 0.0)) if np.isfinite(float(opt.get("confidence", 0.0))) else np.nan
+    c4.metric("Надёжность", str(opt.get("confidence_label", "—")) or "—", f"{conf:.2f}" if np.isfinite(conf) else "—")
+    rec_min, rec_max = opt.get("recommended_price_min", np.nan), opt.get("recommended_price_max", np.nan)
+    if np.isfinite(float(rec_min)) and np.isfinite(float(rec_max)):
+        st.info(f"Рекомендуемый диапазон: **{fmt_price(rec_min)} — {fmt_price(rec_max)}**.")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Спрос", fmt_units(opt.get("recommended_demand", np.nan)), fmt_pct_delta(opt.get("demand_delta_pct", np.nan)))
+    d2.metric("Выручка", fmt_money_total(opt.get("recommended_revenue", np.nan)), fmt_pct_delta(opt.get("revenue_delta_pct", np.nan)))
+    d3.metric("Прибыль", fmt_money_total(opt.get("recommended_profit", np.nan)), fmt_pct_delta(opt.get("profit_delta_pct", np.nan)))
+    st.caption("Изменения сравниваются с текущей ценой при выбранных условиях сценария.")
+    warnings_list = opt.get("warnings", [])
+    if isinstance(warnings_list, list) and warnings_list:
+        with st.expander("Ограничения и предупреждения", expanded=False):
+            for w in warnings_list[:8]:
+                st.warning(str(w))
+
+
+def render_price_optimizer_chart(opt: Dict[str, Any]) -> None:
+    candidates = opt.get("candidates", pd.DataFrame()) if isinstance(opt, dict) else pd.DataFrame()
+    if not isinstance(candidates, pd.DataFrame) or len(candidates) == 0:
+        st.info("Нет таблицы кандидатов для графика.")
+        return
+    plot_df = candidates.copy()
+    plot_df["Цена"] = pd.to_numeric(plot_df["price"], errors="coerce")
+    plot_df["Прибыль"] = pd.to_numeric(plot_df["profit"], errors="coerce")
+    plot_df["Статус"] = np.where(plot_df.get("valid_for_recommendation", False).astype(bool), "Можно рекомендовать", "Только ориентир / риск")
+    fig = px.line(plot_df, x="Цена", y="Прибыль", markers=True, color="Статус")
+    current_price = opt.get("current_price", np.nan)
+    recommended_price = opt.get("recommended_price", np.nan)
+    status = str(opt.get("status", ""))
+    recommended_label = "Рекомендация" if status in ACTIONABLE_PRICE_OPT_STATUSES else "Кандидат"
+    if np.isfinite(float(current_price)):
+        fig.add_vline(x=float(current_price), line_dash="dash", annotation_text="Текущая цена", annotation_position="top left")
+    if recommended_price is not None and np.isfinite(float(recommended_price)):
+        fig.add_vline(x=float(recommended_price), line_dash="dot", annotation_text=recommended_label, annotation_position="top right")
+    fig.update_layout(**_plot_layout("Прибыль при разных ценах"))
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+def render_price_optimizer_table(opt: Dict[str, Any]) -> None:
+    candidates = opt.get("candidates", pd.DataFrame()) if isinstance(opt, dict) else pd.DataFrame()
+    if not isinstance(candidates, pd.DataFrame) or len(candidates) == 0:
+        return
+    table = candidates.copy()
+    current_profit = float(opt.get("current_profit", np.nan))
+    if np.isfinite(current_profit):
+        table["profit_delta_pct"] = ((pd.to_numeric(table["profit"], errors="coerce") - current_profit) / max(abs(current_profit), 1e-9)) * 100.0
+    else:
+        table["profit_delta_pct"] = np.nan
+    table["status_text"] = np.where(table.get("valid_for_recommendation", False).astype(bool), "Можно рекомендовать", "Только ориентир / риск")
+    view = table[["price", "demand", "revenue", "profit", "profit_delta_pct", "margin_pct", "confidence_label", "support_label", "status_text"]].copy()
+    view = view.rename(columns={"price": "Цена", "demand": "Спрос", "revenue": "Выручка", "profit": "Прибыль", "profit_delta_pct": "Δ прибыли, %", "margin_pct": "Маржа, %", "confidence_label": "Надёжность", "support_label": "Поддержка", "status_text": "Статус"})
+    st.dataframe(view.sort_values("Прибыль", ascending=False).head(10), use_container_width=True, hide_index=True)
+
+
 def fmt_pp_delta(value: Any) -> str:
     if _is_nan(value):
         return "—"
@@ -6285,6 +6362,12 @@ def reset_scenario_ui_state_to_base(results: Dict[str, Any], clear_saved_slot: b
     results["manual_scenario_daily_csv"] = b""
     st.session_state.what_if_result = None
     st.session_state.applied_scenario_snapshot = None
+    st.session_state.sensitivity_df = None
+    st.session_state.price_optimizer_result_base = None
+    st.session_state.price_optimizer_signature_base = None
+    st.session_state.price_optimizer_result_scenario = None
+    st.session_state.price_optimizer_signature_scenario = None
+    st.session_state.price_optimizer_context = None
     st.session_state.scenario_ui_status = "as_is"
     if clear_saved_slot:
         st.session_state.last_saved_slot = None
@@ -6398,6 +6481,18 @@ if __name__ == "__main__":
         st.session_state.scenario_table = None
     if "sensitivity_df" not in st.session_state:
         st.session_state.sensitivity_df = None
+    if "price_optimizer_result_base" not in st.session_state:
+        st.session_state.price_optimizer_result_base = None
+    if "price_optimizer_signature_base" not in st.session_state:
+        st.session_state.price_optimizer_signature_base = None
+    if "price_optimizer_result_scenario" not in st.session_state:
+        st.session_state.price_optimizer_result_scenario = None
+    if "price_optimizer_signature_scenario" not in st.session_state:
+        st.session_state.price_optimizer_signature_scenario = None
+    if "price_optimizer_context" not in st.session_state:
+        st.session_state.price_optimizer_context = None
+    if "price_optimizer_auto_run" not in st.session_state:
+        st.session_state.price_optimizer_auto_run = False
     if "saved_scenarios" not in st.session_state:
         st.session_state.saved_scenarios = {}
     if "compare_slot" not in st.session_state:
@@ -6887,6 +6982,15 @@ def render_upload_screen() -> dict[str, Any]:
                 key="input_analysis_calc_mode",
             )
             st.caption("Техническая настройка режима расчёта. Если не уверены — оставьте по умолчанию.")
+            auto_price_optimizer = st.checkbox(
+                "После анализа сразу показать оптимальную цену",
+                value=False,
+                help=(
+                    "Оптимизатор не меняет расчёт спроса и не применяет цену автоматически. "
+                    "Он только проверит несколько цен через текущий what-if механизм и покажет рекомендацию."
+                ),
+                key="input_auto_price_optimizer",
+            )
         if target_category and target_sku:
             st.info(f"Будет рассчитан SKU: **{target_sku}** в категории **{target_category}**.")
         run_requested = st.button("Запустить анализ", type="primary", use_container_width=True)
@@ -6900,6 +7004,7 @@ def render_upload_screen() -> dict[str, Any]:
         "run_requested": run_requested,
         "horizon_days": horizon_days,
         "analysis_calc_mode": analysis_calc_mode,
+        "auto_price_optimizer": bool(auto_price_optimizer),
     }
 
 
@@ -6935,6 +7040,41 @@ if __name__ == "__main__":
                         scenario_calc_mode=str(ctx.get("analysis_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
                         horizon_days=int(ctx.get("horizon_days", CONFIG["HORIZON_DAYS_DEFAULT"])),
                     )
+                    if bool(ctx.get("auto_price_optimizer", False)) and not bool(results.get("blocking_error", False)):
+                        try:
+                            opt_overrides = {}
+                            st.session_state.price_optimizer_signature_base = build_price_optimizer_signature(
+                                current_price=float(results.get("current_price", 0.0)),
+                                horizon_days=int(ctx.get("horizon_days", CONFIG["HORIZON_DAYS_DEFAULT"])),
+                                scenario_calc_mode=str(results.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+                                price_guardrail_mode=DEFAULT_PRICE_GUARDRAIL_MODE,
+                                overrides=opt_overrides,
+                                factor_overrides={},
+                                freight_multiplier=1.0,
+                                demand_multiplier=1.0,
+                                candidate_count=25,
+                                search_pct=0.20,
+                            )
+                            st.session_state.price_optimizer_result_base = analyze_price_optimization(
+                                trained_bundle=results["_trained_bundle"],
+                                current_price=float(results.get("current_price", 0.0)),
+                                runner=run_what_if_projection,
+                                horizon_days=int(ctx.get("horizon_days", CONFIG["HORIZON_DAYS_DEFAULT"])),
+                                scenario_calc_mode=str(results.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+                                price_guardrail_mode=DEFAULT_PRICE_GUARDRAIL_MODE,
+                                overrides=opt_overrides,
+                                factor_overrides={},
+                                freight_multiplier=1.0,
+                                demand_multiplier=1.0,
+                                candidate_count=25,
+                                search_pct=0.20,
+                            )
+                            st.session_state.active_workspace_tab = "Оптимальная цена"
+                            st.session_state["workspace_tab_radio"] = "Оптимальная цена"
+                        except Exception as exc:
+                            st.session_state.price_optimizer_result_base = {"status": "optimizer_error", "recommendation_title": "Оптимизатор цены не был рассчитан", "recommendation_text": f"Базовый анализ выполнен, но оптимизатор цены завершился ошибкой: {exc}", "warnings": [str(exc)], "candidates": pd.DataFrame()}
+                            st.session_state.price_optimizer_signature_base = None
+                            st.session_state.price_optimizer_context = "base"
                     st.session_state.results = copy.deepcopy(results)
                     st.session_state["what_if_calc_mode"] = str(results.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
                     st.session_state.selected_category_for_results = ctx["target_category"]
@@ -7017,7 +7157,7 @@ if __name__ == "__main__":
         "Диагностика": "Отчёт",
         "Отчет": "Отчёт",
     }
-    tabs = ["Итог", "Проверить цену и промо", "Сравнить варианты", "Отчёт"]
+    tabs = ["Итог", "Оптимальная цена", "Проверить цену и промо", "Сравнить варианты", "Отчёт"]
     current_tab = TAB_ALIASES.get(str(st.session_state.get("active_workspace_tab", "Итог")), str(st.session_state.get("active_workspace_tab", "Итог")))
     radio_tab = TAB_ALIASES.get(str(st.session_state.get("workspace_tab_radio", current_tab)), str(st.session_state.get("workspace_tab_radio", current_tab)))
     if current_tab not in tabs:
@@ -7092,6 +7232,73 @@ if __name__ == "__main__":
         close_surface()
 
 
+    elif active_tab == "Оптимальная цена":
+        render_page_header("Оптимальная цена", "Проверьте, есть ли цена, которая может дать больше прибыли при допустимом уровне риска.")
+        current_factor_overrides = factor_overrides if "factor_overrides" in locals() else {}
+        base_opt_overrides = {
+            "promotion": float(st.session_state.get("what_if_promo", r.get("_trained_bundle", {}).get("base_ctx", {}).get("promotion", 0.0))),
+            "discount": float(st.session_state.get("what_if_discount", r.get("_trained_bundle", {}).get("base_ctx", {}).get("discount", 0.0))),
+        }
+        current_opt_signature = build_price_optimizer_signature(
+            current_price=float(r.get("current_price", 0.0)),
+            horizon_days=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])),
+            scenario_calc_mode=str(st.session_state.get("what_if_calc_mode", r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))),
+            price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+            overrides=base_opt_overrides,
+            factor_overrides=current_factor_overrides,
+            freight_multiplier=float(st.session_state.get("what_if_freight_mult", 1.0)),
+            demand_multiplier=float(st.session_state.get("what_if_demand_mult", 1.0)),
+            candidate_count=25,
+            search_pct=0.20,
+        )
+        if st.button("Найти оптимальную цену", type="primary", use_container_width=True, key="run_price_optimizer_btn"):
+            st.session_state.price_optimizer_result_base = analyze_price_optimization(
+                trained_bundle=r["_trained_bundle"],
+                current_price=float(r.get("current_price", 0.0)),
+                runner=run_what_if_projection,
+                horizon_days=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])),
+                scenario_calc_mode=str(st.session_state.get("what_if_calc_mode", r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))),
+                price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+                overrides=base_opt_overrides,
+                factor_overrides=current_factor_overrides,
+                freight_multiplier=float(st.session_state.get("what_if_freight_mult", 1.0)),
+                demand_multiplier=float(st.session_state.get("what_if_demand_mult", 1.0)),
+                candidate_count=25,
+                search_pct=0.20,
+            )
+            st.session_state.price_optimizer_signature_base = build_price_optimizer_signature(
+                current_price=float(r.get("current_price", 0.0)),
+                horizon_days=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])),
+                scenario_calc_mode=str(st.session_state.get("what_if_calc_mode", r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))),
+                price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+                overrides=base_opt_overrides,
+                factor_overrides=current_factor_overrides,
+                freight_multiplier=float(st.session_state.get("what_if_freight_mult", 1.0)),
+                demand_multiplier=float(st.session_state.get("what_if_demand_mult", 1.0)),
+                candidate_count=25,
+                search_pct=0.20,
+            )
+            st.session_state.price_optimizer_context = "base"
+        opt = st.session_state.get("price_optimizer_result_base")
+        is_price_optimizer_stale = st.session_state.get("price_optimizer_signature_base") != current_opt_signature
+        if is_price_optimizer_stale and opt is not None:
+            st.warning("Рекомендация по цене устарела: параметры сценария изменились. Нажмите «Найти оптимальную цену» ещё раз.")
+        render_price_optimizer_summary(opt or {})
+        st.caption("Контекст: рекомендация рассчитана для базовых условий.")
+        if isinstance(opt, dict):
+            rp = opt.get("recommended_price")
+            can_apply = (
+                opt.get("status") in ACTIONABLE_PRICE_OPT_STATUSES
+                and rp is not None
+                and np.isfinite(float(rp))
+                and (not is_price_optimizer_stale)
+            )
+            if st.button("Применить рекомендованную цену в what-if", use_container_width=True, disabled=not can_apply, key="apply_price_optimizer_to_what_if"):
+                st.session_state["what_if_price"] = float(rp)
+                st.session_state.scenario_ui_status = "dirty"
+                st.rerun()
+            render_price_optimizer_chart(opt)
+            render_price_optimizer_table(opt)
     elif active_tab == "Проверить цену и промо":
         render_page_header("Проверить цену и промо", "Измените ключевые параметры и нажмите «Рассчитать сценарий».")
         st.info("Изменения не применяются автоматически. Настройте параметры и нажмите «Рассчитать сценарий»." )
@@ -7701,6 +7908,52 @@ if __name__ == "__main__":
             st.caption("Сначала рассчитайте сценарий.")
 
         st.info("Сравнить с текущим планом можно во вкладке «Сравнить варианты».")
+        open_surface("Оптимальная цена для текущих условий", "Можно проверить, какая цена выглядит лучше при выбранных скидке, промо, логистике и внешнем шоке.")
+        scenario_reference_price = float(st.session_state.get("what_if_price", r.get("current_price", 0.0)))
+        scenario_opt_signature = build_price_optimizer_signature(
+            current_price=scenario_reference_price,
+            horizon_days=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])),
+            scenario_calc_mode=str(st.session_state.get("what_if_calc_mode", r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))),
+            price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+            overrides={"promotion": float(st.session_state.get("what_if_promo", 0.0)), "discount": float(st.session_state.get("what_if_discount", 0.0))},
+            factor_overrides=factor_overrides if "factor_overrides" in locals() else {},
+            freight_multiplier=float(st.session_state.get("what_if_freight_mult", 1.0)),
+            demand_multiplier=float(st.session_state.get("what_if_demand_mult", 1.0)),
+            candidate_count=25,
+            search_pct=0.20,
+        )
+        scenario_opt = st.session_state.get("price_optimizer_result_scenario")
+        is_scenario_price_optimizer_stale = (
+            st.session_state.get("price_optimizer_signature_scenario") != scenario_opt_signature
+        )
+        if is_scenario_price_optimizer_stale and isinstance(scenario_opt, dict):
+            st.warning(
+                "Сценарная рекомендация по цене устарела: параметры сценария изменились. "
+                "Нажмите «Найти цену для текущих условий» ещё раз."
+            )
+        if st.button("Найти цену для текущих условий", key="run_price_optimizer_from_scenario_tab", use_container_width=True):
+            st.session_state.price_optimizer_result_scenario = analyze_price_optimization(
+                trained_bundle=r["_trained_bundle"],
+                current_price=scenario_reference_price,
+                runner=run_what_if_projection,
+                horizon_days=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])),
+                scenario_calc_mode=str(st.session_state.get("what_if_calc_mode", r.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))),
+                price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+                overrides={"promotion": float(st.session_state.get("what_if_promo", 0.0)), "discount": float(st.session_state.get("what_if_discount", 0.0))},
+                factor_overrides=factor_overrides if "factor_overrides" in locals() else {},
+                freight_multiplier=float(st.session_state.get("what_if_freight_mult", 1.0)),
+                demand_multiplier=float(st.session_state.get("what_if_demand_mult", 1.0)),
+                candidate_count=25,
+                search_pct=0.20,
+            )
+            st.session_state.price_optimizer_signature_scenario = scenario_opt_signature
+            st.session_state.price_optimizer_context = "scenario"
+        if isinstance(st.session_state.get("price_optimizer_result_scenario"), dict):
+            render_price_optimizer_summary(st.session_state.get("price_optimizer_result_scenario"))
+            render_price_optimizer_chart(st.session_state.get("price_optimizer_result_scenario"))
+            render_price_optimizer_table(st.session_state.get("price_optimizer_result_scenario"))
+            st.caption("Контекст: рекомендация рассчитана для текущих условий сценария.")
+        close_surface()
 
         open_surface("Проверка соседних цен")
         st.caption("График показывает, как могла бы измениться прибыль при нескольких ценах рядом с текущей. Это вспомогательная проверка, а не автоматический выбор оптимальной цены.")
