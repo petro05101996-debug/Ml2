@@ -42,6 +42,11 @@ from v1_runtime_helpers import (
 )
 from what_if import build_sensitivity_grid, run_scenario_set
 from price_optimizer import analyze_price_optimization, build_price_optimizer_signature
+from decision_candidate_engine import generate_decision_candidates, evaluate_decision_candidates
+from decision_optimizer import rank_decision_candidates
+from decision_passport import build_decision_passport
+from decision_math import safe_pct_delta
+from recommendation_auditor import audit_and_improve_recommendation
 from ui.theme import apply_theme
 
 warnings.filterwarnings("ignore")
@@ -7273,7 +7278,7 @@ if __name__ == "__main__":
         "Отчёт": "Экспорт",
         "Отчет": "Экспорт",
     }
-    tabs = ["Итог", "Оптимальная цена", "Сценарий", "Сравнить варианты", "Экспорт"]
+    tabs = ["Итог", "Оптимальная цена", "Сценарий", "Проверка решений", "Сравнить варианты", "Экспорт"]
     current_tab = TAB_ALIASES.get(str(st.session_state.get("active_workspace_tab", "Итог")), str(st.session_state.get("active_workspace_tab", "Итог")))
     radio_tab = TAB_ALIASES.get(str(st.session_state.get("workspace_tab_radio", current_tab)), str(st.session_state.get("workspace_tab_radio", current_tab)))
     if current_tab not in tabs:
@@ -8167,6 +8172,162 @@ if __name__ == "__main__":
         close_surface()
         st.caption("Технические детали доступны во вкладке «Экспорт».")
         st.markdown("</div>", unsafe_allow_html=True)
+
+
+    elif active_tab == "Проверка решений":
+        render_page_header("Проверка коммерческих решений", "Decision layer: найти лучшее решение или улучшить внешнюю рекомендацию без причинных обещаний.")
+        if not isinstance(r.get("_trained_bundle"), dict) or not r.get("_trained_bundle"):
+            st.warning("Сначала выполните базовый анализ: для проверки решений нужен обученный bundle.")
+            st.stop()
+        objective_map = {
+            "Максимизировать прибыль": "profit",
+            "Увеличить выручку": "revenue",
+            "Сохранить спрос": "demand",
+            "Снизить риск": "risk_reduction",
+        }
+        action_map = {
+            "Цена": "price_change",
+            "Скидка": "discount_change",
+            "Промо": "promotion_change",
+            "Demand shock / маркетинговая гипотеза": "demand_shock",
+        }
+        reverse_action_map = {
+            "Изменить цену": "price_change",
+            "Изменить скидку": "discount_change",
+            "Изменить промо": "promotion_change",
+            "Изменить спрос / маркетинг-гипотезу": "demand_shock",
+        }
+
+        def _show_decision_passport(passport: Dict[str, Any], table: Optional[List[Dict[str, Any]]] = None) -> None:
+            st.subheader(passport.get("decision_title", "Решение"))
+            rel = passport.get("reliability", {}) or {}
+            eff = passport.get("expected_effect", {}) or {}
+            action = passport.get("recommended_action", {}) or {}
+            st.info(f"Решение: {action.get('title') or action.get('action_type')}. Статус: {passport.get('decision_status')}. Что делать: внедрять только согласно плану проверки ниже.")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Decision Reliability", f"{float(rel.get('score', 0.0)):.0f}/100")
+            m2.metric("Риск", str(rel.get("risk_level", "n/a")))
+            m3.metric("Demand Δ", fmt_pct_delta(float(eff.get("demand_delta_pct", 0.0))))
+            m4.metric("Revenue Δ", fmt_pct_delta(float(eff.get("revenue_delta_pct", 0.0))))
+            m5.metric("Conservative profit Δ", fmt_pct_delta(float(eff.get("conservative_profit_delta_pct", eff.get("profit_delta_pct", 0.0)))))
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Почему это решение**")
+                for item in passport.get("evidence", [])[:5]:
+                    st.write(f"• {item}")
+            with c2:
+                st.markdown("**Ограничения**")
+                for item in passport.get("limitations", [])[:6]:
+                    st.write(f"• {item}")
+            st.markdown("**План проверки**")
+            st.json(passport.get("validation_plan", {}), expanded=False)
+            st.download_button(
+                "Скачать decision_passport.json",
+                data=json.dumps(passport, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name="decision_passport.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            technical_failed = any(bool(((row or {}).get("full_reliability") or (row or {}).get("reliability") or {}).get("technical_error")) for row in (table or []))
+            if technical_failed:
+                st.warning("Часть вариантов не рассчиталась технически и исключена из рекомендаций. Подробности доступны в таблице кандидатов.")
+            with st.expander("Подробнее: alternatives / candidates", expanded=False):
+                st.json(passport.get("alternatives", {}), expanded=False)
+                if table:
+                    st.dataframe(pd.DataFrame(table), use_container_width=True)
+
+        decision_tab, audit_tab = st.tabs(["Найти лучшее решение", "Проверить и улучшить рекомендацию"])
+        with decision_tab:
+            d_obj_label = st.selectbox("Цель", list(objective_map.keys()), key="decision_objective")
+            d_actions = st.multiselect("Разрешённые действия", list(action_map.keys()), default=["Цена", "Скидка", "Промо"], key="decision_allowed_actions")
+            d_horizon = st.number_input("Горизонт, дней", min_value=7, max_value=120, value=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])), step=1, key="decision_horizon")
+            if st.button("Найти лучшее решение", key="run_decision_optimizer", use_container_width=True):
+                objective = objective_map[d_obj_label]
+                candidates = generate_decision_candidates(
+                    r["_trained_bundle"],
+                    None,
+                    objective=objective,
+                    allowed_actions=[action_map[a] for a in d_actions],
+                    horizon_days=int(d_horizon),
+                )
+                evaluated = evaluate_decision_candidates(
+                    r,
+                    r["_trained_bundle"],
+                    candidates,
+                    run_what_if_projection,
+                    scenario_calc_mode=str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+                    price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+                    horizon_days=int(d_horizon),
+                    objective=objective,
+                )
+                opt = rank_decision_candidates(evaluated, objective=objective)
+                passport = build_decision_passport("find_best_decision", opt)
+                st.session_state["decision_optimizer_result"] = opt
+                st.session_state["decision_passport"] = passport
+            if isinstance(st.session_state.get("decision_passport"), dict):
+                _show_decision_passport(st.session_state["decision_passport"], st.session_state.get("decision_optimizer_result", {}).get("ranking_table"))
+        with audit_tab:
+            a_source = st.text_input("Источник рекомендации", value="manual", key="audit_source")
+            a_action_label = st.selectbox("Тип рекомендации", list(reverse_action_map.keys()), key="audit_action")
+            audit_action = reverse_action_map[a_action_label]
+            base_ctx_audit = r.get("_trained_bundle", {}).get("base_ctx", {})
+            if audit_action == "price_change":
+                a_target = st.number_input("Новая цена", min_value=0.01, value=float(r.get("current_price", base_ctx_audit.get("price", 1.0))), step=1.0, key="audit_target_price")
+                base_value = float(r.get("current_price", base_ctx_audit.get("price", 1.0)))
+                external_evidence = False
+                evidence_comment = ""
+            elif audit_action == "discount_change":
+                discount_pct = st.slider("Новая скидка, %", min_value=0, max_value=95, value=int(float(base_ctx_audit.get("discount", 0.0)) * 100), step=1, key="audit_target_discount_pct")
+                a_target = float(discount_pct) / 100.0
+                base_value = float(base_ctx_audit.get("discount", 0.0))
+                external_evidence = False
+                evidence_comment = ""
+            elif audit_action == "promotion_change":
+                promo_choice = st.selectbox("Промо", ["Выключить", "Включить"], key="audit_target_promo")
+                a_target = 1.0 if promo_choice == "Включить" else 0.0
+                base_value = float(base_ctx_audit.get("promotion", 0.0))
+                external_evidence = False
+                evidence_comment = ""
+            else:
+                demand_pct = st.slider("Ожидаемое изменение спроса, %", min_value=-50, max_value=50, value=0, step=1, key="audit_target_demand_pct")
+                a_target = 1.0 + float(demand_pct) / 100.0
+                base_value = 1.0
+                external_evidence = st.checkbox("Есть внешнее обоснование гипотезы", value=False, key="audit_external_evidence")
+                evidence_comment = st.text_input("Кратко: источник/обоснование гипотезы", value="", key="audit_evidence_comment")
+                st.caption("Demand shock — ручная гипотеза, а не выученный причинный эффект. Без внешнего обоснования она допускается только как experimental/test-only сценарий.")
+            a_obj_label = st.selectbox("Цель рекомендации", list(objective_map.keys()), key="audit_objective")
+            a_comment = st.text_area("Комментарий", value="Внешняя рекомендация", key="audit_comment")
+            a_horizon = st.number_input("Горизонт проверки, дней", min_value=7, max_value=120, value=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])), step=1, key="audit_horizon")
+            if st.button("Проверить и улучшить", key="run_recommendation_audit", use_container_width=True):
+                objective = objective_map[a_obj_label]
+                recommendation = {
+                    "source_name": a_source,
+                    "action_type": audit_action,
+                    "target_value": float(a_target),
+                    "change_pct": safe_pct_delta(float(a_target), base_value) if 'safe_pct_delta' in globals() else 0.0,
+                    "objective": objective,
+                    "comment": a_comment,
+                    "metadata": {"external_evidence": bool(external_evidence), "evidence_comment": evidence_comment},
+                }
+                audit = audit_and_improve_recommendation(
+                    r,
+                    r["_trained_bundle"],
+                    recommendation,
+                    run_what_if_projection,
+                    scenario_calc_mode=str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+                    price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+                    horizon_days=int(a_horizon),
+                    objective=objective,
+                )
+                st.session_state["recommendation_audit_result"] = audit
+            audit = st.session_state.get("recommendation_audit_result")
+            if isinstance(audit, dict):
+                verdict = audit.get("audit_verdict", {})
+                st.subheader(f"Вердикт: {verdict.get('verdict')}")
+                st.write(verdict.get("reason"))
+                st.markdown("**Улучшенное решение**")
+                st.json(audit.get("improved_solution", {}), expanded=False)
+                _show_decision_passport(audit.get("decision_passport", {}), audit.get("alternatives_table", []))
 
     elif active_tab == "Сравнить варианты":
         render_page_header("Сравнить варианты", "Сравните текущий план, ваш сценарий и сохранённые варианты.")
