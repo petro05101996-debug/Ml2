@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from decision_reliability import evaluate_decision_reliability
+from decision_reliability import evaluate_decision_reliability, estimate_effect_uncertainty
 
 
 def bundle(days=180, prices=None, include_cost=True):
@@ -142,3 +142,57 @@ def test_unknown_model_features_do_not_claim_price_is_used_by_ml():
     assert details["model_feature_known"] is False
     assert details["model_uses_price"] is False
     assert any("Список признаков модели неизвестен" in x for x in rel["warnings"])
+
+
+def test_model_quality_wape_is_already_percent_not_rescaled():
+    tb, res = bundle()
+    res["quality_report"]["holdout_metrics"]["wape"] = 0.67
+    out = evaluate_decision_reliability(res, tb, cand(), scenario(), BASE)
+    assert out["component_details"]["model_quality"]["wape"] == 0.67
+    assert not any("WAPE высокий" in w for w in out["warnings"])
+
+
+def test_strong_economic_extrapolation_blocks_auto_recommendation():
+    tb, res = bundle()
+    c = cand(target=150, change=50)
+    sc = scenario(
+        price=150,
+        ood_flag=True,
+        extrapolation_applied=True,
+        effective_scenario={"price_out_of_range": True},
+    )
+    sc["price_out_of_range"] = True
+    sc["extrapolation_price_ratio"] = 1.36
+    out = evaluate_decision_reliability(res, tb, c, sc, BASE, price_guardrail_mode="economic_extrapolation")
+    assert out["decision_status"] == "experimental_only"
+
+
+def test_uncertainty_wape_stays_percent_points_not_fraction_scaled():
+    out = estimate_effect_uncertainty({}, {"profit_total": 100.0}, {"profit_total": 103.0}, horizon_days=30, profit_delta_pct=3.0, wape=0.67)
+    assert out["method"] == "wape_approximation"
+    assert out["expected_model_error_pct"] < 2.5
+
+
+def test_fallback_elasticity_extrapolation_is_experimental_only():
+    tb, res = bundle()
+    c = cand(target=125, change=25)
+    sc = scenario(price=125, ood_flag=True, extrapolation_applied=True, effective_scenario={"price_out_of_range": True, "elasticity_source": "fallback_prior_invalid_elasticity"})
+    sc["price_out_of_range"] = True
+    sc["extrapolation_price_ratio"] = 1.12
+    sc["elasticity_source"] = "fallback_prior_invalid_elasticity"
+    out = evaluate_decision_reliability(res, tb, c, sc, BASE, price_guardrail_mode="economic_extrapolation")
+    assert out["decision_status"] == "experimental_only"
+    assert out["effect_nature"] == "prior_based"
+
+
+def test_out_of_safe_range_fallback_elasticity_extrapolation_is_experimental_only():
+    tb, res = bundle()
+    c = cand(target=125, change=25)
+    sc = scenario(price=125, ood_flag=True, extrapolation_applied=True, effective_scenario={"price_out_of_range": True, "elasticity_source": "fallback_prior_out_of_safe_range"})
+    sc["price_out_of_range"] = True
+    sc["extrapolation_price_ratio"] = 1.12
+    sc["elasticity_source"] = "fallback_prior_out_of_safe_range"
+    out = evaluate_decision_reliability(res, tb, c, sc, BASE, price_guardrail_mode="economic_extrapolation")
+    assert out["decision_status"] == "experimental_only"
+    assert out["recommendation_gate"] == "experimental_only"
+    assert out["effect_nature"] == "prior_based"

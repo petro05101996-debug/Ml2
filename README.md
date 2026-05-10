@@ -2,14 +2,14 @@
 
 Приложение поддерживает production-v1 контур:
 
-Universal CSV → stable weekly baseline (`legacy_baseline`) → scenario recompute / enhanced local factor layer → manual shock overlay.
+Universal CSV → stable weekly baseline (`legacy_baseline`) → default `enhanced_local_factors` what-if layer → manual shock overlay.
 
 Дополнительный режим `catboost_full_factors` доступен как расширенный сценарный режим: он повторно прогнозирует спрос по изменённым факторам, но не является production default.
 
 ## Возможности
 
 - Universal CSV загрузка с auto-mapping и нормализацией.
-- Stable v1 runtime: `legacy_baseline` по умолчанию.
+- Stable v1 runtime: `enhanced_local_factors` по умолчанию для what-if; `legacy_current` оставлен для совместимости.
 - What-if сценарии: цена, скидка, промо, логистика, внешний спрос.
 - Расширенный режим CatBoost full factors: модель переоценивает спрос по изменённым факторам.
 - Decision layer: проверяет сценарии, оценивает риск, экономический эффект и формирует план теста.
@@ -17,11 +17,29 @@ Universal CSV → stable weekly baseline (`legacy_baseline`) → scenario recomp
 
 ## Контракт v1
 
-- Production default: `legacy_baseline`.
-- Non-legacy weekly candidates используются как диагностика, если runtime frozen to legacy.
-- CatBoost full factors включается только выбранным режимом анализа.
+- Production what-if default: `enhanced_local_factors`.
+- `legacy_current` — совместимость/стабильный базовый пересчёт; enhanced — основной v1 слой прозрачных экономических факторов.
+- CatBoost full factors включается только выбранным advanced-режимом анализа и требует достаточно данных.
 - Decision layer ищет лучший найденный вариант среди проверенных сценариев, а не математически гарантированный глобальный оптимум.
 - Demand shock является ручной гипотезой, а не автоматически выученным причинным эффектом.
+
+## Режимы и ограничения
+
+- `legacy_current` — стабильный базовый режим совместимости.
+- `enhanced_local_factors` — production v1 what-if слой: baseline + прозрачные локальные эффекты цены/скидки/промо/логистики.
+- `catboost_full_factors` — advanced ML режим, который переоценивает спрос по факторам и требует достаточно данных.
+- `safe_clip` — безопасный guardrail: и спрос, и финансы считаются по цене внутри исторического диапазона.
+- `economic_extrapolation` — экспериментальный guardrail: спрос считается на границе диапазона с elasticity-tail за пределами, финансы — по введённой цене; такие сценарии должны рассматриваться как тестовые.
+- Decision layer — помощник для выбора сценария, но не доказательство причинности и не гарантия глобального оптимума.
+- Demand shock — ручная внешняя гипотеза / stress-test, не автоматически выученный эффект.
+
+## Что продукт НЕ делает
+
+- Не гарантирует глобальный оптимум.
+- Не доказывает причинно-следственную связь.
+- Не заменяет A/B-тест или контролируемый пилот.
+- Не должен автоматически рекомендовать решения при плохих данных или опасной экстраполяции.
+- Не должен быть единственным источником бизнес-решения.
 
 ## Запуск
 ```bash

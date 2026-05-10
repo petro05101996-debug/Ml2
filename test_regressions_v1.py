@@ -224,3 +224,137 @@ def test_manual_scenario_exports_effect_multipliers_and_verdict_consistently():
     scenario_summary = pd.read_excel(excel_blob, sheet_name="Scenario Summary")
     assert int(scenario_summary.loc[0, "manual_shocks"]) >= 1
     assert summary["manual_scenario_present"] is True
+
+
+def test_price_guardrail_economic_extrapolation_separates_model_and_financial_price():
+    clip = compute_scenario_price_inputs(
+        requested_price=140.0,
+        train_min=90.0,
+        train_max=110.0,
+        price_guardrail_mode="economic_extrapolation",
+        price_elasticity=-1.1,
+    )
+    assert clip["requested_price"] == 140.0
+    assert clip["model_price"] == 110.0
+    assert clip["financial_price"] == 140.0
+    assert clip["price_out_of_range"] is True
+    assert clip["price_clipped"] is False
+    assert clip["extrapolation_applied"] is True
+    assert clip["extrapolation_tail_multiplier"] != 1.0
+    assert clip["scenario_price_effect_source"] == "boundary_plus_elasticity_tail"
+
+
+def test_price_guardrail_safe_clip_uses_safe_price_for_financials():
+    clip = compute_scenario_price_inputs(
+        requested_price=140.0,
+        train_min=90.0,
+        train_max=110.0,
+        price_guardrail_mode="safe_clip",
+    )
+    assert clip["model_price"] == 110.0
+    assert clip["financial_price"] == 110.0
+    assert clip["price_clipped"] is True
+    assert clip["extrapolation_applied"] is False
+
+
+def test_price_guardrail_positive_elasticity_falls_back_to_prior():
+    clip = compute_scenario_price_inputs(
+        requested_price=140.0,
+        train_min=90.0,
+        train_max=110.0,
+        price_guardrail_mode="economic_extrapolation",
+        price_elasticity=0.8,
+        price_elasticity_prior=-1.1,
+    )
+    assert clip["elasticity_used"] == pytest.approx(-1.1)
+    assert clip["elasticity_source"] == "fallback_prior_out_of_safe_range"
+    assert clip["extrapolation_tail_multiplier"] < 1.0
+
+
+def test_price_guardrail_nan_elasticity_falls_back_to_prior():
+    clip = compute_scenario_price_inputs(
+        requested_price=140.0,
+        train_min=90.0,
+        train_max=110.0,
+        price_guardrail_mode="economic_extrapolation",
+        price_elasticity=np.nan,
+        price_elasticity_prior=-1.1,
+    )
+    assert clip["elasticity_used"] == pytest.approx(-1.1)
+    assert clip["elasticity_source"] == "fallback_prior_invalid_elasticity"
+
+
+def test_price_guardrail_negative_elasticity_uses_actual():
+    clip = compute_scenario_price_inputs(
+        requested_price=140.0,
+        train_min=90.0,
+        train_max=110.0,
+        price_guardrail_mode="economic_extrapolation",
+        price_elasticity=-0.7,
+        price_elasticity_prior=-1.1,
+    )
+    assert clip["elasticity_used"] == pytest.approx(-0.7)
+    assert clip["elasticity_source"] == "pooled_price_elasticity"
+
+
+@pytest.mark.parametrize(
+    "kwargs, field",
+    [
+        ({"requested_price": 0.0, "train_min": 90.0, "train_max": 110.0}, "requested_price"),
+        ({"requested_price": -10.0, "train_min": 90.0, "train_max": 110.0}, "requested_price"),
+        ({"requested_price": np.nan, "train_min": 90.0, "train_max": 110.0}, "requested_price"),
+        ({"requested_price": 100.0, "train_min": 0.0, "train_max": 110.0}, "train_min"),
+        ({"requested_price": 100.0, "train_min": 90.0, "train_max": np.nan}, "train_max"),
+    ],
+)
+def test_price_guardrail_rejects_invalid_prices(kwargs, field):
+    with pytest.raises(ValueError, match=field):
+        compute_scenario_price_inputs(**kwargs)
+
+
+def test_price_guardrail_swaps_valid_reversed_train_bounds():
+    clip = compute_scenario_price_inputs(requested_price=120.0, train_min=130.0, train_max=90.0)
+    assert clip["model_price"] == pytest.approx(120.0)
+    assert clip["financial_price"] == pytest.approx(120.0)
+
+
+def test_price_guardrails_never_return_non_positive_prices():
+    extrapolated = compute_scenario_price_inputs(
+        requested_price=140.0,
+        train_min=90.0,
+        train_max=110.0,
+        price_guardrail_mode="economic_extrapolation",
+        price_elasticity=-1.0,
+    )
+    clipped = compute_scenario_price_inputs(
+        requested_price=1.0,
+        train_min=90.0,
+        train_max=110.0,
+        price_guardrail_mode="safe_clip",
+    )
+    assert extrapolated["financial_price"] > 0
+    assert clipped["model_price"] > 0
+
+
+@pytest.mark.parametrize(
+    "elasticity, source",
+    [
+        (0.0, "fallback_prior_out_of_safe_range"),
+        (0.8, "fallback_prior_out_of_safe_range"),
+        (-20.0, "fallback_prior_out_of_safe_range"),
+        (-0.01, "fallback_prior_out_of_safe_range"),
+        (np.inf, "fallback_prior_invalid_elasticity"),
+        (np.nan, "fallback_prior_invalid_elasticity"),
+    ],
+)
+def test_price_guardrail_elasticity_safe_range(elasticity, source):
+    clip = compute_scenario_price_inputs(
+        requested_price=140.0,
+        train_min=90.0,
+        train_max=110.0,
+        price_guardrail_mode="economic_extrapolation",
+        price_elasticity=elasticity,
+        price_elasticity_prior=-1.1,
+    )
+    assert clip["elasticity_used"] == pytest.approx(-1.1)
+    assert clip["elasticity_source"] == source

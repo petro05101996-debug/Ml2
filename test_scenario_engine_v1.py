@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from scenario_engine import run_scenario
 from scenario_engine_enhanced import run_enhanced_scenario
@@ -247,3 +248,148 @@ def test_enhanced_shock_and_stock_constraint():
     assert float(np.sum(shocked["unconstrained_units"])) >= float(np.sum(baseline["unconstrained_units"]))
     assert np.all(shocked["final_units"] <= shocked["scenario_profile"]["available_stock"].to_numpy(dtype=float) + 1e-9)
     assert np.all(shocked["lost_sales"] >= -1e-9)
+
+
+def test_enhanced_model_price_path_controls_demand_financial_price_controls_money():
+    baseline = _enhanced_baseline(days=3, units=100.0)
+    price_path = [{"date": str(d.date()), "value": 150.0} for d in baseline["date"]]
+    model_path = [{"date": str(d.date()), "value": 110.0} for d in baseline["date"]]
+    tail_path = [{"date": str(d.date()), "value": (150.0 / 110.0) ** -1.1} for d in baseline["date"]]
+    out = run_enhanced_scenario(
+        baseline_daily=baseline,
+        current_ctx={"price": 100.0, "discount": 0.0, "promotion": 0.0, "cost": 60.0, "freight_value": 5.0},
+        future_dates=pd.DataFrame({"date": baseline["date"]}),
+        scenario_overrides={
+            "price_path": price_path,
+            "model_price_path": model_path,
+            "extrapolation_tail_multiplier_path": tail_path,
+        },
+        pooled_elasticity=-1.1,
+        small_mode_info={"price_changes": 10, "price_span": 0.2, "price_stability": 0.8},
+        requested_price=150.0,
+        model_price=110.0,
+        financial_price=150.0,
+        baseline_discount=0.0,
+        scenario_discount=0.0,
+        baseline_cost=60.0,
+        scenario_cost=60.0,
+        baseline_freight=5.0,
+        scenario_freight=5.0,
+        shocks=[],
+    )
+    profile = out["scenario_profile"]
+    assert float(profile["price_effect"].mean()) < 1.0
+    assert float(profile["actual_sales"].sum()) < float(profile["baseline_units"].sum())
+    assert float(profile["scenario_price_gross"].iloc[0]) == pytest.approx(150.0)
+    assert float(profile["model_price_gross"].iloc[0]) == pytest.approx(110.0)
+    assert float(profile["revenue"].iloc[0]) == pytest.approx(float(profile["actual_sales"].iloc[0]) * 150.0)
+
+
+def _enhanced_baseline(days: int = 4) -> pd.DataFrame:
+    return pd.DataFrame({
+        "date": pd.date_range("2025-02-01", periods=days, freq="D"),
+        "base_pred_sales": np.full(days, 20.0),
+        "stock": np.full(days, 15.0),
+    })
+
+
+def _assert_enhanced_pnl_invariants(out):
+    profile = out["scenario_profile"]
+    assert np.allclose(profile["revenue"], profile["actual_sales"] * profile["applied_price_net"])
+    assert np.allclose(
+        profile["profit"],
+        profile["actual_sales"] * (profile["applied_price_net"] - profile["scenario_cost"] - profile["scenario_freight_value"]),
+    )
+    assert np.all(profile["actual_sales"] <= profile["available_stock"] + 1e-9)
+    assert np.allclose(profile["lost_sales"], profile["scenario_demand_raw"] - profile["actual_sales"])
+
+
+def test_enhanced_scalar_safe_clip_pnl_invariants_and_model_price_for_demand():
+    out = run_enhanced_scenario(
+        baseline_daily=_enhanced_baseline(),
+        current_ctx={"price": 100.0, "promotion": 0.0},
+        future_dates=pd.DataFrame(),
+        scenario_overrides={"stock_cap": 15.0},
+        pooled_elasticity=-1.0,
+        small_mode_info={"price_changes": 8, "price_span": 0.4, "price_stability": 0.8},
+        requested_price=140.0,
+        model_price=110.0,
+        financial_price=110.0,
+        baseline_discount=0.0,
+        scenario_discount=0.0,
+        baseline_cost=60.0,
+        scenario_cost=65.0,
+        baseline_freight=5.0,
+        scenario_freight=6.0,
+        shocks=[],
+    )
+    _assert_enhanced_pnl_invariants(out)
+    profile = out["scenario_profile"]
+    assert np.allclose(profile["requested_price_gross"], 140.0)
+    assert np.allclose(profile["model_price_gross"], 110.0)
+    assert np.allclose(profile["applied_price_gross"], 110.0)
+
+
+def test_enhanced_economic_extrapolation_uses_financial_price_for_pnl_and_model_price_for_demand():
+    out = run_enhanced_scenario(
+        baseline_daily=_enhanced_baseline(),
+        current_ctx={"price": 100.0, "promotion": 0.0},
+        future_dates=pd.DataFrame(),
+        scenario_overrides={"stock_cap": 15.0, "extrapolation_tail_multiplier": 0.75, "extrapolation_price_ratio": 140.0 / 110.0},
+        pooled_elasticity=-1.0,
+        small_mode_info={"price_changes": 8, "price_span": 0.4, "price_stability": 0.8},
+        requested_price=140.0,
+        model_price=110.0,
+        financial_price=140.0,
+        baseline_discount=0.0,
+        scenario_discount=0.0,
+        baseline_cost=65.0,
+        scenario_cost=70.0,
+        baseline_freight=5.0,
+        scenario_freight=6.0,
+        shocks=[],
+    )
+    _assert_enhanced_pnl_invariants(out)
+    profile = out["scenario_profile"]
+    assert np.allclose(profile["price_for_model"], 110.0)
+    assert np.allclose(profile["applied_price_gross"], 140.0)
+    assert np.all(profile["price_effect"] < 1.0)
+    assert np.allclose(profile["revenue"], profile["actual_sales"] * 140.0)
+
+
+def test_enhanced_price_path_pnl_invariants_for_safe_clip_and_economic_extrapolation():
+    requested_path = [80.0, 100.0, 120.0, 140.0]
+    model_path = [90.0, 100.0, 110.0, 110.0]
+    financial_path_safe = model_path
+    financial_path_extrap = requested_path
+    for financial_path, tails in [(financial_path_safe, [1.0, 1.0, 1.0, 1.0]), (financial_path_extrap, [1.1, 1.0, 0.9, 0.75])]:
+        out = run_enhanced_scenario(
+            baseline_daily=_enhanced_baseline(),
+            current_ctx={"price": 100.0, "promotion": 0.0},
+            future_dates=pd.DataFrame(),
+            scenario_overrides={
+                "requested_price_path": requested_path,
+                "model_price_path": model_path,
+                "price_path": financial_path,
+                "extrapolation_tail_multiplier_path": tails,
+                "extrapolation_price_ratio_path": [80.0 / 90.0, 1.0, 120.0 / 110.0, 140.0 / 110.0],
+                "stock_cap": 15.0,
+            },
+            pooled_elasticity=-1.0,
+            small_mode_info={"price_changes": 8, "price_span": 0.4, "price_stability": 0.8},
+            requested_price=100.0,
+            model_price=100.0,
+            financial_price=100.0,
+            baseline_discount=0.0,
+            scenario_discount=0.0,
+            baseline_cost=60.0,
+            scenario_cost=65.0,
+            baseline_freight=5.0,
+            scenario_freight=6.0,
+            shocks=[],
+        )
+        _assert_enhanced_pnl_invariants(out)
+        profile = out["scenario_profile"]
+        assert np.allclose(profile["requested_price_gross"], requested_path)
+        assert np.allclose(profile["model_price_gross"], model_path)
+        assert np.allclose(profile["applied_price_gross"], financial_path)

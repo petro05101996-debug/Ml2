@@ -60,6 +60,7 @@ def run_enhanced_scenario(
     baseline_freight: float,
     scenario_freight: float,
     shocks: List[Dict[str, Any]],
+    financial_price: float | None = None,
 ) -> Dict[str, Any]:
     daily = baseline_daily.copy().reset_index(drop=True)
     if "date" not in daily.columns and len(future_dates):
@@ -72,13 +73,20 @@ def run_enhanced_scenario(
         available_stock = np.minimum(available_stock, float(scenario_overrides["stock_cap"]))
 
     baseline_price_gross = np.repeat(float(current_ctx.get("price", model_price)), len(daily))
-    scenario_price_gross = _resolve_path_vector(daily["date"], scenario_overrides.get("price_path"), float(model_price))
+    scenario_requested_price_gross = _resolve_path_vector(daily["date"], scenario_overrides.get("requested_price_path"), float(requested_price))
+    scenario_model_price_gross = _resolve_path_vector(daily["date"], scenario_overrides.get("model_price_path"), float(model_price))
+    scenario_financial_price_gross = _resolve_path_vector(
+        daily["date"],
+        scenario_overrides.get("price_path"),
+        float(model_price if financial_price is None else financial_price),
+    )
     baseline_discount_vec = np.repeat(float(np.clip(baseline_discount, 0.0, 0.95)), len(daily))
     scenario_discount_vec = _resolve_path_vector(daily["date"], scenario_overrides.get("discount_path"), float(np.clip(scenario_discount, 0.0, 0.95)))
     scenario_discount_vec = np.clip(scenario_discount_vec, 0.0, 0.95)
 
     baseline_price_net = np.maximum(0.01, baseline_price_gross * (1.0 - baseline_discount_vec))
-    scenario_price_net = np.maximum(0.01, scenario_price_gross * (1.0 - scenario_discount_vec))
+    scenario_model_price_net = np.maximum(0.01, scenario_model_price_gross * (1.0 - scenario_discount_vec))
+    scenario_price_net = np.maximum(0.01, scenario_financial_price_gross * (1.0 - scenario_discount_vec))
 
     baseline_promo = np.repeat(float(current_ctx.get("promotion", 0.0)), len(daily))
     scenario_promo = _resolve_path_vector(
@@ -102,7 +110,12 @@ def run_enhanced_scenario(
         float(price_conf["score"]),
     )
 
-    price_effect = compute_price_effect_vector(baseline_price_net, scenario_price_net, price_elasticity=beta_final, cap=float(DEFAULTS["price_cap"]))
+    tail_multiplier = _resolve_path_vector(daily["date"], scenario_overrides.get("extrapolation_tail_multiplier_path"), float(scenario_overrides.get("extrapolation_tail_multiplier", 1.0)))
+    tail_multiplier = np.clip(np.nan_to_num(tail_multiplier, nan=1.0, posinf=1.0, neginf=1.0), 0.05, 20.0)
+    extrapolation_ratio = _resolve_path_vector(daily["date"], scenario_overrides.get("extrapolation_price_ratio_path"), float(scenario_overrides.get("extrapolation_price_ratio", 1.0)))
+    extrapolation_ratio = np.nan_to_num(extrapolation_ratio, nan=1.0, posinf=1.0, neginf=1.0)
+    price_effect = compute_price_effect_vector(baseline_price_net, scenario_model_price_net, price_elasticity=beta_final, cap=float(DEFAULTS["price_cap"]))
+    price_effect = price_effect * tail_multiplier
     promo_effect = compute_promo_effect_vector(
         promo_flag_baseline=(baseline_promo > 0).astype(float),
         promo_flag_scenario=(scenario_promo > 0).astype(float),
@@ -145,11 +158,20 @@ def run_enhanced_scenario(
             "date": daily["date"],
             "baseline_units": baseline_units,
             "baseline_price_gross": baseline_price_gross,
-            "scenario_price_gross": scenario_price_gross,
+            "requested_price_gross": scenario_requested_price_gross,
+            "safe_price_gross": scenario_model_price_gross,
+            "model_price_gross": scenario_model_price_gross,
+            "price_for_model": scenario_model_price_gross,
+            "applied_price_gross": scenario_financial_price_gross,
+            "scenario_price_gross": scenario_financial_price_gross,
             "baseline_discount": baseline_discount_vec,
             "scenario_discount": scenario_discount_vec,
             "baseline_price_net": baseline_price_net,
+            "model_price_net": scenario_model_price_net,
+            "applied_price_net": scenario_price_net,
             "scenario_price_net": scenario_price_net,
+            "extrapolation_tail_multiplier": tail_multiplier,
+            "extrapolation_price_ratio": extrapolation_ratio,
             "baseline_promotion": baseline_promo,
             "scenario_promotion": scenario_promo,
             "baseline_freight_value": baseline_freight_vec,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from decision_math import safe_float
+from recommendation_gate import resolve_recommendation_gate
 
 
 def _econ(e: dict, objective: str) -> float:
@@ -37,7 +38,16 @@ def _eligible_best(e: dict, objective: str, min_profit_uplift_pct: float) -> boo
     rel = e.get("reliability") or {}; eff = e.get("expected_effect") or {}; econ = rel.get("economic_significance") or {}
     if (e.get("blockers") or rel.get("blockers")):
         return False
-    if rel.get("decision_status") not in {"recommended", "test_recommended"}:
+    gate = resolve_recommendation_gate(
+        price_policy=(rel.get("component_details") or {}).get("scenario_support", {}),
+        data_quality=(rel.get("component_details") or {}).get("data_quality", {}),
+        model_quality=(rel.get("component_details") or {}).get("model_quality", {}),
+        factor_policy=(rel.get("component_details") or {}).get("factor_support", {}),
+        economic_significance=econ,
+        cost_policy={"cost_proxied": bool(econ.get("cost_proxied"))},
+        decision_reliability={"base_status": rel.get("decision_status"), "status_namespace": "decision", "warnings": rel.get("warnings", []), "blockers": e.get("blockers") or rel.get("blockers", [])},
+    )
+    if gate.get("decision_status") not in {"recommended", "test_recommended"}:
         return False
     if safe_float(rel.get("score"), 0) < 65 or rel.get("risk_level") == "high":
         return False
@@ -51,7 +61,7 @@ def _compact(e: dict | None) -> dict | None:
     cand = e.get("candidate") or {}; rel = e.get("reliability") or {}
     scenario_result = e.get("scenario_result") or {}
     effective = scenario_result.get("effective_scenario") or {}
-    return {"candidate_id": cand.get("candidate_id"), "title": cand.get("title"), "action_type": cand.get("action_type"), "objective": cand.get("objective"), "current_value": cand.get("current_value"), "target_value": cand.get("target_value"), "change_pct": cand.get("change_pct"), "decision_rank_score": e.get("decision_rank_score"), "expected_effect": e.get("expected_effect"), "reliability": {"score": rel.get("score"), "risk_level": rel.get("risk_level"), "decision_status": rel.get("decision_status"), "label": rel.get("label"), "statistical_support": (rel.get("statistical_support") or {}).get("level")}, "requested_price": effective.get("requested_price_gross", scenario_result.get("requested_price")), "applied_price": effective.get("applied_price_gross", scenario_result.get("model_price")), "price_clipped": bool(effective.get("price_clipped", scenario_result.get("price_clipped", False))), "support_label": scenario_result.get("support_label"), "confidence_label": scenario_result.get("confidence_label"), "full_reliability": rel, "warnings": e.get("warnings", []), "blockers": e.get("blockers", [])}
+    return {"candidate_id": cand.get("candidate_id"), "title": cand.get("title"), "action_type": cand.get("action_type"), "objective": cand.get("objective"), "current_value": cand.get("current_value"), "target_value": cand.get("target_value"), "change_pct": cand.get("change_pct"), "decision_rank_score": e.get("decision_rank_score"), "expected_effect": e.get("expected_effect"), "reliability": {"score": rel.get("score"), "risk_level": rel.get("risk_level"), "decision_status": rel.get("decision_status"), "recommendation_gate": rel.get("recommendation_gate"), "label": rel.get("label"), "statistical_support": (rel.get("statistical_support") or {}).get("level")}, "requested_price": effective.get("requested_price_gross", scenario_result.get("requested_price")), "applied_price": effective.get("applied_price_gross", scenario_result.get("model_price")), "price_clipped": bool(effective.get("price_clipped", scenario_result.get("price_clipped", False))), "support_label": scenario_result.get("support_label"), "confidence_label": scenario_result.get("confidence_label"), "full_reliability": rel, "warnings": e.get("warnings", []), "blockers": e.get("blockers", [])}
 
 
 def rank_decision_candidates(evaluated_candidates: list[dict], objective: str = "profit", min_profit_uplift_pct: float = 3.0) -> dict:

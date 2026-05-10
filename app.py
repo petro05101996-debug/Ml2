@@ -37,6 +37,8 @@ from v1_runtime_helpers import (
     build_backend_warning,
     compute_scenario_price_inputs,
     evaluate_net_price_support,
+    VALID_ELASTICITY_MAX,
+    VALID_ELASTICITY_MIN,
     get_model_backend_status,
     select_weekly_baseline_candidate,
 )
@@ -47,6 +49,7 @@ from decision_optimizer import rank_decision_candidates
 from decision_passport import build_decision_passport
 from decision_math import safe_pct_delta
 from recommendation_auditor import audit_and_improve_recommendation
+from recommendation_gate import resolve_recommendation_gate
 from ui.theme import apply_theme
 
 warnings.filterwarnings("ignore")
@@ -3528,6 +3531,7 @@ def _run_what_if_projection_legacy(
     cost_multiplier: float = 1.0,
     stock_cap: float = 0.0,
     overrides: Optional[Dict[str, Any]] = None,
+    price_guardrail_mode: str = DEFAULT_PRICE_GUARDRAIL_MODE,
 ) -> Dict[str, Any]:
     base_history = trained_bundle["daily_base"].copy()
     current_ctx = dict(trained_bundle["base_ctx"])
@@ -3545,8 +3549,9 @@ def _run_what_if_projection_legacy(
     train_prices = pd.to_numeric(trained_bundle["daily_base"].get("price", pd.Series([manual_price])), errors="coerce").dropna()
     train_min = float(train_prices.min()) if len(train_prices) else float(manual_price)
     train_max = float(train_prices.max()) if len(train_prices) else float(manual_price)
-    price_lo = max(0.01, train_min * 0.90)
-    price_hi = max(price_lo, train_max * 1.10)
+    price_lo = max(0.01, train_min)
+    price_hi = max(price_lo, train_max)
+    path_price_elasticity = float(trained_bundle.get("pooled_elasticity", CONFIG["PRIOR_ELASTICITY"]))
 
     def _clip_path_list(path_key: str, lo: float, hi: float, label: str) -> None:
         path = scenario_overrides.get(path_key)
@@ -3568,7 +3573,66 @@ def _run_what_if_projection_legacy(
         if changed:
             guardrail_warnings.append(f"{label} был ограничен guardrails диапазоном [{lo:.3f}, {hi:.3f}].")
 
-    _clip_path_list("price_path", price_lo, price_hi, "Price path")
+    def _resolve_price_paths() -> None:
+        path = scenario_overrides.get("price_path")
+        if not isinstance(path, list):
+            scalar_clip = compute_scenario_price_inputs(
+                requested_price=float(manual_price),
+                train_min=price_lo,
+                train_max=price_hi,
+                price_guardrail_mode=price_guardrail_mode,
+                price_elasticity=path_price_elasticity,
+                price_elasticity_prior=float(CONFIG["PRIOR_ELASTICITY"]),
+            )
+            scenario_overrides["model_price_path"] = []
+            scenario_overrides["extrapolation_tail_multiplier_path"] = []
+            scenario_overrides["extrapolation_price_ratio_path"] = []
+            scenario_overrides["requested_price_path"] = []
+            scenario_overrides["financial_price_path"] = []
+            return
+        requested_path: List[Dict[str, Any]] = []
+        financial_path: List[Dict[str, Any]] = []
+        model_path: List[Dict[str, Any]] = []
+        tail_path: List[Dict[str, Any]] = []
+        ratio_path: List[Dict[str, Any]] = []
+        clipped_financial = False
+        extrapolated = False
+        for item in path:
+            if not isinstance(item, dict):
+                continue
+            value = float(item.get("value", manual_price))
+            resolved = compute_scenario_price_inputs(
+                requested_price=value,
+                train_min=price_lo,
+                train_max=price_hi,
+                price_guardrail_mode=price_guardrail_mode,
+                price_elasticity=path_price_elasticity,
+                price_elasticity_prior=float(CONFIG["PRIOR_ELASTICITY"]),
+            )
+            date_value = item.get("date")
+            financial_value = float(resolved.get("financial_price", value))
+            model_value = float(resolved.get("model_price", value))
+            requested_path.append({**item, "date": date_value, "value": value})
+            financial_path.append({**item, "date": date_value, "value": financial_value})
+            model_path.append({**item, "date": date_value, "value": model_value})
+            tail_path.append({"date": date_value, "value": float(resolved.get("extrapolation_tail_multiplier", 1.0))})
+            ratio_path.append({"date": date_value, "value": float(resolved.get("extrapolation_price_ratio", 1.0))})
+            clipped_financial = clipped_financial or bool(resolved.get("clip_applied", False))
+            extrapolated = extrapolated or bool(resolved.get("extrapolation_applied", False))
+        scenario_overrides["requested_price_path"] = requested_path
+        scenario_overrides["price_path"] = financial_path
+        scenario_overrides["financial_price_path"] = financial_path
+        scenario_overrides["model_price_path"] = model_path
+        scenario_overrides["extrapolation_tail_multiplier_path"] = tail_path
+        scenario_overrides["extrapolation_price_ratio_path"] = ratio_path
+        scenario_overrides["__price_path_financial_clipped"] = bool(clipped_financial)
+        scenario_overrides["__price_path_extrapolated"] = bool(extrapolated)
+        if clipped_financial:
+            guardrail_warnings.append(f"Price path был ограничен guardrails диапазоном [{price_lo:.3f}, {price_hi:.3f}].")
+        if extrapolated:
+            guardrail_warnings.append("Price path вне исторического диапазона: спрос посчитан на границе плюс elasticity tail, финансы — по введённой траектории.")
+
+    _resolve_price_paths()
     _clip_path_list("discount_path", 0.0, 0.95, "Discount path")
     _clip_path_list("promo_path", 0.0, 0.70, "Promo path")
     freight_base = float(trained_bundle.get("base_ctx", {}).get("freight_value", 0.0))
@@ -3627,10 +3691,20 @@ def _run_what_if_projection_legacy(
     if not np.isfinite(train_min) or not np.isfinite(train_max):
         train_min = requested_price
         train_max = requested_price
-    clip = compute_scenario_price_inputs(requested_price=requested_price, train_min=train_min, train_max=train_max)
+    price_elasticity = float(trained_bundle.get("pooled_elasticity", CONFIG["PRIOR_ELASTICITY"]))
+    clip = compute_scenario_price_inputs(
+        requested_price=requested_price,
+        train_min=train_min,
+        train_max=train_max,
+        price_guardrail_mode=price_guardrail_mode,
+        price_elasticity=price_elasticity,
+        price_elasticity_prior=float(CONFIG["PRIOR_ELASTICITY"]),
+    )
     model_price = float(clip["model_price"])
+    financial_price = float(clip["financial_price"])
     base_net_price_ref = float(max(0.01, current_price_raw * (1.0 - baseline_discount)))
-    scenario_net_price = float(max(0.01, model_price * (1.0 - scenario_discount)))
+    model_net_price = float(max(0.01, model_price * (1.0 - scenario_discount)))
+    financial_net_price = float(max(0.01, financial_price * (1.0 - scenario_discount)))
 
     baseline_cost = float(current_ctx.get("cost", baseline_price_ref * CONFIG["COST_PROXY_RATIO"]))
     scenario_cost = float(scenario_overrides.get("cost", baseline_cost))
@@ -3650,18 +3724,30 @@ def _run_what_if_projection_legacy(
         stock_series = np.minimum(stock_series, float(scenario_overrides["stock_cap"]))
 
     effective_scenario = {
+        "price_guardrail_mode": str(clip["price_guardrail_mode"]),
         "requested_price_gross": float(manual_price),
-        "applied_price_gross": float(model_price),
+        "safe_price_gross": float(model_price),
+        "model_price_gross": float(model_price),
+        "financial_price_gross": float(financial_price),
+        "applied_price_gross": float(financial_price),
         "current_price_gross": float(current_price_raw),
         "current_discount": float(baseline_discount),
         "applied_discount": float(scenario_discount),
         "current_price_net": float(base_net_price_ref),
-        "applied_price_net": float(scenario_net_price),
+        "safe_price_net": float(model_net_price),
+        "model_price_net": float(model_net_price),
+        "financial_price_net": float(financial_net_price),
+        "applied_price_net": float(financial_net_price),
         "promotion": float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))),
         "freight_value": float(scenario_freight),
         "cost": float(scenario_cost),
         "demand_multiplier": float(scenario_overrides.get("manual_shock_multiplier", 1.0)),
         "price_clipped": bool(clip.get("price_clipped", False)),
+        "clip_applied": bool(clip.get("clip_applied", False)),
+        "model_price_clipped": bool(clip.get("model_price_clipped", False)),
+        "price_out_of_range": bool(clip.get("price_out_of_range", False)),
+        "extrapolation_applied": bool(clip.get("extrapolation_applied", False)),
+        "guardrail_warning_type": "economic_extrapolation" if bool(clip.get("extrapolation_applied", False)) else ("safe_clip" if bool(clip.get("clip_applied", False)) else ""),
         "clip_reason": clip.get("clip_reason"),
         "lower_clip": float(train_min) if np.isfinite(train_min) else None,
         "upper_clip": float(train_max) if np.isfinite(train_max) else None,
@@ -3669,14 +3755,16 @@ def _run_what_if_projection_legacy(
 
     scenario_inputs = {
         "demand_price_baseline": float(base_net_price_ref),
-        "demand_price_scenario": float(scenario_net_price),
+        "demand_price_scenario": float(model_net_price),
         "gross_price_baseline": float(current_price_raw),
         "gross_price_scenario": float(model_price),
+        "financial_gross_price_scenario": float(financial_price),
         "base_price": float(base_net_price_ref),
-        "scenario_price": float(scenario_net_price),
+        "scenario_price": float(model_net_price),
         "baseline_net_price": float(base_net_price_ref),
-        "scenario_net_price": float(scenario_net_price),
-        "price_elasticity": float(trained_bundle.get("pooled_elasticity", CONFIG["PRIOR_ELASTICITY"])),
+        "scenario_net_price": float(financial_net_price),
+        "price_elasticity": price_elasticity,
+        "extrapolation_tail_multiplier": float(clip.get("extrapolation_tail_multiplier", 1.0)),
         "price_elasticity_prior": float(CONFIG["PRIOR_ELASTICITY"]),
         "price_cap": 0.35,
         "promo_baseline": float(current_ctx.get("promotion", 0.0)),
@@ -3699,7 +3787,7 @@ def _run_what_if_projection_legacy(
     manual_shock_multiplier = float(scenario_overrides.get("manual_shock_multiplier", 1.0))
     has_explicit_shocks = bool(len(shocks))
     scenario_changed = bool(
-        abs(effective_scenario["applied_price_gross"] - effective_scenario["current_price_gross"]) > 1e-9
+        abs(effective_scenario["requested_price_gross"] - effective_scenario["current_price_gross"]) > 1e-9
         or abs(scenario_discount - baseline_discount) > 1e-9
         or abs(scenario_freight - baseline_freight) > 1e-9
         or abs(scenario_cost - baseline_cost) > 1e-9
@@ -3725,11 +3813,33 @@ def _run_what_if_projection_legacy(
     if len(daily):
         daily["base_pred_sales"] = np.asarray(scenario_result["baseline_units"], dtype=float)
         daily["pred_sales"] = np.asarray(scenario_result["final_units"], dtype=float)
-        daily["price"] = float(model_price)
+        daily["price"] = float(financial_price)
         daily["discount"] = float(scenario_discount)
         daily["cost"] = scenario_cost
         daily["freight_value"] = scenario_freight
-        daily["net_unit_price"] = scenario_net_price
+        daily["net_unit_price"] = financial_net_price
+        daily["requested_price_gross"] = float(requested_price)
+        daily["safe_price_gross"] = float(model_price)
+        daily["model_price_gross"] = float(model_price)
+        daily["model_price_net"] = float(model_net_price)
+        daily["price_for_model"] = float(model_price)
+        daily["applied_price_gross"] = float(financial_price)
+        daily["applied_price_net"] = float(financial_net_price)
+        daily["scenario_price_gross"] = float(financial_price)
+        daily["scenario_price_net"] = float(financial_net_price)
+        daily["price_guardrail_mode"] = str(clip["price_guardrail_mode"])
+        daily["price_out_of_range"] = bool(clip.get("price_out_of_range", False))
+        daily["price_clipped"] = bool(clip.get("price_clipped", False))
+        daily["clip_applied"] = bool(clip.get("clip_applied", False))
+        daily["extrapolation_applied"] = bool(clip.get("extrapolation_applied", False))
+        daily["model_boundary_price_gross"] = float(clip.get("model_boundary_price_gross", np.nan))
+        daily["extrapolation_from_price_gross"] = float(clip.get("extrapolation_from_price_gross", np.nan))
+        daily["extrapolation_to_price_gross"] = float(clip.get("extrapolation_to_price_gross", np.nan))
+        daily["extrapolation_price_ratio"] = float(clip.get("extrapolation_price_ratio", 1.0))
+        daily["extrapolation_tail_multiplier"] = float(clip.get("extrapolation_tail_multiplier", 1.0))
+        daily["elasticity_used"] = float(clip.get("elasticity_used", np.nan))
+        daily["elasticity_source"] = str(clip.get("elasticity_source", ""))
+        daily["scenario_price_effect_source"] = str(clip.get("scenario_price_effect_source", "scenario_engine_recompute_from_baseline"))
         daily["promotion"] = float(promo_scenario)
         daily["stock"] = stock_series
         daily["unconstrained_demand"] = daily["pred_sales"].clip(lower=0.0)
@@ -3743,7 +3853,7 @@ def _run_what_if_projection_legacy(
     revenue_total = float(daily["revenue"].sum()) if "revenue" in daily.columns else 0.0
     lost_sales_total = float(daily["lost_sales"].sum()) if "lost_sales" in daily.columns else 0.0
     base_confidence = float(trained_bundle.get("confidence", 0.6))
-    price_plausibility = 1.0 if is_price_plausible(effective_scenario["applied_price_gross"], train_min, train_max, margin=0.25) else 0.0
+    price_plausibility = 1.0 if is_price_plausible(effective_scenario["requested_price_gross"], train_min, train_max, margin=0.25) else 0.0
     ood_penalty = 0.20 if not bool(price_plausibility) else 0.0
     horizon_penalty = max(0.0, (len(future_dates) - 30) / 120.0)
     extreme_penalty = max(0.0, abs(float(freight_multiplier) - 1.0) + abs(float(discount_multiplier) - 1.0) + abs(float(cost_multiplier) - 1.0) - 0.25) * 0.08
@@ -3821,17 +3931,31 @@ def _run_what_if_projection_legacy(
         "confidence_scenario": confidence_scenario,
         "confidence_label": confidence_label,
         "uncertainty": 1.0 - confidence_scenario,
-        "ood_flag": bool(not is_price_plausible(effective_scenario["applied_price_gross"], train_min, train_max, margin=0.25)),
+        "ood_flag": bool(not is_price_plausible(effective_scenario["requested_price_gross"], train_min, train_max, margin=0.25)),
         "requested_price": requested_price,
         "model_price": model_price,
         "price_for_model": model_price,
+        "safe_price_gross": model_price,
+        "financial_price": financial_price,
+        "applied_price_gross": financial_price,
+        "applied_price_net": financial_net_price,
         "current_price_raw": float(current_price_raw),
+        "price_guardrail_mode": str(clip["price_guardrail_mode"]),
         "price_clipped": bool(clip["price_clipped"]),
-        "clip_applied": bool(clip["price_clipped"]),
+        "clip_applied": bool(clip["clip_applied"]),
+        "price_out_of_range": bool(clip["price_out_of_range"]),
+        "extrapolation_applied": bool(clip["extrapolation_applied"]),
+        "model_boundary_price_gross": float(clip.get("model_boundary_price_gross", np.nan)),
+        "extrapolation_from_price_gross": float(clip.get("extrapolation_from_price_gross", np.nan)),
+        "extrapolation_to_price_gross": float(clip.get("extrapolation_to_price_gross", np.nan)),
+        "extrapolation_price_ratio": float(clip.get("extrapolation_price_ratio", 1.0)),
+        "extrapolation_tail_multiplier": float(clip.get("extrapolation_tail_multiplier", 1.0)),
+        "elasticity_used": float(clip.get("elasticity_used", np.nan)),
+        "elasticity_source": str(clip.get("elasticity_source", "")),
         "clip_reason": str(clip["clip_reason"]),
         "net_price_supported": bool(net_support.get("net_price_supported", True)),
         "net_price_support": net_support,
-        "scenario_price_effect_source": "scenario_engine_recompute_from_baseline",
+        "scenario_price_effect_source": str(clip.get("scenario_price_effect_source", "scenario_engine_recompute_from_baseline")),
         "fallback_multiplier_used": runtime_meta["fallback_multiplier_used"],
         "fallback_reason": runtime_meta["fallback_reason"],
         "learned_uplift_active": runtime_meta["learned_uplift_active"],
@@ -3861,9 +3985,10 @@ def _run_what_if_projection_legacy(
         },
         "scenario_inputs_contract": {
             "base_price": float(baseline_price_ref),
-            "scenario_price": float(model_price),
+            "scenario_price": float(financial_price),
             "requested_price": float(requested_price),
             "model_price": float(model_price),
+            "financial_price": float(financial_price),
             "base_promo": float(current_ctx.get("promotion", 0.0)),
             "scenario_promo": float(scenario_overrides.get("promotion", current_ctx.get("promotion", 0.0))),
             "base_freight": float(current_ctx.get("freight_value", 0.0)),
@@ -3906,6 +4031,7 @@ def _run_what_if_projection_enhanced(
     cost_multiplier: float = 1.0,
     stock_cap: float = 0.0,
     overrides: Optional[Dict[str, Any]] = None,
+    price_guardrail_mode: str = DEFAULT_PRICE_GUARDRAIL_MODE,
 ) -> Dict[str, Any]:
     legacy_result = _run_what_if_projection_legacy(
         trained_bundle=trained_bundle,
@@ -3917,6 +4043,7 @@ def _run_what_if_projection_enhanced(
         cost_multiplier=cost_multiplier,
         stock_cap=stock_cap,
         overrides=overrides,
+        price_guardrail_mode=price_guardrail_mode,
     )
     scenario_overrides = dict(overrides or {})
     scenario_overrides.setdefault("freight_multiplier", float(freight_multiplier))
@@ -3930,8 +4057,9 @@ def _run_what_if_projection_enhanced(
     train_prices = pd.to_numeric(trained_bundle["daily_base"].get("price", pd.Series([manual_price])), errors="coerce").dropna()
     train_min = float(train_prices.min()) if len(train_prices) else float(manual_price)
     train_max = float(train_prices.max()) if len(train_prices) else float(manual_price)
-    price_lo = max(0.01, train_min * 0.90)
-    price_hi = max(price_lo, train_max * 1.10)
+    price_lo = max(0.01, train_min)
+    price_hi = max(price_lo, train_max)
+    path_price_elasticity = float(trained_bundle.get("pooled_elasticity", CONFIG["PRIOR_ELASTICITY"]))
 
     def _clip_path_list(path_key: str, lo: float, hi: float, label: str) -> None:
         path = scenario_overrides.get(path_key)
@@ -3952,7 +4080,60 @@ def _run_what_if_projection_enhanced(
         if changed:
             guardrail_warnings.append(f"{label} был ограничен guardrails диапазоном [{lo:.3f}, {hi:.3f}].")
 
-    _clip_path_list("price_path", price_lo, price_hi, "Price path")
+    def _resolve_price_paths() -> None:
+        path = scenario_overrides.get("price_path")
+        if not isinstance(path, list):
+            scenario_overrides.setdefault("model_price_path", [])
+            scenario_overrides.setdefault("extrapolation_tail_multiplier_path", [])
+            scenario_overrides.setdefault("extrapolation_price_ratio_path", [])
+            scenario_overrides.setdefault("requested_price_path", [])
+            scenario_overrides.setdefault("financial_price_path", [])
+            scenario_overrides.setdefault("extrapolation_tail_multiplier", float(legacy_result.get("extrapolation_tail_multiplier", 1.0)))
+            scenario_overrides.setdefault("extrapolation_price_ratio", float(legacy_result.get("extrapolation_price_ratio", 1.0)))
+            return
+        requested_path: List[Dict[str, Any]] = []
+        financial_path: List[Dict[str, Any]] = []
+        model_path: List[Dict[str, Any]] = []
+        tail_path: List[Dict[str, Any]] = []
+        ratio_path: List[Dict[str, Any]] = []
+        clipped_financial = False
+        extrapolated = False
+        for item in path:
+            if not isinstance(item, dict):
+                continue
+            value = float(item.get("value", manual_price))
+            resolved = compute_scenario_price_inputs(
+                requested_price=value,
+                train_min=price_lo,
+                train_max=price_hi,
+                price_guardrail_mode=price_guardrail_mode,
+                price_elasticity=path_price_elasticity,
+                price_elasticity_prior=float(CONFIG["PRIOR_ELASTICITY"]),
+            )
+            date_value = item.get("date")
+            financial_value = float(resolved.get("financial_price", value))
+            model_value = float(resolved.get("model_price", value))
+            requested_path.append({**item, "date": date_value, "value": value})
+            financial_path.append({**item, "date": date_value, "value": financial_value})
+            model_path.append({**item, "date": date_value, "value": model_value})
+            tail_path.append({"date": date_value, "value": float(resolved.get("extrapolation_tail_multiplier", 1.0))})
+            ratio_path.append({"date": date_value, "value": float(resolved.get("extrapolation_price_ratio", 1.0))})
+            clipped_financial = clipped_financial or bool(resolved.get("clip_applied", False))
+            extrapolated = extrapolated or bool(resolved.get("extrapolation_applied", False))
+        scenario_overrides["requested_price_path"] = requested_path
+        scenario_overrides["price_path"] = financial_path
+        scenario_overrides["financial_price_path"] = financial_path
+        scenario_overrides["model_price_path"] = model_path
+        scenario_overrides["extrapolation_tail_multiplier_path"] = tail_path
+        scenario_overrides["extrapolation_price_ratio_path"] = ratio_path
+        scenario_overrides["__price_path_financial_clipped"] = bool(clipped_financial)
+        scenario_overrides["__price_path_extrapolated"] = bool(extrapolated)
+        if clipped_financial:
+            guardrail_warnings.append(f"Price path был ограничен guardrails диапазоном [{price_lo:.3f}, {price_hi:.3f}].")
+        if extrapolated:
+            guardrail_warnings.append("Price path вне исторического диапазона: спрос посчитан на границе плюс elasticity tail, финансы — по введённой траектории.")
+
+    _resolve_price_paths()
     _clip_path_list("discount_path", 0.0, 0.95, "Discount path")
     _clip_path_list("promo_path", 0.0, 0.70, "Promo path")
     freight_base = float(trained_bundle.get("base_ctx", {}).get("freight_value", 0.0))
@@ -4012,6 +4193,7 @@ def _run_what_if_projection_enhanced(
         small_mode_info=dict(small_mode_meta),
         requested_price=float(manual_price),
         model_price=float(legacy_result.get("model_price", manual_price)),
+        financial_price=float(legacy_result.get("financial_price", legacy_result.get("applied_price_gross", manual_price))),
         baseline_discount=float(current_ctx.get("discount", 0.0)),
         scenario_discount=float(effective.get("applied_discount", current_ctx.get("discount", 0.0))),
         baseline_cost=float(current_ctx.get("cost", current_ctx.get("price", manual_price) * CONFIG["COST_PROXY_RATIO"])),
@@ -4035,6 +4217,21 @@ def _run_what_if_projection_enhanced(
     daily["freight_value"] = profile["scenario_freight_value"].to_numpy(dtype=float)
     daily["cost"] = profile["scenario_cost"].to_numpy(dtype=float)
     daily["stock"] = profile["available_stock"].to_numpy(dtype=float)
+    for scalar_col in [
+        "price_guardrail_mode",
+        "price_out_of_range",
+        "price_clipped",
+        "clip_applied",
+        "extrapolation_applied",
+        "guardrail_warning_type",
+        "model_boundary_price_gross",
+        "extrapolation_from_price_gross",
+        "extrapolation_to_price_gross",
+        "extrapolation_price_ratio",
+        "extrapolation_tail_multiplier",
+        "scenario_price_effect_source",
+    ]:
+        daily[scalar_col] = legacy_result.get(scalar_col, (legacy_result.get("effective_scenario", {}) or {}).get(scalar_col, np.nan))
     for col in [
         "price_effect",
         "promo_effect",
@@ -4044,6 +4241,17 @@ def _run_what_if_projection_enhanced(
         "shock_units",
         "scenario_demand_raw",
         "lost_sales",
+        "requested_price_gross",
+        "safe_price_gross",
+        "model_price_gross",
+        "model_price_net",
+        "price_for_model",
+        "applied_price_gross",
+        "applied_price_net",
+        "scenario_price_gross",
+        "scenario_price_net",
+        "extrapolation_tail_multiplier",
+        "extrapolation_price_ratio",
     ]:
         if col in profile.columns:
             daily[col] = pd.to_numeric(profile[col], errors="coerce").to_numpy(dtype=float)
@@ -4086,6 +4294,22 @@ def _run_what_if_projection_enhanced(
     if low_factors >= 3:
         conf_score = min(conf_score, 0.35)
     conf_label = "Высокая" if conf_score >= 0.75 else ("Средняя" if conf_score >= 0.45 else "Низкая")
+    path_extrapolated = bool(scenario_overrides.get("__price_path_extrapolated", False))
+    path_clipped = bool(scenario_overrides.get("__price_path_financial_clipped", False))
+    path_tail = pd.to_numeric(profile.get("extrapolation_tail_multiplier", pd.Series(np.ones(len(profile)))), errors="coerce").fillna(1.0)
+    path_ratio = pd.to_numeric(profile.get("extrapolation_price_ratio", pd.Series(np.ones(len(profile)))), errors="coerce").fillna(1.0)
+    valid_path_elasticity = bool(np.isfinite(path_price_elasticity) and VALID_ELASTICITY_MIN <= path_price_elasticity <= VALID_ELASTICITY_MAX)
+    path_elasticity_used = float(path_price_elasticity if valid_path_elasticity else CONFIG["PRIOR_ELASTICITY"])
+    if valid_path_elasticity:
+        path_elasticity_source = "pooled_price_elasticity"
+    elif np.isfinite(path_price_elasticity):
+        path_elasticity_source = "fallback_prior_out_of_safe_range"
+    else:
+        path_elasticity_source = "fallback_prior_invalid_elasticity"
+    if path_extrapolated:
+        daily["scenario_price_effect_source"] = "boundary_plus_elasticity_tail"
+        daily["elasticity_used"] = path_elasticity_used
+        daily["elasticity_source"] = path_elasticity_source
     out = dict(legacy_result)
     baseline_path = str(legacy_result.get("baseline_forecast_path", "weekly_ml_baseline"))
     scenario_path = "enhanced_local_factor_layer"
@@ -4104,13 +4328,22 @@ def _run_what_if_projection_enhanced(
             "confidence_scenario": conf_score,
             "confidence_label": conf_label,
             "uncertainty": 1.0 - conf_score,
+            "price_path_active": bool(scenario_overrides.get("requested_price_path")),
+            "price_clipped": bool(path_clipped or legacy_result.get("price_clipped", False)),
+            "clip_applied": bool(path_clipped or legacy_result.get("clip_applied", False)),
+            "price_out_of_range": bool(path_extrapolated or legacy_result.get("price_out_of_range", False)),
+            "extrapolation_applied": bool(path_extrapolated or legacy_result.get("extrapolation_applied", False)),
+            "extrapolation_tail_multiplier": float(path_tail.mean()) if len(path_tail) else float(legacy_result.get("extrapolation_tail_multiplier", 1.0)),
+            "extrapolation_price_ratio": float(path_ratio.mean()) if len(path_ratio) else float(legacy_result.get("extrapolation_price_ratio", 1.0)),
+            "elasticity_used": path_elasticity_used if path_extrapolated else float(legacy_result.get("elasticity_used", np.nan)),
+            "elasticity_source": path_elasticity_source if path_extrapolated else str(legacy_result.get("elasticity_source", "")),
+            "scenario_price_effect_source": "boundary_plus_elasticity_tail" if path_extrapolated else str(legacy_result.get("scenario_price_effect_source", "baseline_daily_x_local_factor_layer")),
             "scenario_driver_mode": "baseline_daily_plus_local_factor_layer",
             "active_path_contract": visible_path,
             "baseline_forecast_path": baseline_path,
             "scenario_calculation_path": scenario_path,
             "learned_uplift_path": learned_uplift_path,
             "final_user_visible_path": visible_path,
-            "scenario_price_effect_source": "baseline_daily_x_local_factor_layer",
             "scenario_calc_mode": "enhanced_local_factors",
             "scenario_engine_version": "v1_enhanced_local_factors",
             "effect_source": "baseline_daily_x_local_factor_layer",
@@ -4152,6 +4385,94 @@ def _run_what_if_projection_enhanced(
     return out
 
 
+
+def _series_min_max(frame: pd.DataFrame, column: str, fallback: float = np.nan) -> Tuple[float, float]:
+    if not isinstance(frame, pd.DataFrame) or column not in frame.columns:
+        val = float(fallback) if np.isfinite(fallback) else np.nan
+        return val, val
+    values = pd.to_numeric(frame[column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(values) == 0:
+        val = float(fallback) if np.isfinite(fallback) else np.nan
+        return val, val
+    return float(values.min()), float(values.max())
+
+
+def _finalize_scenario_contract(result: Dict[str, Any], mode: str, price_guardrail_mode: str) -> Dict[str, Any]:
+    out = dict(result or {})
+    daily = out.get("daily")
+    effective = dict(out.get("effective_scenario") or {})
+    if not isinstance(daily, pd.DataFrame):
+        daily = pd.DataFrame()
+    requested_fallback = float(out.get("requested_price", effective.get("requested_price_gross", np.nan)))
+    model_fallback = float(out.get("model_price", out.get("price_for_model", effective.get("model_price_gross", effective.get("safe_price_gross", np.nan)))))
+    financial_fallback = float(out.get("financial_price", effective.get("financial_price_gross", effective.get("applied_price_gross", np.nan))))
+    req_min, req_max = _series_min_max(daily, "requested_price_gross", requested_fallback)
+    model_min, model_max = _series_min_max(daily, "model_price_gross", model_fallback)
+    fin_min, fin_max = _series_min_max(daily, "applied_price_gross", financial_fallback)
+    raw_requested_min, raw_requested_max = req_min, req_max
+    is_path = bool(out.get("price_path_active", False) or abs(req_max - req_min) > 1e-9 or abs(model_max - model_min) > 1e-9 or abs(fin_max - fin_min) > 1e-9)
+    price_policy = {
+        "mode": str(price_guardrail_mode),
+        "is_path": bool(is_path),
+        "requested_price_min": raw_requested_min,
+        "requested_price_max": raw_requested_max,
+        "model_price_min": model_min,
+        "model_price_max": model_max,
+        "financial_price_min": fin_min,
+        "financial_price_max": fin_max,
+        "applied_price_min": fin_min,
+        "applied_price_max": fin_max,
+        "extrapolation_applied": bool(out.get("extrapolation_applied", effective.get("extrapolation_applied", False))),
+        "clip_applied": bool(out.get("clip_applied", effective.get("clip_applied", out.get("price_clipped", False)))),
+        "price_out_of_range": bool(out.get("price_out_of_range", effective.get("price_out_of_range", False))),
+        "extrapolation_tail_multiplier": float(out.get("extrapolation_tail_multiplier", 1.0)),
+        "extrapolation_price_ratio": float(out.get("extrapolation_price_ratio", 1.0)),
+        "elasticity_source": str(out.get("elasticity_source", effective.get("elasticity_source", ""))),
+    }
+    out["price_policy"] = {**dict(out.get("price_policy") or {}), **price_policy}
+    out.setdefault("factor_policy", {
+        "mode": str(mode),
+        "effect_source": str(out.get("effect_source", out.get("scenario_price_effect_source", ""))),
+        "learned_uplift_active": bool(out.get("learned_uplift_active", False)),
+        "demand_shock_is_manual_hypothesis": True,
+    })
+    out.setdefault("calculation_trace", {
+        "baseline_source": str(out.get("baseline_forecast_path", "unknown")),
+        "scenario_mode": str(mode),
+        "price_effect_source": str(out.get("scenario_price_effect_source", out.get("effect_source", "unknown"))),
+        "promo_effect_source": str(out.get("effect_source", "scenario_layer")),
+        "freight_effect_source": str(out.get("effect_source", "scenario_layer")),
+        "shock_source": "manual_shock_overlay",
+        "guardrail_mode": str(price_guardrail_mode),
+        "extrapolation_policy": "boundary_plus_elasticity_tail" if price_policy["extrapolation_applied"] else "none",
+        "cost_policy": "unit_cost_or_proxy",
+        "stock_policy": "stock_cap_if_provided",
+    })
+    out.setdefault("guardrail_warnings", [w for w in out.get("warnings", []) if "guardrail" in str(w).lower() or "экстраполя" in str(w).lower() or "диапаз" in str(w).lower()])
+    gate = resolve_recommendation_gate(
+        price_policy=price_policy,
+        data_quality={"flat_history": bool(out.get("flat_history", False))},
+        model_quality={"wape": out.get("wape", out.get("holdout_wape"))},
+        factor_policy={
+            **dict(out.get("factor_policy") or {}),
+            "manual_demand_shock_main_driver": bool(out.get("manual_demand_shock_main_driver", False)),
+        },
+        economic_significance={
+            "profit_delta_pct": out.get("profit_delta_pct", out.get("profit_delta")),
+            "conservative_profit_delta_pct": out.get("conservative_profit_delta_pct"),
+            "cost_proxied": out.get("cost_proxied", out.get("cost_is_proxy", False)),
+        },
+        cost_policy={"cost_proxied": bool(out.get("cost_proxied", out.get("cost_is_proxy", False)))},
+        decision_reliability={"warnings": out.get("guardrail_warnings", [])},
+    )
+    out["calculation_gate"] = gate["calculation_gate"]
+    out["recommendation_gate"] = gate["recommendation_gate"]
+    out["recommendation_gate_reasons"] = gate["reasons"]
+    out["recommendation_gate_warnings"] = gate["warnings"]
+    if gate["warnings"]:
+        out["guardrail_warnings"] = list(dict.fromkeys(list(out.get("guardrail_warnings") or []) + gate["warnings"]))
+    return out
+
 def run_what_if_projection(
     trained_bundle: Dict[str, Any],
     manual_price: float,
@@ -4172,7 +4493,7 @@ def run_what_if_projection(
     selected_mode = scenario_calc_mode if scenario_calc_mode is not None else trained_bundle.get("analysis_scenario_calc_mode")
     mode = resolve_scenario_calc_mode(selected_mode)
     if mode == CATBOOST_FULL_FACTOR_MODE:
-        return predict_catboost_full_factor_projection(
+        result = predict_catboost_full_factor_projection(
             trained_bundle=trained_bundle,
             manual_price=manual_price,
             freight_multiplier=freight_multiplier,
@@ -4185,6 +4506,7 @@ def run_what_if_projection(
             factor_overrides=factor_overrides,
             price_guardrail_mode=price_guardrail_mode,
         )
+        return _finalize_scenario_contract(result, mode, price_guardrail_mode)
     if mode == "legacy_current":
         result = _run_what_if_projection_legacy(
             trained_bundle=trained_bundle,
@@ -4196,6 +4518,7 @@ def run_what_if_projection(
             cost_multiplier=cost_multiplier,
             stock_cap=stock_cap,
             overrides=overrides,
+            price_guardrail_mode=price_guardrail_mode,
         )
         result["scenario_calc_mode"] = "legacy_current"
         result.setdefault("scenario_engine_version", "v1_legacy_current")
@@ -4204,9 +4527,9 @@ def run_what_if_projection(
         result.setdefault("daily_effects_summary", [])
         result.setdefault("legacy_or_enhanced_label", "legacy")
         result.setdefault("scenario_calc_mode_label", scenario_mode_label("legacy_current"))
-        return result
+        return _finalize_scenario_contract(result, mode, price_guardrail_mode)
     if mode == "enhanced_local_factors":
-        return _run_what_if_projection_enhanced(
+        result = _run_what_if_projection_enhanced(
             trained_bundle=trained_bundle,
             manual_price=manual_price,
             freight_multiplier=freight_multiplier,
@@ -4216,7 +4539,9 @@ def run_what_if_projection(
             cost_multiplier=cost_multiplier,
             stock_cap=stock_cap,
             overrides=overrides,
+            price_guardrail_mode=price_guardrail_mode,
         )
+        return _finalize_scenario_contract(result, mode, price_guardrail_mode)
     raise ValueError(f"Unknown scenario_calc_mode: {scenario_calc_mode}")
 
 
@@ -4602,6 +4927,10 @@ def build_manual_scenario_artifacts(result_dict: Dict[str, Any], what_if_result:
         "confidence": float(what_if_result.get("confidence", np.nan)),
         "scenario_assumptions": what_if_result.get("applied_overrides", {}),
         "scenario_inputs_contract": what_if_result.get("scenario_inputs_contract", {}),
+        "price_policy": what_if_result.get("price_policy", {}),
+        "factor_policy": what_if_result.get("factor_policy", {}),
+        "calculation_trace": what_if_result.get("calculation_trace", {}),
+        "guardrail_warnings": what_if_result.get("guardrail_warnings", []),
         "applied_overrides": what_if_result.get("applied_overrides", {}),
         "scenario_forecast": manual_daily.to_dict("records"),
         "baseline_forecast_path": baseline_forecast_path,
