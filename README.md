@@ -1,21 +1,27 @@
 # ML Pricing What-if v1
 
-Приложение поддерживает **один активный production-контур**: Universal CSV → weekly baseline (`price_promo_freight_baseline`) → scenario recompute (`price/promo/freight`) → manual shock.
+Приложение поддерживает production-v1 контур:
+
+Universal CSV → stable weekly baseline (`legacy_baseline`) → scenario recompute / enhanced local factor layer → manual shock overlay.
+
+Дополнительный режим `catboost_full_factors` доступен как расширенный сценарный режим: он повторно прогнозирует спрос по изменённым факторам, но не является production default.
 
 ## Возможности
+
 - Universal CSV загрузка с auto-mapping и нормализацией.
-- Leak-safe daily pipeline (без backward fill из будущего).
-- Прозрачный what-if: `price`, `promo`, `freight`, `manual shock`.
-- Раздельные метрики: baseline / as-is / scenario, плюс дельты по units/revenue/profit.
-- Learned uplift оставлен только в диагностике (в runtime не участвует).
-- **Excel export**: `history`, `neutral_baseline`, `as_is`, `metrics`.
-- **CSV export**: `holdout_predictions`, `analysis_baseline_vs_as_is`, `manual_scenario_daily`, `feature_report`.
+- Stable v1 runtime: `legacy_baseline` по умолчанию.
+- What-if сценарии: цена, скидка, промо, логистика, внешний спрос.
+- Расширенный режим CatBoost full factors: модель переоценивает спрос по изменённым факторам.
+- Decision layer: проверяет сценарии, оценивает риск, экономический эффект и формирует план теста.
+- Decision layer не является причинным доказательством и не гарантирует глобальный оптимум.
 
 ## Контракт v1
-- Активный путь по умолчанию: `price_promo_freight_baseline+scenario_recompute`.
-- Legacy/naive путь используется только как аварийный fallback (когда weekly ML не проходит проверку качества или данных недостаточно).
-- Для `price/promo/freight` нет двойного учёта: эффекты применяются один раз через scenario engine поверх baseline units.
-- `shock` применяется отдельно как прозрачный post-model multiplier.
+
+- Production default: `legacy_baseline`.
+- Non-legacy weekly candidates используются как диагностика, если runtime frozen to legacy.
+- CatBoost full factors включается только выбранным режимом анализа.
+- Decision layer ищет лучший найденный вариант среди проверенных сценариев, а не математически гарантированный глобальный оптимум.
+- Demand shock является ручной гипотезой, а не автоматически выученным причинным эффектом.
 
 ## Запуск
 ```bash

@@ -17,17 +17,21 @@ def _ctx(trained_bundle, current_context=None):
 def build_candidate_from_recommendation(recommendation: dict, trained_bundle: dict, current_context: dict | None, horizon_days: int) -> dict:
     ctx = _ctx(trained_bundle, current_context)
     action = recommendation.get("action_type", "price_change")
-    current_price = safe_float(ctx.get("price"), 0.0); current_discount = clamp(ctx.get("discount", 0.0), 0, 0.95); current_promo = clamp(ctx.get("promotion", 0.0), 0, 1)
+    current_price = safe_float(ctx.get("price"), 0.0); current_discount = clamp(ctx.get("discount", 0.0), 0, 0.95); current_promo = clamp(ctx.get("promotion", 0.0), 0, 1); current_freight = safe_float(ctx.get("freight_value"), 0.0)
+    factor_overrides = dict(ctx.get("factor_overrides") or {})
     target = recommendation.get("target_value")
     if target is None and recommendation.get("change_pct") is not None:
-        base = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else 1.0
+        base = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else current_freight if action == "freight_change" else 1.0
         target = base * (1.0 + safe_float(recommendation.get("change_pct"), 0.0) / 100.0)
-    target = safe_float(target, current_price if action == "price_change" else 1.0)
-    current = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else 1.0
-    params = {"manual_price": current_price, "discount_multiplier": 1.0, "demand_multiplier": 1.0, "overrides": {"discount": current_discount, "promotion": current_promo}}
+    target = safe_float(target, current_price if action == "price_change" else current_freight if action == "freight_change" else 1.0)
+    current = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else current_freight if action == "freight_change" else 1.0
+    params = {"manual_price": current_price, "freight_multiplier": 1.0, "discount_multiplier": 1.0, "demand_multiplier": 1.0, "factor_overrides": dict(factor_overrides), "overrides": {"discount": current_discount, "promotion": current_promo, "freight_value": current_freight}}
     if action == "price_change": params["manual_price"] = target
     elif action == "discount_change": params["overrides"]["discount"] = clamp(target, 0, 0.95)
     elif action == "promotion_change": params["overrides"]["promotion"] = clamp(target, 0, 1)
+    elif action == "freight_change":
+        params["freight_multiplier"] = 1.0
+        params["overrides"]["freight_value"] = safe_float(target, current_freight)
     elif action == "demand_shock": params["demand_multiplier"] = max(0.01, target)
     metadata = {"source_name": recommendation.get("source_name"), "horizon_days": horizon_days, **(recommendation.get("metadata") or {})}
     if action in {"discount_change", "promotion_change"}:
@@ -36,12 +40,16 @@ def build_candidate_from_recommendation(recommendation: dict, trained_bundle: di
 
 
 def _make_alt(cid, base, target, action, objective, ctx, source="improved"):
-    current_price = safe_float(ctx.get("price"), 0.0); current_discount = clamp(ctx.get("discount", 0.0), 0, 0.95); current_promo = clamp(ctx.get("promotion", 0.0), 0, 1)
-    current = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else 1.0
-    params = {"manual_price": current_price, "discount_multiplier": 1.0, "demand_multiplier": 1.0, "overrides": {"discount": current_discount, "promotion": current_promo}}
+    current_price = safe_float(ctx.get("price"), 0.0); current_discount = clamp(ctx.get("discount", 0.0), 0, 0.95); current_promo = clamp(ctx.get("promotion", 0.0), 0, 1); current_freight = safe_float(ctx.get("freight_value"), 0.0)
+    factor_overrides = dict(ctx.get("factor_overrides") or {})
+    current = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else current_freight if action == "freight_change" else 1.0
+    params = {"manual_price": current_price, "freight_multiplier": 1.0, "discount_multiplier": 1.0, "demand_multiplier": 1.0, "factor_overrides": dict(factor_overrides), "overrides": {"discount": current_discount, "promotion": current_promo, "freight_value": current_freight}}
     if action == "price_change": params["manual_price"] = target
     elif action == "discount_change": params["overrides"]["discount"] = clamp(target, 0, 0.95)
     elif action == "promotion_change": params["overrides"]["promotion"] = clamp(target, 0, 1)
+    elif action == "freight_change":
+        params["freight_multiplier"] = 1.0
+        params["overrides"]["freight_value"] = safe_float(target, current_freight)
     else: params["demand_multiplier"] = max(0.01, target)
     metadata = {}
     if action in {"discount_change", "promotion_change"}:
@@ -62,6 +70,8 @@ def generate_alternatives_around_recommendation(recommendation_candidate: dict, 
         values += [current + (target-current)*r for r in (0.5, 1.0, 0.75)]
     elif action == "promotion_change":
         values += [target, 0.0, 1.0]
+    elif action == "freight_change":
+        values += [current + (target-current)*r for r in (0.5, 0.75, 1.0)]
     elif action == "demand_shock":
         values += [1.0 + (target-1.0)*r for r in (0.5, 1.0)]
     seen = set(); out=[]
@@ -97,11 +107,11 @@ def _verdict(input_eval: dict, optimizer: dict) -> dict:
     return {"verdict": verdict, "reason": reason, "main_risks": rel.get("warnings", [])[:5] + rel.get("blockers", [])[:3], "what_is_valid": rel.get("reasons_positive", []), "what_is_weak": rel.get("reasons_negative", [])[:6]}
 
 
-def audit_and_improve_recommendation(results: dict, trained_bundle: dict, recommendation: dict, runner: Callable, scenario_calc_mode: str, price_guardrail_mode: str, horizon_days: int = 30, objective: str = "profit") -> dict:
+def audit_and_improve_recommendation(results: dict, trained_bundle: dict, recommendation: dict, runner: Callable, scenario_calc_mode: str, price_guardrail_mode: str, horizon_days: int = 30, objective: str = "profit", current_context: dict | None = None) -> dict:
     objective = recommendation.get("objective") or objective
-    cand = build_candidate_from_recommendation(recommendation, trained_bundle, None, horizon_days)
-    alts = generate_alternatives_around_recommendation(cand, trained_bundle, None, objective, horizon_days)
-    evaluated = evaluate_decision_candidates(results, trained_bundle, alts, runner, scenario_calc_mode, price_guardrail_mode, horizon_days, objective)
+    cand = build_candidate_from_recommendation(recommendation, trained_bundle, current_context, horizon_days)
+    alts = generate_alternatives_around_recommendation(cand, trained_bundle, current_context, objective, horizon_days)
+    evaluated = evaluate_decision_candidates(results, trained_bundle, alts, runner, scenario_calc_mode, price_guardrail_mode, horizon_days, objective, current_context=current_context)
     optimizer = rank_decision_candidates(evaluated, objective=objective)
     input_eval = next((e for e in evaluated if (e.get("candidate") or {}).get("candidate_id") == "external_recommendation"), evaluated[-1] if evaluated else {})
     verdict = _verdict(input_eval, optimizer)
@@ -110,5 +120,5 @@ def audit_and_improve_recommendation(results: dict, trained_bundle: dict, recomm
         improved = {"action_type": "no_change_or_test", "title": "Не менять параметр без теста", "reason": "Нет сценария с достаточной надёжностью и экономической значимостью"}
     optimizer_for_passport = dict(optimizer); optimizer_for_passport["best_action"] = improved
     audit_stub = {"audit_verdict": verdict}
-    passport = build_decision_passport("improve_external_recommendation", optimizer_for_passport, input_recommendation=recommendation, audit_result=audit_stub)
+    passport = build_decision_passport("improve_external_recommendation", optimizer_for_passport, input_recommendation=recommendation, audit_result=audit_stub, calculation_context=current_context)
     return {"input_recommendation": recommendation, "input_evaluation": input_eval, "audit_verdict": verdict, "improved_solution": improved, "safe_option": optimizer.get("safe_option"), "balanced_option": optimizer.get("balanced_option"), "aggressive_option": optimizer.get("aggressive_option"), "alternatives_table": optimizer.get("ranking_table", []), "decision_passport": passport}

@@ -49,7 +49,9 @@ def _eligible_best(e: dict, objective: str, min_profit_uplift_pct: float) -> boo
 def _compact(e: dict | None) -> dict | None:
     if e is None: return None
     cand = e.get("candidate") or {}; rel = e.get("reliability") or {}
-    return {"candidate_id": cand.get("candidate_id"), "title": cand.get("title"), "action_type": cand.get("action_type"), "objective": cand.get("objective"), "current_value": cand.get("current_value"), "target_value": cand.get("target_value"), "change_pct": cand.get("change_pct"), "decision_rank_score": e.get("decision_rank_score"), "expected_effect": e.get("expected_effect"), "reliability": {"score": rel.get("score"), "risk_level": rel.get("risk_level"), "decision_status": rel.get("decision_status"), "label": rel.get("label"), "statistical_support": (rel.get("statistical_support") or {}).get("level")}, "full_reliability": rel, "warnings": e.get("warnings", []), "blockers": e.get("blockers", [])}
+    scenario_result = e.get("scenario_result") or {}
+    effective = scenario_result.get("effective_scenario") or {}
+    return {"candidate_id": cand.get("candidate_id"), "title": cand.get("title"), "action_type": cand.get("action_type"), "objective": cand.get("objective"), "current_value": cand.get("current_value"), "target_value": cand.get("target_value"), "change_pct": cand.get("change_pct"), "decision_rank_score": e.get("decision_rank_score"), "expected_effect": e.get("expected_effect"), "reliability": {"score": rel.get("score"), "risk_level": rel.get("risk_level"), "decision_status": rel.get("decision_status"), "label": rel.get("label"), "statistical_support": (rel.get("statistical_support") or {}).get("level")}, "requested_price": effective.get("requested_price_gross", scenario_result.get("requested_price")), "applied_price": effective.get("applied_price_gross", scenario_result.get("model_price")), "price_clipped": bool(effective.get("price_clipped", scenario_result.get("price_clipped", False))), "support_label": scenario_result.get("support_label"), "confidence_label": scenario_result.get("confidence_label"), "full_reliability": rel, "warnings": e.get("warnings", []), "blockers": e.get("blockers", [])}
 
 
 def rank_decision_candidates(evaluated_candidates: list[dict], objective: str = "profit", min_profit_uplift_pct: float = 3.0) -> dict:
@@ -74,5 +76,9 @@ def select_decision_options(ranked_candidates: list[dict], objective: str = "pro
     aggressive_pool = sorted(aggressive_pool, key=lambda e: _econ(e, objective), reverse=True)
     aggressive = aggressive_pool[0] if aggressive_pool else None
     notrec = [e for e in ranked_candidates if (e.get("reliability") or {}).get("decision_status") == "not_recommended"]
-    summary_text = "Найдено решение с учётом экономического эффекта и риска." if best else "Надёжного решения для автоматической рекомендации нет. Лучшее действие — не менять параметры без теста."
+    summary_text = (
+        "Найден лучший вариант среди проверенных сценариев с учётом экономического эффекта и риска."
+        if best
+        else "Надёжного решения для рекомендации нет. Лучшее действие — не менять параметры без ограниченного теста."
+    )
     return {"best_action": _compact(best), "safe_option": _compact(safe), "balanced_option": _compact(balanced), "aggressive_option": _compact(aggressive), "not_recommended_options": [_compact(e) for e in notrec], "ranking_table": [_compact(e) for e in ranked_candidates], "summary": {"message": summary_text, "valid_candidate_count": len(valid), "candidate_count": len(ranked_candidates)}}

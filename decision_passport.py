@@ -32,7 +32,13 @@ def _option_action(option: Optional[dict]) -> dict:
     return {"candidate_id": option.get("candidate_id"), "title": option.get("title"), "action_type": option.get("action_type"), "current_value": option.get("current_value"), "target_value": option.get("target_value"), "change_pct": option.get("change_pct")}
 
 
-def build_decision_passport(mode: str, optimizer_result: dict, input_recommendation: dict | None = None, audit_result: dict | None = None) -> dict:
+def build_decision_passport(
+    mode: str,
+    optimizer_result: dict,
+    input_recommendation: dict | None = None,
+    audit_result: dict | None = None,
+    calculation_context: dict | None = None,
+) -> dict:
     best = (optimizer_result or {}).get("best_action") or (optimizer_result or {}).get("improved_solution")
     if best and best.get("action_type") == "no_change_or_test":
         option = None
@@ -58,4 +64,4 @@ def build_decision_passport(mode: str, optimizer_result: dict, input_recommendat
     if not option:
         evidence = ["Надёжного сценария для автоматического внедрения не найдено."]
     validation_plan = build_validation_plan(action, rel, objective)
-    return {"mode": mode, "decision_title": title, "decision_status": rel.get("decision_status", "not_recommended" if not option else "test_recommended"), "recommended_action": action, "expected_effect": expected, "reliability": {"score": safe_float(rel.get("score"), 0.0), "label": rel.get("label", "low"), "risk_level": rel.get("risk_level", "high"), "statistical_support": rel.get("statistical_support", rel.get("support", "insufficient"))}, "evidence": evidence, "limitations": list(dict.fromkeys(limitations)), "validation_plan": validation_plan, "alternatives": {"safe": (optimizer_result or {}).get("safe_option"), "balanced": (optimizer_result or {}).get("balanced_option"), "aggressive": (optimizer_result or {}).get("aggressive_option")}, "input_recommendation": input_recommendation, "audit_verdict": (audit_result or {}).get("audit_verdict") if audit_result else None}
+    return {"mode": mode, "decision_title": title, "decision_status": rel.get("decision_status", "not_recommended" if not option else "test_recommended"), "recommended_action": action, "expected_effect": expected, "reliability": {"score": safe_float(rel.get("score"), 0.0), "label": rel.get("label", "low"), "risk_level": rel.get("risk_level", "high"), "statistical_support": rel.get("statistical_support", rel.get("support", "insufficient"))}, "evidence": evidence, "limitations": list(dict.fromkeys(limitations)), "validation_plan": validation_plan, "calculation_context": dict(calculation_context or {}), "alternatives": {"safe": (optimizer_result or {}).get("safe_option"), "balanced": (optimizer_result or {}).get("balanced_option"), "aggressive": (optimizer_result or {}).get("aggressive_option")}, "input_recommendation": input_recommendation, "audit_verdict": (audit_result or {}).get("audit_verdict") if audit_result else None}

@@ -110,3 +110,35 @@ def test_revenue_objective_profit_decline_not_recommended():
     out=evaluate_decision_reliability(res,tb,cand(),slight,BASE,objective="revenue")
     assert out["decision_status"] != "recommended"
     assert any("Прибыль снижается" in w for w in out["warnings"])
+
+
+def test_unknown_model_features_do_not_claim_price_is_used_by_ml():
+    results = {
+        "history_daily": pd.DataFrame({
+            "price": [100, 102, 104, 106, 108, 110, 112, 114, 116, 118],
+            "sales": [10, 11, 9, 10, 12, 8, 9, 7, 8, 7],
+            "date": pd.date_range("2025-01-01", periods=10),
+        }),
+        "quality_report": {"holdout_metrics": {"wape": 30}},
+    }
+    trained_bundle = {"daily_base": results["history_daily"]}
+    candidate = {
+        "action_type": "price_change",
+        "target_value": 110,
+        "change_pct": 10,
+        "metadata": {},
+    }
+
+    rel = evaluate_decision_reliability(
+        results,
+        trained_bundle,
+        candidate,
+        {"profit_total": 110, "demand_total": 90, "revenue_total": 1000, "confidence": 0.7},
+        {"profit_total": 100, "demand_total": 100, "revenue_total": 900},
+        objective="profit",
+    )
+
+    details = rel["component_details"]["factor_support"]
+    assert details["model_feature_known"] is False
+    assert details["model_uses_price"] is False
+    assert any("Список признаков модели неизвестен" in x for x in rel["warnings"])

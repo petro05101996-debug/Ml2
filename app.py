@@ -5702,9 +5702,88 @@ def fmt_pct_delta(value: Any) -> str:
     return f"{v:+.1f}%"
 
 
+
+def _finite_or_default(value: Any, default: float) -> float:
+    try:
+        v = float(value)
+        return v if np.isfinite(v) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _fmt_decision_context_value(value: Any, suffix: str = "", decimals: int = 2) -> str:
+    try:
+        v = float(value)
+        if not np.isfinite(v):
+            return "—"
+        return f"{v:.{decimals}f}{suffix}"
+    except Exception:
+        return "—"
+
+
+def build_decision_current_context(results: Dict[str, Any], context_source: str) -> Dict[str, Any]:
+    bundle = results.get("_trained_bundle", {}) or {}
+    base_ctx = dict(bundle.get("base_ctx", {}) or {})
+    base_price = _finite_or_default(base_ctx.get("price"), _finite_or_default(results.get("current_price"), 0.0))
+    base_discount = _finite_or_default(base_ctx.get("discount"), 0.0)
+    base_promotion = _finite_or_default(base_ctx.get("promotion"), 0.0)
+    base_freight = _finite_or_default(base_ctx.get("freight_value"), 0.0)
+    base_cost = _finite_or_default(base_ctx.get("cost"), base_price * CONFIG["COST_PROXY_RATIO"])
+
+    if context_source != "applied_scenario":
+        return {
+            "price": base_price,
+            "discount": base_discount,
+            "promotion": base_promotion,
+            "freight_value": base_freight,
+            "cost": base_cost,
+            "factor_overrides": {},
+            "context_source": "base_ctx",
+        }
+
+    snap = st.session_state.get("applied_scenario_snapshot") or {}
+    wr = st.session_state.get("what_if_result") or {}
+    effective = (wr.get("effective_scenario") or {}) if isinstance(wr, dict) else {}
+
+    price = _finite_or_default(
+        snap.get("manual_price_applied"),
+        _finite_or_default(
+            wr.get("requested_price"),
+            _finite_or_default(
+                wr.get("applied_price_gross"),
+                _finite_or_default(effective.get("applied_price_gross"), base_price),
+            ),
+        ),
+    )
+    discount = _finite_or_default(snap.get("discount_applied"), base_discount)
+    promotion = _finite_or_default(snap.get("promo_applied"), base_promotion)
+    freight_mult = _finite_or_default(snap.get("freight_mult", snap.get("freight_requested_multiplier")), 1.0)
+    freight_value = _finite_or_default(snap.get("freight_applied"), base_freight * freight_mult)
+
+    return {
+        "price": price,
+        "discount": discount,
+        "promotion": promotion,
+        "freight_value": freight_value,
+        "cost": _finite_or_default(base_ctx.get("cost"), price * CONFIG["COST_PROXY_RATIO"]),
+        "factor_overrides": dict(st.session_state.get("last_factor_overrides", {}) or {}),
+        "context_source": "applied_scenario",
+    }
+
+
+def decision_status_label(status: str) -> str:
+    mapping = {
+        "recommended": "Можно тестировать с постепенным внедрением",
+        "test_recommended": "Рекомендуется controlled test",
+        "experimental_only": "Только экспериментальная гипотеза",
+        "not_recommended": "Не рекомендуется",
+    }
+    return mapping.get(str(status), str(status))
+
+
 def render_price_optimizer_summary(opt: Dict[str, Any]) -> None:
     if not isinstance(opt, dict) or len(opt) == 0:
-        render_empty_state("Оптимальная цена ещё не рассчитана", "Нажмите кнопку ниже, чтобы проверить несколько цен через текущий механизм what-if.")
+        render_empty_state("Лучший найденный вариант цены ещё не рассчитан", "Нажмите кнопку ниже, чтобы проверить несколько цен через текущий механизм what-if.")
         return
     title = str(opt.get("recommendation_title", "Результат анализа цены"))
     text = str(opt.get("recommendation_text", ""))
@@ -5719,7 +5798,7 @@ def render_price_optimizer_summary(opt: Dict[str, Any]) -> None:
     st.markdown(f'<div class="{css}"><b>{title}</b><br>{text}</div>', unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Текущая цена", fmt_price(opt.get("current_price", np.nan)))
-    price_label = "Рекомендуемая цена" if str(opt.get("status", "")) in ACTIONABLE_PRICE_OPT_STATUSES else "Лучший расчётный кандидат"
+    price_label = "Лучший найденный вариант цены" if str(opt.get("status", "")) in ACTIONABLE_PRICE_OPT_STATUSES else "Лучший расчётный кандидат"
     c2.metric(price_label, fmt_price(opt.get("recommended_price", np.nan)))
     c3.metric("Ожидаемая прибыль", fmt_money_total(opt.get("recommended_profit", np.nan)), fmt_pct_delta(opt.get("profit_delta_pct", np.nan)))
     conf = float(opt.get("confidence", 0.0)) if np.isfinite(float(opt.get("confidence", 0.0))) else np.nan
@@ -7045,7 +7124,7 @@ def render_upload_screen() -> dict[str, Any]:
             )
             st.caption("Техническая настройка режима расчёта. Если не уверены — оставьте по умолчанию.")
             auto_price_optimizer = st.checkbox(
-                "После анализа сразу показать оптимальную цену",
+                "После анализа сразу показать лучший найденный вариант цены",
                 value=False,
                 help=(
                     "Оптимизатор не меняет расчёт спроса и не применяет цену автоматически. "
@@ -7189,8 +7268,8 @@ if __name__ == "__main__":
                                 candidate_count=25,
                                 search_pct=0.20,
                             )
-                            st.session_state.active_workspace_tab = "Оптимальная цена"
-                            st.session_state["workspace_tab_radio"] = "Оптимальная цена"
+                            st.session_state.active_workspace_tab = "Лучший вариант цены"
+                            st.session_state["workspace_tab_radio"] = "Лучший вариант цены"
                         except Exception as exc:
                             st.session_state.price_optimizer_result_base = {"status": "optimizer_error", "recommendation_title": "Оптимизатор цены не был рассчитан", "recommendation_text": f"Базовый анализ выполнен, но оптимизатор цены завершился ошибкой: {exc}", "warnings": [str(exc)], "candidates": pd.DataFrame()}
                             st.session_state.price_optimizer_signature_base = None
@@ -7278,7 +7357,7 @@ if __name__ == "__main__":
         "Отчёт": "Экспорт",
         "Отчет": "Экспорт",
     }
-    tabs = ["Итог", "Оптимальная цена", "Сценарий", "Проверка решений", "Сравнить варианты", "Экспорт"]
+    tabs = ["Итог", "Лучший вариант цены", "Сценарий", "Проверка решений", "Сравнить варианты", "Экспорт"]
     current_tab = TAB_ALIASES.get(str(st.session_state.get("active_workspace_tab", "Итог")), str(st.session_state.get("active_workspace_tab", "Итог")))
     radio_tab = TAB_ALIASES.get(str(st.session_state.get("workspace_tab_radio", current_tab)), str(st.session_state.get("workspace_tab_radio", current_tab)))
     if current_tab not in tabs:
@@ -7398,8 +7477,8 @@ if __name__ == "__main__":
         close_surface()
 
 
-    elif active_tab == "Оптимальная цена":
-        render_page_header("Оптимальная цена", "Проверьте, есть ли цена, которая может дать больше прибыли при допустимом уровне риска.")
+    elif active_tab == "Лучший вариант цены":
+        render_page_header("Лучший вариант цены", "Проверьте цены-кандидаты и выберите лучший найденный вариант при допустимом уровне риска.")
         current_factor_overrides = factor_overrides if "factor_overrides" in locals() else {}
         base_opt_overrides = {
             "promotion": float(st.session_state.get("what_if_promo", r.get("_trained_bundle", {}).get("base_ctx", {}).get("promotion", 0.0))),
@@ -7417,7 +7496,7 @@ if __name__ == "__main__":
             candidate_count=25,
             search_pct=0.20,
         )
-        if st.button("Найти оптимальную цену", type="primary", use_container_width=True, key="run_price_optimizer_btn"):
+        if st.button("Проверить цены и найти лучший найденный вариант", type="primary", use_container_width=True, key="run_price_optimizer_btn"):
             st.session_state.price_optimizer_result_base = analyze_price_optimization(
                 trained_bundle=r["_trained_bundle"],
                 current_price=float(r.get("current_price", 0.0)),
@@ -7448,7 +7527,7 @@ if __name__ == "__main__":
         opt = st.session_state.get("price_optimizer_result_base")
         is_price_optimizer_stale = st.session_state.get("price_optimizer_signature_base") != current_opt_signature
         if is_price_optimizer_stale and opt is not None:
-            st.warning("Рекомендация по цене устарела: параметры сценария изменились. Нажмите «Найти оптимальную цену» ещё раз.")
+            st.warning("Рекомендация по цене устарела: параметры сценария изменились. Нажмите «Проверить цены и найти лучший найденный вариант» ещё раз.")
         render_price_optimizer_summary(opt or {})
         st.caption("Контекст: рекомендация рассчитана для базовых условий.")
         if isinstance(opt, dict):
@@ -7887,6 +7966,7 @@ if __name__ == "__main__":
                 scenario_calc_mode=str(scenario_calc_mode),
                 price_guardrail_mode=st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE),
             )
+            st.session_state["last_factor_overrides"] = dict(factor_overrides or {})
             wr = st.session_state.what_if_result
             try:
                 base_for_scenario = align_forecasts_by_scenario_dates(current_forecast, wr["daily"])
@@ -8074,7 +8154,7 @@ if __name__ == "__main__":
             st.caption("Сначала рассчитайте сценарий.")
 
         st.info("Сравнить с текущим планом можно во вкладке «Сравнить варианты».")
-        open_surface("Оптимальная цена для текущих условий", "Можно проверить, какая цена выглядит лучше при выбранных скидке, промо, логистике и внешнем шоке.")
+        open_surface("Лучший найденный вариант цены для текущих условий", "Можно проверить, какая цена выглядит лучше при выбранных скидке, промо, логистике и внешнем шоке.")
         scenario_reference_price = float(st.session_state.get("what_if_price", r.get("current_price", 0.0)))
         scenario_opt_signature = build_price_optimizer_signature(
             current_price=scenario_reference_price,
@@ -8122,7 +8202,7 @@ if __name__ == "__main__":
         close_surface()
 
         open_surface("Проверка соседних цен")
-        st.caption("График показывает, как могла бы измениться прибыль при нескольких ценах рядом с текущей. Это вспомогательная проверка, а не автоматический выбор оптимальной цены.")
+        st.caption("График показывает, как могла бы измениться прибыль при нескольких ценах рядом с текущей. Это вспомогательная проверка, а не автоматический выбор цены или гарантия глобального оптимума.")
         if wr is not None and str(wr.get("support_label", "")) == "low":
             st.warning("Низкая историческая поддержка сценария: проверку соседних цен интерпретируйте осторожно.")
         sens_signature = {
@@ -8175,7 +8255,10 @@ if __name__ == "__main__":
 
 
     elif active_tab == "Проверка решений":
-        render_page_header("Проверка коммерческих решений", "Decision layer: найти лучшее решение или улучшить внешнюю рекомендацию без причинных обещаний.")
+        render_page_header(
+            "Проверка коммерческих решений",
+            "Decision layer: проверяет варианты сценариев, оценивает риск и предлагает план теста.",
+        )
         if not isinstance(r.get("_trained_bundle"), dict) or not r.get("_trained_bundle"):
             st.warning("Сначала выполните базовый анализ: для проверки решений нужен обученный bundle.")
             st.stop()
@@ -8189,21 +8272,37 @@ if __name__ == "__main__":
             "Цена": "price_change",
             "Скидка": "discount_change",
             "Промо": "promotion_change",
+            "Логистика": "freight_change",
             "Demand shock / маркетинговая гипотеза": "demand_shock",
         }
         reverse_action_map = {
             "Изменить цену": "price_change",
             "Изменить скидку": "discount_change",
             "Изменить промо": "promotion_change",
+            "Изменить логистику": "freight_change",
             "Изменить спрос / маркетинг-гипотезу": "demand_shock",
         }
 
         def _show_decision_passport(passport: Dict[str, Any], table: Optional[List[Dict[str, Any]]] = None) -> None:
             st.subheader(passport.get("decision_title", "Решение"))
+            ctx = passport.get("calculation_context", {}) or {}
+            if ctx:
+                st.caption(
+                    "Расчёт выполнен от контекста: "
+                    f"{ctx.get('context_source', 'base_ctx')}; "
+                    f"режим: {ctx.get('scenario_calc_mode_label', ctx.get('scenario_calc_mode', 'unknown'))}; "
+                    f"guardrail: {ctx.get('price_guardrail_mode', 'unknown')}."
+                )
             rel = passport.get("reliability", {}) or {}
             eff = passport.get("expected_effect", {}) or {}
             action = passport.get("recommended_action", {}) or {}
-            st.info(f"Решение: {action.get('title') or action.get('action_type')}. Статус: {passport.get('decision_status')}. Что делать: внедрять только согласно плану проверки ниже.")
+            status_raw = str(passport.get("decision_status", "not_recommended"))
+            status_text = decision_status_label(status_raw)
+            st.info(
+                f"Решение: {action.get('title') or action.get('action_type')}. "
+                f"Статус: {status_text}. "
+                "Не внедряйте без проверки по плану ниже."
+            )
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Decision Reliability", f"{float(rel.get('score', 0.0)):.0f}/100")
             m2.metric("Риск", str(rel.get("risk_level", "n/a")))
@@ -8219,8 +8318,23 @@ if __name__ == "__main__":
                 st.markdown("**Ограничения**")
                 for item in passport.get("limitations", [])[:6]:
                     st.write(f"• {item}")
-            st.markdown("**План проверки**")
-            st.json(passport.get("validation_plan", {}), expanded=False)
+            plan = passport.get("validation_plan", {}) or {}
+            st.markdown("**План безопасной проверки**")
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Период теста", f"{int(plan.get('test_period_days', 0))} дней")
+            p2.metric("Формат", str(plan.get("test_scope", "controlled_test")))
+            p3.metric("Главная метрика", str(plan.get("success_metric", "gross_profit")))
+            st.markdown("**Что отслеживать дополнительно**")
+            secondary = plan.get("secondary_metrics", []) or []
+            if secondary:
+                st.write(", ".join(map(str, secondary)))
+            else:
+                st.write("—")
+            st.markdown("**Когда откатывать**")
+            st.warning(str(plan.get("rollback_condition", "Откатить, если прибыль не выше baseline или спрос падает сверх допустимого порога.")))
+            st.markdown("**Как проверять**")
+            st.info(str(plan.get("control_recommendation", "Использовать контрольную группу SKU/регионов/периодов, если возможно.")))
+            st.caption(str(plan.get("causal_note", "Результат является модельной оценкой, а не доказанной причинной связью.")))
             st.download_button(
                 "Скачать decision_passport.json",
                 data=json.dumps(passport, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -8234,18 +8348,61 @@ if __name__ == "__main__":
             with st.expander("Подробнее: alternatives / candidates", expanded=False):
                 st.json(passport.get("alternatives", {}), expanded=False)
                 if table:
-                    st.dataframe(pd.DataFrame(table), use_container_width=True)
+                    df_table = pd.DataFrame(table)
+                    cols = [
+                        "title",
+                        "action_type",
+                        "current_value",
+                        "target_value",
+                        "decision_rank_score",
+                        "expected_effect",
+                        "reliability",
+                        "price_clipped",
+                        "support_label",
+                        "confidence_label",
+                    ]
+                    shown = [c for c in cols if c in df_table.columns]
+                    st.dataframe(df_table[shown] if shown else df_table, use_container_width=True)
+            with st.expander("Технический JSON паспорта", expanded=False):
+                st.json(passport, expanded=False)
 
-        decision_tab, audit_tab = st.tabs(["Найти лучшее решение", "Проверить и улучшить рекомендацию"])
+        context_source_label = st.radio(
+            "От чего проверять решение",
+            options=[
+                "От базового состояния",
+                "От рассчитанного what-if сценария",
+            ],
+            index=1 if st.session_state.get("what_if_result") is not None else 0,
+            key="decision_context_source_label",
+            help="Если выбрать what-if сценарий, анализатор будет проверять решения относительно уже рассчитанных цены, скидки, промо, логистики и факторов.",
+        )
+        decision_context_source = (
+            "applied_scenario"
+            if context_source_label == "От рассчитанного what-if сценария"
+            else "base_ctx"
+        )
+        current_decision_context = build_decision_current_context(r, decision_context_source)
+        st.caption(
+            "Контекст анализа решений: "
+            f"цена {_fmt_decision_context_value(current_decision_context.get('price'), decimals=2)}, "
+            f"скидка {_fmt_decision_context_value(float(current_decision_context.get('discount', np.nan)) * 100.0, suffix='%', decimals=0)}, "
+            f"промо {_fmt_decision_context_value(float(current_decision_context.get('promotion', np.nan)) * 100.0, suffix='%', decimals=0)}, "
+            f"логистика {_fmt_decision_context_value(current_decision_context.get('freight_value'), decimals=2)}."
+        )
+
+        decision_tab, audit_tab = st.tabs([
+            "Найти лучший проверенный вариант",
+            "Проверить внешнюю рекомендацию",
+        ])
         with decision_tab:
             d_obj_label = st.selectbox("Цель", list(objective_map.keys()), key="decision_objective")
-            d_actions = st.multiselect("Разрешённые действия", list(action_map.keys()), default=["Цена", "Скидка", "Промо"], key="decision_allowed_actions")
+            d_actions = st.multiselect("Разрешённые действия", list(action_map.keys()), default=["Цена", "Скидка", "Промо", "Логистика"], key="decision_allowed_actions")
             d_horizon = st.number_input("Горизонт, дней", min_value=7, max_value=120, value=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])), step=1, key="decision_horizon")
-            if st.button("Найти лучшее решение", key="run_decision_optimizer", use_container_width=True):
+            if st.button("Проверить варианты и выбрать лучший найденный", key="run_decision_optimizer", use_container_width=True):
                 objective = objective_map[d_obj_label]
                 candidates = generate_decision_candidates(
                     r["_trained_bundle"],
-                    None,
+                    current_decision_context,
                     objective=objective,
                     allowed_actions=[action_map[a] for a in d_actions],
                     horizon_days=int(d_horizon),
@@ -8259,33 +8416,58 @@ if __name__ == "__main__":
                     price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
                     horizon_days=int(d_horizon),
                     objective=objective,
+                    current_context=current_decision_context,
                 )
                 opt = rank_decision_candidates(evaluated, objective=objective)
-                passport = build_decision_passport("find_best_decision", opt)
+                passport = build_decision_passport(
+                    "find_best_decision",
+                    opt,
+                    calculation_context={
+                        **current_decision_context,
+                        "scenario_calc_mode": str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+                        "scenario_calc_mode_label": scenario_mode_label(str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE))),
+                        "price_guardrail_mode": normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+                    },
+                )
                 st.session_state["decision_optimizer_result"] = opt
                 st.session_state["decision_passport"] = passport
             if isinstance(st.session_state.get("decision_passport"), dict):
                 _show_decision_passport(st.session_state["decision_passport"], st.session_state.get("decision_optimizer_result", {}).get("ranking_table"))
         with audit_tab:
+            st.caption(
+                "Внешняя рекомендация проверяется от выбранного выше контекста: "
+                f"{current_decision_context.get('context_source', 'base_ctx')}."
+            )
             a_source = st.text_input("Источник рекомендации", value="manual", key="audit_source")
             a_action_label = st.selectbox("Тип рекомендации", list(reverse_action_map.keys()), key="audit_action")
             audit_action = reverse_action_map[a_action_label]
             base_ctx_audit = r.get("_trained_bundle", {}).get("base_ctx", {})
             if audit_action == "price_change":
-                a_target = st.number_input("Новая цена", min_value=0.01, value=float(r.get("current_price", base_ctx_audit.get("price", 1.0))), step=1.0, key="audit_target_price")
-                base_value = float(r.get("current_price", base_ctx_audit.get("price", 1.0)))
+                a_target = st.number_input("Новая цена", min_value=0.01, value=float(current_decision_context.get("price", r.get("current_price", base_ctx_audit.get("price", 1.0)))), step=1.0, key="audit_target_price")
+                base_value = float(current_decision_context.get("price", r.get("current_price", base_ctx_audit.get("price", 1.0))))
                 external_evidence = False
                 evidence_comment = ""
             elif audit_action == "discount_change":
-                discount_pct = st.slider("Новая скидка, %", min_value=0, max_value=95, value=int(float(base_ctx_audit.get("discount", 0.0)) * 100), step=1, key="audit_target_discount_pct")
+                discount_pct = st.slider("Новая скидка, %", min_value=0, max_value=95, value=int(float(current_decision_context.get("discount", base_ctx_audit.get("discount", 0.0))) * 100), step=1, key="audit_target_discount_pct")
                 a_target = float(discount_pct) / 100.0
-                base_value = float(base_ctx_audit.get("discount", 0.0))
+                base_value = float(current_decision_context.get("discount", base_ctx_audit.get("discount", 0.0)))
                 external_evidence = False
                 evidence_comment = ""
             elif audit_action == "promotion_change":
                 promo_choice = st.selectbox("Промо", ["Выключить", "Включить"], key="audit_target_promo")
                 a_target = 1.0 if promo_choice == "Включить" else 0.0
-                base_value = float(base_ctx_audit.get("promotion", 0.0))
+                base_value = float(current_decision_context.get("promotion", base_ctx_audit.get("promotion", 0.0)))
+                external_evidence = False
+                evidence_comment = ""
+            elif audit_action == "freight_change":
+                a_target = st.number_input(
+                    "Новая логистика на единицу",
+                    min_value=0.0,
+                    value=float(current_decision_context.get("freight_value", base_ctx_audit.get("freight_value", 0.0))),
+                    step=1.0,
+                    key="audit_target_freight",
+                )
+                base_value = float(current_decision_context.get("freight_value", base_ctx_audit.get("freight_value", 0.0)))
                 external_evidence = False
                 evidence_comment = ""
             else:
@@ -8298,7 +8480,7 @@ if __name__ == "__main__":
             a_obj_label = st.selectbox("Цель рекомендации", list(objective_map.keys()), key="audit_objective")
             a_comment = st.text_area("Комментарий", value="Внешняя рекомендация", key="audit_comment")
             a_horizon = st.number_input("Горизонт проверки, дней", min_value=7, max_value=120, value=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])), step=1, key="audit_horizon")
-            if st.button("Проверить и улучшить", key="run_recommendation_audit", use_container_width=True):
+            if st.button("Проверить внешнюю рекомендацию", key="run_recommendation_audit", use_container_width=True):
                 objective = objective_map[a_obj_label]
                 recommendation = {
                     "source_name": a_source,
@@ -8318,6 +8500,12 @@ if __name__ == "__main__":
                     price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
                     horizon_days=int(a_horizon),
                     objective=objective,
+                    current_context={
+                        **current_decision_context,
+                        "scenario_calc_mode": str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
+                        "scenario_calc_mode_label": scenario_mode_label(str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE))),
+                        "price_guardrail_mode": normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+                    },
                 )
                 st.session_state["recommendation_audit_result"] = audit
             audit = st.session_state.get("recommendation_audit_result")

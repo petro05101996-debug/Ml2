@@ -156,18 +156,50 @@ def _factor_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_result
                 corr = corr_val if np.isfinite(corr_val) else None
             except Exception:
                 corr = None
-        model_features = candidate.get("metadata", {}).get("model_features") or candidate.get("metadata", {}).get("selected_features") or []
-        model_uses_price = (not model_features) or "price" in model_features or "net_price" in model_features
-        if not model_uses_price:
+        model_features = (
+            candidate.get("metadata", {}).get("model_features")
+            or candidate.get("metadata", {}).get("selected_features")
+            or []
+        )
+        model_features_set = {str(x) for x in model_features}
+
+        price_feature_names = {
+            "price",
+            "net_price",
+            "net_unit_price",
+            "price_idx",
+            "price_mean",
+            "price_median",
+        }
+
+        model_feature_known = bool(model_features_set)
+        model_uses_price = bool(model_features_set.intersection(price_feature_names))
+
+        scenario_layer_features = set(candidate.get("metadata", {}).get("scenario_layer_features") or [])
+        scenario_layer_uses_price = "price" in scenario_layer_features or str(candidate.get("action_type")) == "price_change"
+
+        if not model_feature_known:
+            score = min(score, 60.0)
+            warnings.append(
+                "Список признаков модели неизвестен: нельзя утверждать, что price был использован ML-моделью."
+            )
+        elif not model_uses_price and scenario_layer_uses_price:
+            score = min(score, 65.0)
+            warnings.append(
+                "Price не найден среди ML-признаков. Эффект цены рассчитан сценарным слоем, а не напрямую ML-моделью."
+            )
+        elif not model_uses_price:
             score = min(score, 40.0)
-            warnings.append("Фактор price не найден среди используемых моделью признаков: поддержка ограничена.")
+            warnings.append(
+                "Фактор price не найден среди используемых моделью признаков: поддержка ограничена."
+            )
         if corr is not None and safe_float(candidate.get("change_pct"), 0.0) > 0 and corr > 0.2:
             warnings.append("Историческая связь price-demand экономически необычна; возможны смешение факторов/сезонность.")
             score = min(score, 75.0)
         if uniq < 4 or span_pct < 0.06:
             warnings.append("Цена почти не менялась в истории: влияние цены слабо поддержано.")
             score = min(score, 40.0)
-        return score_0_100(score), {"unique_price_count": uniq, "price_span_pct": span_pct, "target_inside_range": inside, "price_demand_trend_adjusted_corr": corr, "model_uses_price": model_uses_price}, warnings, blockers
+        return score_0_100(score), {"unique_price_count": uniq, "price_span_pct": span_pct, "target_inside_range": inside, "price_demand_trend_adjusted_corr": corr, "model_feature_known": model_feature_known, "model_uses_price": model_uses_price, "scenario_layer_uses_price": scenario_layer_uses_price}, warnings, blockers
     if action == "discount_change":
         disc = _series(df, "discount")
         if len(disc.dropna()) == 0:
@@ -193,6 +225,29 @@ def _factor_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_result
         if score < 50:
             warnings.append("Промо почти всегда включено или выключено: влияние промо слабо поддержано.")
         return score, {"promo_positive_share": share, "promo_positive_observations": positive, "promo_zero_observations": nonpromo}, warnings, blockers
+    if action == "freight_change":
+        freight = _series(df, "freight_value")
+        if len(freight.dropna()) == 0:
+            blockers.append("Нет исторической колонки freight_value для проверки логистики.")
+            return 20.0, {}, warnings, blockers
+
+        uniq = int(freight.dropna().round(4).nunique())
+        mean = abs(float(freight.dropna().mean())) if len(freight.dropna()) else 0.0
+        span_pct = float((freight.max() - freight.min()) / max(mean, 1e-9)) if len(freight.dropna()) else 0.0
+        target = _target(candidate)
+        rscore, inside, _ = _range_score(target, freight)
+
+        base = 80.0 if uniq >= 5 and span_pct >= 0.10 else (55.0 if uniq >= 3 and span_pct >= 0.03 else 35.0)
+        score = 0.65 * base + 0.35 * rscore
+
+        if score < 55:
+            warnings.append("Логистика почти не менялась в истории: поддержка слабая.")
+
+        return score_0_100(score), {
+            "unique_freight_count": uniq,
+            "freight_span_pct": span_pct,
+            "target_inside_range": inside,
+        }, warnings, blockers
     if action == "demand_shock":
         warnings.append("Demand shock является ручной гипотезой, а не выученным причинным эффектом.")
         evidence = bool((candidate.get("metadata") or {}).get("external_evidence"))
@@ -210,7 +265,14 @@ def _scenario_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_resu
     blockers: List[str] = []
     action = str(candidate.get("action_type", ""))
     target = _target(candidate)
-    s = _series(df, "price") if action in {"price_change", "baseline"} else _series(df, "discount") if action == "discount_change" else pd.Series(dtype=float)
+    if action in {"price_change", "baseline"}:
+        s = _series(df, "price")
+    elif action == "discount_change":
+        s = _series(df, "discount")
+    elif action == "freight_change":
+        s = _series(df, "freight_value")
+    else:
+        s = pd.Series(dtype=float)
     range_score, inside, dist = _range_score(target, s) if len(s) else (75.0, True, 0.0)
     flags = {
         "price_clipped": bool(scenario_result.get("price_clipped") or scenario_result.get("clip_applied")),

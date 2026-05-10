@@ -110,6 +110,15 @@ def _safe_numeric(s: pd.Series, default: float = 0.0) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
 
 
+def _ffill_no_future_numeric(series: pd.Series, default: float) -> pd.Series:
+    raw = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return raw.ffill().fillna(default)
+
+
+def _ffill_no_future_object(series: pd.Series, default: str = "unknown") -> pd.Series:
+    return series.astype("object").ffill().fillna(default).astype(str)
+
+
 def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     dt = pd.to_datetime(out["date"], errors="coerce")
@@ -150,24 +159,29 @@ def _prepare_base_columns(daily: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = np.nan
 
-    out["price"] = _safe_numeric(out["price"], 1.0).ffill().bfill().clip(lower=0.01)
-    out["discount"] = _safe_numeric(out["discount"], 0.0).ffill().bfill().clip(0.0, 0.95)
+    out["price"] = _ffill_no_future_numeric(out["price"], 1.0).clip(lower=0.01)
+    out["discount"] = _ffill_no_future_numeric(out["discount"], 0.0).clip(0.0, 0.95)
     out["net_unit_price"] = _safe_numeric(out["net_unit_price"], np.nan)
     out["net_unit_price"] = out["net_unit_price"].fillna(out["price"] * (1.0 - out["discount"])).clip(lower=0.01)
-    out["freight_value"] = _safe_numeric(out["freight_value"], 0.0).ffill().bfill().clip(lower=0.0)
-    out["cost"] = _safe_numeric(out["cost"], np.nan).ffill().bfill()
+    out["freight_value"] = _ffill_no_future_numeric(out["freight_value"], 0.0).clip(lower=0.0)
+    out["cost"] = _ffill_no_future_numeric(out["cost"], np.nan)
     out["cost"] = out["cost"].fillna(out["price"] * 0.65).clip(lower=0.0)
-    out["promotion"] = _safe_numeric(out["promotion"], 0.0).ffill().bfill().clip(0.0, 1.0)
-    out["review_score"] = _safe_numeric(out["review_score"], 4.5).ffill().bfill()
-    out["reviews_count"] = _safe_numeric(out["reviews_count"], 0.0).ffill().bfill().clip(lower=0.0)
-    out["stock"] = _safe_numeric(out["stock"], np.inf).ffill().bfill()
+    out["promotion"] = _ffill_no_future_numeric(out["promotion"], 0.0).clip(0.0, 1.0)
+    out["review_score"] = _ffill_no_future_numeric(out["review_score"], 4.5)
+    out["reviews_count"] = _ffill_no_future_numeric(out["reviews_count"], 0.0).clip(lower=0.0)
+    out["stock"] = _ffill_no_future_numeric(out["stock"], np.inf)
 
     factor_cols = [c for c in out.columns if str(c).startswith("factor__")]
     for col in factor_cols:
+        missing_flag = f"{col}__was_missing"
         if pd.api.types.is_numeric_dtype(out[col]):
-            out[col] = _safe_numeric(out[col], np.nan).ffill().bfill()
+            raw = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            out[missing_flag] = raw.isna().astype(int)
+            out[col] = raw.ffill().fillna(0.0)
         else:
-            out[col] = out[col].astype("object").ffill().bfill().fillna("unknown").astype(str)
+            raw = out[col].astype("object")
+            out[missing_flag] = raw.isna().astype(int)
+            out[col] = _ffill_no_future_object(raw, "unknown")
 
     return out
 
