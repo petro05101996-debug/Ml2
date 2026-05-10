@@ -28,7 +28,7 @@ def _analyze_bundle():
     return run_full_pricing_analysis_universal(_make_txn(240), "cat-a", "sku-1")
 
 
-def test_active_path_is_frozen_to_legacy_baseline():
+def test_baseline_forecast_uses_legacy_baseline_but_what_if_default_is_enhanced():
     res = _analyze_bundle()
     summary = json.loads(res["analysis_run_summary_json"].decode("utf-8"))
     assert summary["config"]["selected_candidate"] == "legacy_baseline"
@@ -632,3 +632,57 @@ def test_price_guardrail_mode_change_marks_scenario_dirty():
     current_form = app.collect_current_form_values(100.0, 0.0, 0.0, 1.0, 1.0, 30, "catboost_full_factors", "economic_extrapolation")
     status = app.get_user_scenario_status(current_form, base_form, applied_snapshot, "applied")
     assert status == "dirty"
+
+
+def test_enhanced_economic_extrapolation_preserves_price_effect_source():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    horizon = 7
+    train_max = float(pd.to_numeric(bundle["daily_base"]["price"], errors="coerce").max())
+    requested_price = train_max * 1.4
+    dates = pd.date_range(pd.to_datetime(bundle["future_dates"]["date"]).min(), periods=horizon, freq="D")
+    wr = run_what_if_projection(
+        bundle,
+        manual_price=requested_price,
+        horizon_days=horizon,
+        overrides={"price_path": [{"date": str(d.date()), "value": requested_price} for d in dates]},
+        scenario_calc_mode="enhanced_local_factors",
+        price_guardrail_mode="economic_extrapolation",
+    )
+    daily = wr["daily"]
+    assert wr["scenario_price_effect_source"] == "boundary_plus_elasticity_tail"
+    assert wr["extrapolation_applied"] is True
+    assert np.isclose(float(wr["requested_price"]), requested_price)
+    assert np.isclose(float(wr["model_price"]), train_max)
+    assert np.isclose(float(wr["financial_price"]), requested_price)
+    assert wr["price_policy"]["is_path"] is True
+    assert np.isclose(float(wr["price_policy"]["requested_price_min"]), requested_price)
+    assert np.isclose(float(pd.to_numeric(daily["requested_price_gross"], errors="coerce").iloc[0]), requested_price)
+    assert np.isclose(float(pd.to_numeric(daily["model_price_gross"], errors="coerce").iloc[0]), train_max)
+    assert np.isclose(float(pd.to_numeric(daily["applied_price_gross"], errors="coerce").iloc[0]), requested_price)
+    assert "calculation_trace" in wr and "price_policy" in wr and "factor_policy" in wr
+    assert float(pd.to_numeric(daily["actual_sales"], errors="coerce").sum()) < float(pd.to_numeric(daily["base_pred_sales"], errors="coerce").sum())
+    first = daily.iloc[0]
+    assert np.isclose(float(first["revenue"]), float(first["actual_sales"]) * float(first["applied_price_net"]))
+
+
+def test_legacy_and_enhanced_share_v1_result_contract_fields():
+    res = _analyze_bundle()
+    bundle = res["_trained_bundle"]
+    base_price = float(bundle["base_ctx"]["price"])
+    required = {
+        "daily",
+        "effective_scenario",
+        "price_policy",
+        "factor_policy",
+        "calculation_trace",
+        "guardrail_warnings",
+        "calculation_gate",
+        "recommendation_gate",
+        "scenario_calc_mode",
+        "scenario_engine_version",
+    }
+    for mode in ["legacy_current", "enhanced_local_factors"]:
+        wr = run_what_if_projection(bundle, manual_price=base_price, scenario_calc_mode=mode)
+        assert required.issubset(wr.keys())
+        assert {"mode", "is_path", "requested_price_min", "model_price_min", "financial_price_min"}.issubset(wr["price_policy"].keys())

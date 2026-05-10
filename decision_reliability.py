@@ -7,8 +7,20 @@ import numpy as np
 import pandas as pd
 
 from decision_math import clamp, extract_metric, finite_or_none, safe_div, safe_float, safe_pct_delta, score_0_100
+from recommendation_gate import resolve_recommendation_gate
 
 PROFIT_KEYS = ("profit_total_adjusted", "profit_total", "profit_total_raw", "profit", "gross_profit")
+
+
+def normalize_wape_percent(value: Any, default: float | None = None) -> float | None:
+    """Return WAPE in percentage points without fraction auto-scaling.
+
+    Project contract: 18.0 means 18%, and 0.67 means 0.67%, not 67%.
+    """
+    parsed = finite_or_none(value)
+    if parsed is None:
+        return default
+    return float(parsed)
 
 
 def _as_df(obj: Any) -> pd.DataFrame:
@@ -85,9 +97,10 @@ def _data_quality(results: Dict[str, Any], trained_bundle: Dict[str, Any]) -> Tu
 
 def _model_quality(results: Dict[str, Any], scenario_result: Dict[str, Any]) -> Tuple[float, Dict[str, Any], List[str]]:
     warnings: List[str] = []
-    wape = extract_metric(results, "quality_report.holdout_metrics.wape", "quality_report.holdout_metrics.WAPE", "holdout_metrics.wape", "holdout_metrics.WAPE", default=None)
-    if wape is not None and wape <= 1.5:
-        wape *= 100.0
+    wape = normalize_wape_percent(extract_metric(results, "quality_report.holdout_metrics.wape", "quality_report.holdout_metrics.WAPE", "holdout_metrics.wape", "holdout_metrics.WAPE", default=None))
+    # WAPE contract: project metrics are stored as percentage points (18.0 == 18%).
+    # Do not auto-scale small values here: app.calculate_wape already returns percent,
+    # and multiplying values like 0.67 would turn a good 0.67% holdout WAPE into 67%.
     confidence = finite_or_none(scenario_result.get("confidence"))
     confidence_score = score_0_100((confidence if confidence is not None else 0.5) * 100.0)
     if wape is None:
@@ -274,17 +287,26 @@ def _scenario_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_resu
     else:
         s = pd.Series(dtype=float)
     range_score, inside, dist = _range_score(target, s) if len(s) else (75.0, True, 0.0)
+    effective = scenario_result.get("effective_scenario") or {}
+    price_ratio = safe_float(
+        scenario_result.get("extrapolation_price_ratio", effective.get("extrapolation_price_ratio", 1.0)),
+        1.0,
+    )
+    elasticity_source = str(scenario_result.get("elasticity_source", effective.get("elasticity_source", "")) or "")
     flags = {
         "price_clipped": bool(scenario_result.get("price_clipped") or scenario_result.get("clip_applied")),
         "ood_flag": bool(scenario_result.get("ood_flag")),
         "validation_ok": bool((scenario_result.get("validation_gate") or {}).get("ok", True)),
-        "price_out_of_range": bool((scenario_result.get("effective_scenario") or {}).get("price_out_of_range", False)),
-        "extrapolation_applied": bool(scenario_result.get("extrapolation_applied", False)),
+        "price_out_of_range": bool(effective.get("price_out_of_range", scenario_result.get("price_out_of_range", False))),
+        "extrapolation_applied": bool(scenario_result.get("extrapolation_applied", effective.get("extrapolation_applied", False))),
     }
     score = range_score
     if flags["ood_flag"] or flags["price_out_of_range"] or flags["extrapolation_applied"]:
         score = min(score, 45.0)
         warnings.append("Сценарий находится вне исторического диапазона или требует экстраполяции.")
+    if flags["extrapolation_applied"] and elasticity_source.startswith("fallback_prior"):
+        score = min(score, 35.0)
+        warnings.append("Экстраполяция использует prior-эластичность: нет подтверждённой исторической эластичности цены.")
     guardrail_mode = str(price_guardrail_mode or scenario_result.get("price_guardrail_mode") or (candidate.get("metadata") or {}).get("price_guardrail_mode") or "safe_clip")
     if flags["price_clipped"]:
         score = min(score, 35.0)
@@ -295,7 +317,7 @@ def _scenario_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_resu
     if not flags["validation_ok"]:
         score = min(score, 35.0)
         warnings.append("Validation gate сценария не пройден.")
-    return score_0_100(score), {"inside_range": inside, "distance_outside_range": dist, **flags}, warnings, blockers
+    return score_0_100(score), {"inside_range": inside, "distance_outside_range": dist, "extrapolation_price_ratio": price_ratio, "extrapolation_distance_pct": abs(price_ratio - 1.0), "elasticity_source": elasticity_source, **flags}, warnings, blockers
 
 
 
@@ -341,9 +363,7 @@ def estimate_effect_uncertainty(
         sigma_pct = float(np.std(dist, ddof=0))
         method = "residual_bootstrap"
     else:
-        wape_pct = safe_float(wape, 35.0 if wape is None else wape)
-        if wape_pct <= 1.5:
-            wape_pct *= 100.0
+        wape_pct = normalize_wape_percent(wape, 35.0)
         horizon_diversification = max(0.25, 1.0 / math.sqrt(float(horizon)))
         support_multiplier = 1.0 + max(0.0, 60.0 - factor_support_score) / 100.0 + max(0.0, 60.0 - scenario_support_score) / 100.0
         if bool(scenario_result.get("ood_flag")) or bool(scenario_result.get("extrapolation_applied")) or bool((scenario_result.get("effective_scenario") or {}).get("price_out_of_range")):
@@ -436,6 +456,12 @@ def _status(score: float, risk: str, blockers: List[str], candidate: Dict[str, A
         return "experimental_only"
     if scenario_meta.get("distance_outside_range", 0.0) > 0.25:
         return "experimental_only"
+    if bool(scenario_meta.get("price_out_of_range") or scenario_meta.get("extrapolation_applied")):
+        if str(scenario_meta.get("elasticity_source") or "").startswith("fallback_prior"):
+            return "experimental_only"
+        if scenario_meta.get("extrapolation_distance_pct", 0.0) > 0.25:
+            return "experimental_only"
+        return "test_recommended" if score >= 65 else "experimental_only"
     if wape is not None and wape > 60:
         return "experimental_only"
     if score >= 80 and risk == "low":
@@ -445,6 +471,20 @@ def _status(score: float, risk: str, blockers: List[str], candidate: Dict[str, A
     if score >= 45:
         return "experimental_only"
     return "not_recommended"
+
+
+def _effect_nature(candidate: Dict[str, Any], scenario_result: Dict[str, Any], scenario_meta: Dict[str, Any]) -> str:
+    action = str(candidate.get("action_type", ""))
+    if action == "demand_shock":
+        return "manual_hypothesis"
+    source = str(scenario_result.get("scenario_price_effect_source") or scenario_result.get("effect_source") or "")
+    if str(scenario_meta.get("elasticity_source") or "").startswith("fallback_prior"):
+        return "prior_based"
+    if "catboost" in source and "recompute" in source:
+        return "ml_learned"
+    if scenario_result.get("extrapolation_applied") or scenario_meta.get("extrapolation_applied"):
+        return "mixed"
+    return "scenario_layer"
 
 
 def evaluate_decision_reliability(results: dict, trained_bundle: dict, candidate: dict, scenario_result: dict, baseline_result: dict | None = None, objective: str = "profit", min_profit_uplift_pct: float = 3.0, price_guardrail_mode: str | None = None) -> dict:
@@ -491,6 +531,8 @@ def evaluate_decision_reliability(results: dict, trained_bundle: dict, candidate
     status = _status(score, risk, blockers, candidate or {}, scenario_meta, wape)
     if data_meta.get("flat_sales") and status == "recommended":
         status = "test_recommended"
+    if str((candidate or {}).get("action_type")) == "price_change" and factor_meta.get("unique_price_count", 99) < 4 and status == "recommended":
+        status = "test_recommended"
     if objective in {"revenue", "demand"} and econ_meta.get("profit_delta_pct", 0.0) < 0 and status == "recommended":
         status = "test_recommended"
     if objective == "profit" and (econ_meta.get("conservative_profit_delta_pct", 0.0) < min_profit_uplift_pct or safe_float(econ_meta.get("uncertainty", {}).get("probability_profit_positive"), 1.0) < 0.75) and status == "recommended":
@@ -499,6 +541,28 @@ def evaluate_decision_reliability(results: dict, trained_bundle: dict, candidate
         status = "experimental_only"
     if objective == "profit" and econ_meta.get("conservative_profit_delta_pct", 0.0) <= 0 and status in {"recommended", "test_recommended"}:
         status = "experimental_only"
+    if econ_meta.get("cost_proxied") and status == "recommended":
+        status = "test_recommended"
+    gate = resolve_recommendation_gate(
+        price_policy=scenario_meta,
+        data_quality=data_meta,
+        model_quality=model_meta,
+        factor_policy={
+            **dict(factor_meta or {}),
+            "manual_demand_shock_main_driver": str((candidate or {}).get("action_type")) == "demand_shock",
+        },
+        economic_significance=econ_meta,
+        cost_policy={"cost_proxied": bool(econ_meta.get("cost_proxied"))},
+        decision_reliability={
+            "base_status": status,
+            "status_namespace": "decision",
+            "warnings": warnings,
+            "blockers": blockers,
+        },
+    )
+    status = gate["decision_status"]
+    warnings = gate["warnings"]
+    blockers = gate["blockers"]
     label = "high" if score >= 80 else "medium" if score >= 60 else "low"
     positives = []
     if scenario_score >= 70: positives.append("Сценарий находится внутри/рядом с историческим диапазоном.")
@@ -506,7 +570,7 @@ def evaluate_decision_reliability(results: dict, trained_bundle: dict, candidate
     if factor_score >= 70: positives.append("Фактор имеет достаточную историческую вариативность.")
     negatives = list(dict.fromkeys(warnings + blockers))
     return {
-        "score": round(score, 2), "label": label, "risk_level": risk, "decision_status": status,
+        "score": round(score, 2), "label": label, "risk_level": risk, "decision_status": status, "recommendation_gate": gate["recommendation_gate"], "recommendation_gate_details": {"calculation_gate": gate["calculation_gate"], "reasons": gate["reasons"], "warnings": gate["warnings"], "blockers": gate["blockers"]}, "effect_nature": _effect_nature(candidate or {}, scenario_result or {}, scenario_meta),
         "statistical_support": {"level": support_level, "reasons": negatives[:6]},
         "economic_significance": econ_meta,
         "components": {"data_quality": round(data_score, 2), "model_quality": round(model_score, 2), "factor_support": round(factor_score, 2), "scenario_support": round(scenario_score, 2), "economic_consistency": round(econ_score, 2), "validation_readiness": round(validation_score, 2)},

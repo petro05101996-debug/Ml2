@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from recommendation_auditor import audit_and_improve_recommendation, build_candidate_from_recommendation, generate_alternatives_around_recommendation
 
@@ -138,3 +139,12 @@ def test_freight_recommendation_uses_absolute_current_context_freight_override()
     assert cand["scenario_params"]["freight_multiplier"] == 1.0
     assert baseline["scenario_params"]["overrides"]["freight_value"] == 20.0
     assert baseline["scenario_params"]["freight_multiplier"] == 1.0
+
+
+def test_discount_absolute_delta_pp_is_not_treated_as_relative_percent():
+    tb, res = make_bundle()
+    tb["base_ctx"]["discount"] = 0.05
+    rec={"source_name":"manual","action_type":"discount_change","absolute_delta_pp":10.0,"objective":"profit","comment":"+10 pp discount","metadata":{}}
+    c=build_candidate_from_recommendation(rec,tb,None,30)
+    assert c["target_value"] == pytest.approx(0.15)
+    assert round(c["absolute_delta_pp"], 2) == 10.0

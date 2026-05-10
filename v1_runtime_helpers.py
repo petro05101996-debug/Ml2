@@ -5,6 +5,44 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+MIN_VALID_PRICE = 0.01
+VALID_ELASTICITY_MIN = -5.0
+VALID_ELASTICITY_MAX = -0.05
+DEFAULT_PRICE_ELASTICITY_PRIOR = -1.10
+
+
+def _validate_positive_finite_price(value: Any, name: str) -> float:
+    try:
+        parsed = float(value)
+    except Exception as exc:
+        raise ValueError(f"{name} must be a finite positive number >= {MIN_VALID_PRICE}") from exc
+    if not np.isfinite(parsed) or parsed < MIN_VALID_PRICE:
+        raise ValueError(f"{name} must be finite and >= {MIN_VALID_PRICE}")
+    return float(parsed)
+
+
+def _safe_prior_elasticity(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        return DEFAULT_PRICE_ELASTICITY_PRIOR
+    if np.isfinite(parsed) and VALID_ELASTICITY_MIN <= parsed <= VALID_ELASTICITY_MAX:
+        return float(parsed)
+    return DEFAULT_PRICE_ELASTICITY_PRIOR
+
+
+def _resolve_safe_elasticity(price_elasticity: Any, price_elasticity_prior: Any) -> tuple[float, str]:
+    prior = _safe_prior_elasticity(price_elasticity_prior)
+    try:
+        raw = float(price_elasticity) if price_elasticity is not None else np.nan
+    except Exception:
+        return prior, "fallback_prior_invalid_elasticity"
+    if not np.isfinite(raw):
+        return prior, "fallback_prior_invalid_elasticity"
+    if VALID_ELASTICITY_MIN <= raw <= VALID_ELASTICITY_MAX:
+        return float(raw), "pooled_price_elasticity"
+    return prior, "fallback_prior_out_of_safe_range"
+
 
 def select_weekly_baseline_candidate(
     bundle_results: List[Dict[str, Any]],
@@ -109,12 +147,38 @@ def select_weekly_baseline_candidate(
     }
 
 
-def compute_scenario_price_inputs(requested_price: float, train_min: float, train_max: float) -> Dict[str, Any]:
-    requested = float(requested_price)
-    low = float(train_min) if np.isfinite(train_min) else requested
-    high = float(train_max) if np.isfinite(train_max) else requested
+def compute_scenario_price_inputs(
+    requested_price: float,
+    train_min: float,
+    train_max: float,
+    price_guardrail_mode: str = "safe_clip",
+    price_elasticity: float | None = None,
+    price_elasticity_prior: float = -1.10,
+) -> Dict[str, Any]:
+    """Resolve requested, model-safe and financial prices for scenario runs.
+
+    Contract used by all scenario modes:
+    - requested_price: raw user/business price.
+    - model_price / price_for_model: price clipped to the historical training range for demand estimation.
+    - financial_price: price used for revenue/profit. It is clipped in ``safe_clip`` and left as
+      requested in ``economic_extrapolation``.
+    """
+    requested = _validate_positive_finite_price(requested_price, "requested_price")
+    low = _validate_positive_finite_price(train_min, "train_min")
+    high = _validate_positive_finite_price(train_max, "train_max")
+    if high < low:
+        low, high = high, low
+    mode = str(price_guardrail_mode or "safe_clip").strip().lower()
+    if mode not in {"safe_clip", "economic_extrapolation"}:
+        mode = "safe_clip"
     model_price = float(np.clip(requested, low, high))
-    clipped = bool(abs(requested - model_price) > 1e-9)
+    model_clipped = bool(abs(requested - model_price) > 1e-9)
+    financial_price = float(requested if mode == "economic_extrapolation" else model_price)
+    financial_clipped = bool(abs(requested - financial_price) > 1e-9)
+    elasticity, elasticity_source = _resolve_safe_elasticity(price_elasticity, price_elasticity_prior)
+    extrapolation_applied = bool(mode == "economic_extrapolation" and model_clipped)
+    extrapolation_price_ratio = float(requested / max(model_price, 1e-9)) if extrapolation_applied else 1.0
+    extrapolation_tail_multiplier = float(np.clip(extrapolation_price_ratio ** elasticity, 0.05, 20.0)) if extrapolation_applied else 1.0
     clip_reason = (
         "price_below_train_min_weekly_baseline_clipped"
         if requested < low
@@ -125,7 +189,24 @@ def compute_scenario_price_inputs(requested_price: float, train_min: float, trai
     return {
         "requested_price": requested,
         "model_price": model_price,
-        "price_clipped": clipped,
+        "price_for_model": model_price,
+        "safe_price": model_price,
+        "financial_price": financial_price,
+        "applied_price": financial_price,
+        "price_clipped": financial_clipped,
+        "clip_applied": financial_clipped,
+        "model_price_clipped": model_clipped,
+        "price_out_of_range": model_clipped,
+        "extrapolation_applied": extrapolation_applied,
+        "model_boundary_price_gross": model_price if extrapolation_applied else np.nan,
+        "extrapolation_from_price_gross": model_price if extrapolation_applied else np.nan,
+        "extrapolation_to_price_gross": requested if extrapolation_applied else np.nan,
+        "extrapolation_price_ratio": extrapolation_price_ratio,
+        "extrapolation_tail_multiplier": extrapolation_tail_multiplier,
+        "elasticity_used": elasticity if extrapolation_applied else np.nan,
+        "elasticity_source": elasticity_source if extrapolation_applied else "",
+        "scenario_price_effect_source": "boundary_plus_elasticity_tail" if extrapolation_applied else "scenario_engine_recompute_from_baseline",
+        "price_guardrail_mode": mode,
         "clip_reason": clip_reason,
     }
 

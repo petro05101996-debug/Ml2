@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List
 from decision_candidate_engine import evaluate_decision_candidates, run_decision_candidate
 from decision_math import clamp, safe_float, safe_pct_delta
 from decision_optimizer import rank_decision_candidates
+from recommendation_gate import resolve_recommendation_gate
 from decision_passport import build_decision_passport
 
 
@@ -20,6 +21,12 @@ def build_candidate_from_recommendation(recommendation: dict, trained_bundle: di
     current_price = safe_float(ctx.get("price"), 0.0); current_discount = clamp(ctx.get("discount", 0.0), 0, 0.95); current_promo = clamp(ctx.get("promotion", 0.0), 0, 1); current_freight = safe_float(ctx.get("freight_value"), 0.0)
     factor_overrides = dict(ctx.get("factor_overrides") or {})
     target = recommendation.get("target_value")
+    if target is None and recommendation.get("absolute_delta_pp") is not None and action in {"discount_change", "promotion_change"}:
+        base = current_discount if action == "discount_change" else current_promo
+        target = round(base + safe_float(recommendation.get("absolute_delta_pp"), 0.0) / 100.0, 10)
+    if target is None and recommendation.get("relative_change_pct") is not None:
+        base = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else current_freight if action == "freight_change" else 1.0
+        target = base * (1.0 + safe_float(recommendation.get("relative_change_pct"), 0.0) / 100.0)
     if target is None and recommendation.get("change_pct") is not None:
         base = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else current_freight if action == "freight_change" else 1.0
         target = base * (1.0 + safe_float(recommendation.get("change_pct"), 0.0) / 100.0)
@@ -34,9 +41,10 @@ def build_candidate_from_recommendation(recommendation: dict, trained_bundle: di
         params["overrides"]["freight_value"] = safe_float(target, current_freight)
     elif action == "demand_shock": params["demand_multiplier"] = max(0.01, target)
     metadata = {"source_name": recommendation.get("source_name"), "horizon_days": horizon_days, **(recommendation.get("metadata") or {})}
+    relative_change_pct = safe_pct_delta(target, current)
     if action in {"discount_change", "promotion_change"}:
         metadata["absolute_delta_pp"] = (safe_float(target, 0.0) - safe_float(current, 0.0)) * 100.0
-    return {"candidate_id": "external_recommendation", "mode": "improve_external_recommendation", "action_type": action, "title": recommendation.get("comment") or "Внешняя рекомендация", "source": "external", "current_value": current, "target_value": target, "change_pct": safe_pct_delta(target, current), "objective": recommendation.get("objective", "profit"), "scenario_params": params, "metadata": metadata}
+    return {"candidate_id": "external_recommendation", "mode": "improve_external_recommendation", "action_type": action, "title": recommendation.get("comment") or "Внешняя рекомендация", "source": "external", "current_value": current, "target_value": target, "change_pct": relative_change_pct, "relative_change_pct": relative_change_pct, "absolute_delta_pp": metadata.get("absolute_delta_pp"), "objective": recommendation.get("objective", "profit"), "scenario_params": params, "metadata": metadata}
 
 
 def _make_alt(cid, base, target, action, objective, ctx, source="improved"):
@@ -52,9 +60,10 @@ def _make_alt(cid, base, target, action, objective, ctx, source="improved"):
         params["overrides"]["freight_value"] = safe_float(target, current_freight)
     else: params["demand_multiplier"] = max(0.01, target)
     metadata = {}
+    relative_change_pct = safe_pct_delta(target, current)
     if action in {"discount_change", "promotion_change"}:
         metadata["absolute_delta_pp"] = (safe_float(target, 0.0) - safe_float(current, 0.0)) * 100.0
-    return {"candidate_id": cid, "mode": "improve_external_recommendation", "action_type": "baseline" if cid == "baseline_current" else action, "title": "Текущий вариант" if cid == "baseline_current" else f"Альтернатива: {target:.4g}", "source": "baseline" if cid == "baseline_current" else source, "current_value": current, "target_value": target, "change_pct": safe_pct_delta(target, current), "objective": objective, "scenario_params": params, "metadata": metadata}
+    return {"candidate_id": cid, "mode": "improve_external_recommendation", "action_type": "baseline" if cid == "baseline_current" else action, "title": "Текущий вариант" if cid == "baseline_current" else f"Альтернатива: {target:.4g}", "source": "baseline" if cid == "baseline_current" else source, "current_value": current, "target_value": target, "change_pct": relative_change_pct, "relative_change_pct": relative_change_pct, "absolute_delta_pp": metadata.get("absolute_delta_pp"), "objective": objective, "scenario_params": params, "metadata": metadata}
 
 
 def generate_alternatives_around_recommendation(recommendation_candidate: dict, trained_bundle: dict, current_context: dict | None, objective: str, horizon_days: int) -> list[dict]:
@@ -94,17 +103,30 @@ def generate_alternatives_around_recommendation(recommendation_candidate: dict, 
 def _verdict(input_eval: dict, optimizer: dict) -> dict:
     rel = input_eval.get("reliability") or {}; econ = rel.get("economic_significance") or {}
     best = optimizer.get("best_action")
-    input_ok = rel.get("decision_status") in {"recommended", "test_recommended"} and rel.get("risk_level") != "high" and not input_eval.get("blockers")
+    objective = str((input_eval.get("candidate") or {}).get("objective") or "profit")
+    gate = resolve_recommendation_gate(
+        price_policy=(rel.get("component_details") or {}).get("scenario_support", {}),
+        data_quality=(rel.get("component_details") or {}).get("data_quality", {}),
+        model_quality=(rel.get("component_details") or {}).get("model_quality", {}),
+        factor_policy=(rel.get("component_details") or {}).get("factor_support", {}),
+        economic_significance=econ,
+        cost_policy={"cost_proxied": bool(econ.get("cost_proxied"))},
+        decision_reliability={"base_status": rel.get("decision_status"), "status_namespace": "decision", "warnings": rel.get("warnings", []), "blockers": input_eval.get("blockers") or rel.get("blockers", [])},
+    )
+    gate_status = gate["decision_status"]
+    input_ok = gate_status in {"recommended", "test_recommended"} and rel.get("risk_level") != "high" and not gate["blockers"]
     profit = safe_float(econ.get("conservative_profit_delta_pct", econ.get("profit_delta_pct")), -999)
-    if input_eval.get("blockers") or profit < 0:
-        verdict = "reject"; reason = "Экономический эффект отрицательный или есть блокеры."
+    if input_eval.get("blockers") or (objective == "profit" and profit < 0) or (objective in {"revenue", "demand"} and profit < -5.0):
+        verdict = "reject"; reason = "Экономический эффект недопустим для выбранной цели или есть блокеры."
+    elif objective in {"revenue", "demand"} and profit < 0:
+        verdict = "test_only"; reason = "Для цели revenue/demand небольшой минус прибыли допустим только как ограниченный тест."
     elif input_ok and (not best or best.get("candidate_id") == "external_recommendation"):
         verdict = "accept"; reason = "Внешняя рекомендация проходит фильтры надёжности."
-    elif rel.get("risk_level") == "high" or rel.get("decision_status") == "experimental_only":
+    elif rel.get("risk_level") == "high" or gate_status == "experimental_only":
         verdict = "test_only"; reason = "Есть потенциал, но риск/экстраполяция требуют ограниченного теста."
     else:
         verdict = "modify"; reason = "Потенциал есть, но найден более надёжный или экономически лучший вариант."
-    return {"verdict": verdict, "reason": reason, "main_risks": rel.get("warnings", [])[:5] + rel.get("blockers", [])[:3], "what_is_valid": rel.get("reasons_positive", []), "what_is_weak": rel.get("reasons_negative", [])[:6]}
+    return {"verdict": verdict, "reason": reason, "recommendation_gate": gate_status, "recommendation_gate_details": gate, "main_risks": gate.get("warnings", [])[:5] + gate.get("blockers", [])[:3], "what_is_valid": rel.get("reasons_positive", []), "what_is_weak": rel.get("reasons_negative", [])[:6]}
 
 
 def audit_and_improve_recommendation(results: dict, trained_bundle: dict, recommendation: dict, runner: Callable, scenario_calc_mode: str, price_guardrail_mode: str, horizon_days: int = 30, objective: str = "profit", current_context: dict | None = None) -> dict:

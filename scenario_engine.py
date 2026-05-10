@@ -84,6 +84,7 @@ def run_scenario(
         price_elasticity=beta_final,
         cap=float(scenario_inputs.get("price_cap", DEFAULTS["price_cap"])),
     )
+    price_effect = float(price_effect) * float(scenario_inputs.get("extrapolation_tail_multiplier", 1.0))
 
     promo_flag_baseline = float(scenario_inputs.get("promo_flag_baseline", scenario_inputs.get("promo_baseline", 0.0)))
     promo_flag_scenario = float(scenario_inputs.get("promo_flag_scenario", scenario_inputs.get("promo_scenario", promo_flag_baseline)))
