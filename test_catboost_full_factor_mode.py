@@ -536,3 +536,32 @@ def test_catboost_daily_preserves_shock_multiplier():
     cb = train_catboost_full_factor_bundle(daily, future, min_train_days=60)
     wr = predict_catboost_full_factor_projection({"daily_base": daily, "future_dates": future, "base_ctx": {"price": 20.0}, "catboost_full_factor_bundle": cb}, manual_price=20.0, horizon_days=2, demand_multiplier=0.87)
     assert wr["daily"]["shock_multiplier"].iloc[0] == pytest.approx(0.87)
+
+
+def test_extra_factor_no_backward_fill_in_daily_builder():
+    from data_adapter import build_daily_from_transactions
+
+    src = pd.DataFrame(
+        [
+            {"date": "2025-01-01", "product_id": "sku-1", "category": "cat-a", "price": 100, "quantity": 1, "revenue": 100, "custom_factor": None},
+            {"date": "2025-01-03", "product_id": "sku-1", "category": "cat-a", "price": 100, "quantity": 1, "revenue": 100, "custom_factor": 10.0},
+            {"date": "2025-01-04", "product_id": "sku-1", "category": "cat-a", "price": 100, "quantity": 1, "revenue": 100, "custom_factor": 12.0},
+        ]
+    )
+    src["date"] = pd.to_datetime(src["date"])
+
+    daily = build_daily_from_transactions(src, "sku-1", target_category="cat-a", include_extra_factors=True)
+
+    first = daily[daily["date"] == pd.Timestamp("2025-01-01")].iloc[0]
+    mid = daily[daily["date"] == pd.Timestamp("2025-01-02")].iloc[0]
+    third = daily[daily["date"] == pd.Timestamp("2025-01-03")].iloc[0]
+    fourth = daily[daily["date"] == pd.Timestamp("2025-01-04")].iloc[0]
+
+    assert float(first["factor__custom_factor"]) == 0.0
+    assert float(mid["factor__custom_factor"]) == 0.0
+    assert float(third["factor__custom_factor"]) == 10.0
+    assert float(fourth["factor__custom_factor"]) == 12.0
+    assert int(first["factor__custom_factor__was_missing"]) == 1
+    assert int(mid["factor__custom_factor__was_missing"]) == 1
+    assert int(third["factor__custom_factor__was_missing"]) == 0
+    assert int(fourth["factor__custom_factor__was_missing"]) == 0

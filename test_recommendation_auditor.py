@@ -96,3 +96,45 @@ def test_audit_discount_candidate_has_absolute_delta_pp_from_zero():
     alts=generate_alternatives_around_recommendation(c,tb,None,"profit",30)
     alt=next(a for a in alts if a["action_type"] == "discount_change" and round(a["target_value"], 2) == 0.10)
     assert round(alt["metadata"]["absolute_delta_pp"], 2) == 10.0
+
+
+def test_recommendation_candidate_preserves_factor_overrides_from_context():
+    tb, _ = make_bundle()
+    rec = {
+        "source_name": "manual",
+        "action_type": "price_change",
+        "target_value": 105.0,
+        "objective": "profit",
+        "comment": "+5%",
+        "metadata": {},
+    }
+    ctx = {"price": 100.0, "discount": 0.0, "promotion": 0.0, "factor_overrides": {"factor__weather": 1.2}}
+
+    cand = build_candidate_from_recommendation(rec, tb, ctx, 30)
+    alts = generate_alternatives_around_recommendation(cand, tb, ctx, "profit", 30)
+
+    assert cand["scenario_params"]["factor_overrides"] == {"factor__weather": 1.2}
+    assert all(a["scenario_params"].get("factor_overrides") == {"factor__weather": 1.2} for a in alts)
+
+
+def test_freight_recommendation_uses_absolute_current_context_freight_override():
+    tb, _ = make_bundle()
+    tb["base_ctx"]["freight_value"] = 10.0
+    ctx = {"price": 100.0, "discount": 0.0, "promotion": 0.0, "freight_value": 20.0}
+    rec = {
+        "source_name": "manual",
+        "action_type": "freight_change",
+        "target_value": 18.0,
+        "objective": "profit",
+        "comment": "freight 18",
+        "metadata": {},
+    }
+
+    cand = build_candidate_from_recommendation(rec, tb, ctx, 30)
+    alts = generate_alternatives_around_recommendation(cand, tb, ctx, "profit", 30)
+    baseline = next(a for a in alts if a["action_type"] == "baseline")
+
+    assert cand["scenario_params"]["overrides"]["freight_value"] == 18.0
+    assert cand["scenario_params"]["freight_multiplier"] == 1.0
+    assert baseline["scenario_params"]["overrides"]["freight_value"] == 20.0
+    assert baseline["scenario_params"]["freight_multiplier"] == 1.0

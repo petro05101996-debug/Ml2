@@ -235,7 +235,7 @@ def build_daily_from_transactions(
             for col in extra_factor_cols["categorical"]:
                 safe_col = f"factor__{col}"
                 vals = g[col].dropna().astype(str)
-                rec[safe_col] = str(vals.mode().iloc[0]) if len(vals) else "unknown"
+                rec[safe_col] = str(vals.mode().iloc[0]) if len(vals) else np.nan
         rows.append(rec)
     daily = pd.DataFrame(rows)
     if len(daily) == 0 or daily["date"].isna().all():
@@ -287,10 +287,15 @@ def build_daily_from_transactions(
     if include_extra_factors:
         factor_cols = [c for c in daily.columns if str(c).startswith("factor__")]
         for c in factor_cols:
+            missing_flag = f"{c}__was_missing"
             if pd.api.types.is_numeric_dtype(daily[c]):
-                daily[c] = pd.to_numeric(daily[c], errors="coerce").ffill().bfill()
+                raw = pd.to_numeric(daily[c], errors="coerce")
+                daily[missing_flag] = raw.isna().astype(int)
+                daily[c] = raw.ffill().fillna(0.0)
             else:
-                daily[c] = daily[c].astype("object").ffill().bfill().fillna("unknown")
+                raw = daily[c].astype("object")
+                daily[missing_flag] = raw.isna().astype(int)
+                daily[c] = raw.ffill().fillna("unknown").astype(str)
     daily["category"] = sku["category"].mode().iloc[0] if "category" in sku.columns and not sku["category"].dropna().empty else "unknown"
     daily["sku_id"] = str(sku_id)
     for ctx in ["region", "channel", "segment"]:
