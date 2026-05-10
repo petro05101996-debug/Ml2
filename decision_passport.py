@@ -66,4 +66,33 @@ def build_decision_passport(
     validation_plan = build_validation_plan(action, rel, objective)
     decision_status = rel.get("decision_status", "not_recommended" if not option else "test_recommended")
     recommendation_gate = rel.get("recommendation_gate", decision_status)
-    return {"mode": mode, "decision_title": title, "decision_status": decision_status, "recommendation_gate": recommendation_gate, "recommended_action": action, "expected_effect": expected, "reliability": {"score": safe_float(rel.get("score"), 0.0), "label": rel.get("label", "low"), "risk_level": rel.get("risk_level", "high"), "decision_status": decision_status, "recommendation_gate": recommendation_gate, "statistical_support": rel.get("statistical_support", rel.get("support", "insufficient"))}, "evidence": evidence, "limitations": list(dict.fromkeys(limitations)), "validation_plan": validation_plan, "calculation_context": dict(calculation_context or {}), "alternatives": {"safe": (optimizer_result or {}).get("safe_option"), "balanced": (optimizer_result or {}).get("balanced_option"), "aggressive": (optimizer_result or {}).get("aggressive_option")}, "input_recommendation": input_recommendation, "audit_verdict": (audit_result or {}).get("audit_verdict") if audit_result else None}
+    if decision_status in {"not_recommended", "experimental_only", "test_recommended"}:
+        action["not_production_recommendation"] = True
+        action["gate_decision_status"] = decision_status
+        if decision_status == "not_recommended":
+            action["title"] = "Не внедрять как рекомендацию"
+        elif decision_status == "experimental_only":
+            action["title"] = "Только экспериментальная гипотеза"
+        else:
+            action["title"] = "Только controlled test"
+    risks = list(dict.fromkeys(limitations))
+    model_unknowns = [
+        "Модель оценивает наблюдаемые продажи/сценарии и не доказывает причинность.",
+        "Система не доказывает, что чужое решение верное или неверное; она проверяет экономическую правдоподобность, поддержку историей, модельный риск и более безопасные альтернативы.",
+        "Невключённые внешние факторы, конкуренты и ассортиментные изменения могут изменить эффект.",
+    ]
+    weak_data = [x for x in risks if any(key in str(x).lower() for key in ["wape", "guardrail", "insufficient", "proxy", "range", "экстраполяц", "недостат"])]
+    passport_sections = {
+        "1_what_we_propose": action,
+        "2_why": evidence,
+        "3_expected_effect": expected,
+        "4_conservative_effect": {"conservative_profit_delta_pct": expected.get("conservative_profit_delta_pct", 0.0)},
+        "5_main_risks": risks,
+        "6_what_model_does_not_know": model_unknowns,
+        "7_supporting_data": evidence,
+        "8_weak_data": weak_data or risks[:3],
+        "9_safe_validation_plan": validation_plan,
+        "10_rollback_conditions": validation_plan.get("rollback_condition"),
+        "11_status": decision_status,
+    }
+    return {"mode": mode, "decision_title": title, "decision_status": decision_status, "recommendation_gate": recommendation_gate, "recommended_action": action, "expected_effect": expected, "reliability": {"score": safe_float(rel.get("score"), 0.0), "label": rel.get("label", "low"), "risk_level": rel.get("risk_level", "high"), "decision_status": decision_status, "recommendation_gate": recommendation_gate, "statistical_support": rel.get("statistical_support", rel.get("support", "insufficient"))}, "passport_sections": passport_sections, "evidence": evidence, "limitations": risks, "validation_plan": validation_plan, "calculation_context": dict(calculation_context or {}), "alternatives": {"safe": (optimizer_result or {}).get("safe_option"), "balanced": (optimizer_result or {}).get("balanced_option"), "aggressive": (optimizer_result or {}).get("aggressive_option")}, "input_recommendation": input_recommendation, "audit_verdict": (audit_result or {}).get("audit_verdict") if audit_result else None}

@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from decision_math import clamp, extract_metric, finite_or_none, safe_div, safe_float, safe_pct_delta, score_0_100
-from recommendation_gate import resolve_recommendation_gate
+from recommendation_gate import evaluate_price_monotonic_sanity, resolve_recommendation_gate
 
 PROFIT_KEYS = ("profit_total_adjusted", "profit_total", "profit_total_raw", "profit", "gross_profit")
 
@@ -148,7 +148,7 @@ def _factor_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_result
         return 85.0, {"action_type": action}, [], []
     if len(df) == 0:
         return 0.0, {"action_type": action}, ["Нет истории для оценки поддержки фактора."], ["Нет исторической поддержки сценария."]
-    if action == "price_change":
+    if action in {"price_change", "combined_change"}:
         price = _series(df, "price")
         uniq = int(price.dropna().round(4).nunique())
         mean = abs(float(price.dropna().mean())) if len(price.dropna()) else 0.0
@@ -189,7 +189,7 @@ def _factor_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_result
         model_uses_price = bool(model_features_set.intersection(price_feature_names))
 
         scenario_layer_features = set(candidate.get("metadata", {}).get("scenario_layer_features") or [])
-        scenario_layer_uses_price = "price" in scenario_layer_features or str(candidate.get("action_type")) == "price_change"
+        scenario_layer_uses_price = "price" in scenario_layer_features or str(candidate.get("action_type")) in {"price_change", "combined_change"}
 
         if not model_feature_known:
             score = min(score, 60.0)
@@ -210,7 +210,7 @@ def _factor_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_result
             warnings.append("Историческая связь price-demand экономически необычна; возможны смешение факторов/сезонность.")
             score = min(score, 75.0)
         if uniq < 4 or span_pct < 0.06:
-            warnings.append("Цена почти не менялась в истории: влияние цены слабо поддержано.")
+            warnings.append("Цена почти не менялась в истории: модельная оценка связи цены слабо поддержана.")
             score = min(score, 40.0)
         return score_0_100(score), {"unique_price_count": uniq, "price_span_pct": span_pct, "target_inside_range": inside, "price_demand_trend_adjusted_corr": corr, "model_feature_known": model_feature_known, "model_uses_price": model_uses_price, "scenario_layer_uses_price": scenario_layer_uses_price}, warnings, blockers
     if action == "discount_change":
@@ -236,7 +236,7 @@ def _factor_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_result
         share = float((promo.fillna(0.0) > 0).mean())
         score = 80.0 if 0.1 <= share <= 0.9 and positive >= 10 and nonpromo >= 10 else 35.0
         if score < 50:
-            warnings.append("Промо почти всегда включено или выключено: влияние промо слабо поддержано.")
+            warnings.append("Промо почти всегда включено или выключено: модельная оценка связи промо слабо поддержана.")
         return score, {"promo_positive_share": share, "promo_positive_observations": positive, "promo_zero_observations": nonpromo}, warnings, blockers
     if action == "freight_change":
         freight = _series(df, "freight_value")
@@ -254,7 +254,7 @@ def _factor_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_result
         score = 0.65 * base + 0.35 * rscore
 
         if score < 55:
-            warnings.append("Логистика почти не менялась в истории: поддержка слабая.")
+            warnings.append("Логистика почти не менялась в истории: модельная оценка связи слабо поддержана.")
 
         return score_0_100(score), {
             "unique_freight_count": uniq,
@@ -278,7 +278,7 @@ def _scenario_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_resu
     blockers: List[str] = []
     action = str(candidate.get("action_type", ""))
     target = _target(candidate)
-    if action in {"price_change", "baseline"}:
+    if action in {"price_change", "combined_change", "baseline"}:
         s = _series(df, "price")
     elif action == "discount_change":
         s = _series(df, "discount")
@@ -402,6 +402,28 @@ def _economic(candidate: Dict[str, Any], scenario: Dict[str, Any], baseline: Dic
     if objective == "profit" and not profit_valid:
         blockers.append("Прибыль не рассчитана валидно: оптимизация по profit недоступна.")
     cost_proxied = bool(candidate.get("metadata", {}).get("cost_proxied") or scenario.get("cost_proxied") or baseline.get("cost_proxied"))
+    daily = scenario.get("daily")
+    daily_cost_available = False
+    if hasattr(daily, "columns") and "cost" in daily.columns:
+        try:
+            daily_cost_available = bool(daily["cost"].dropna().astype(float).gt(0).any())
+        except Exception:
+            daily_cost_available = False
+    explicit_cost_missing = bool(scenario.get("cost_missing") or baseline.get("cost_missing"))
+    cost_evidence_available = bool(
+        daily_cost_available
+        or scenario.get("scenario_cost") is not None
+        or baseline.get("scenario_cost") is not None
+        or scenario.get("cost") is not None
+        or baseline.get("cost") is not None
+        or scenario.get("unit_cost") is not None
+        or baseline.get("unit_cost") is not None
+    )
+    cost_missing = bool(explicit_cost_missing or (objective == "profit" and not profit_valid))
+    if cost_missing and objective == "profit":
+        blockers.append("Себестоимость отсутствует или прибыль не рассчитана: profit-рекомендация недоступна.")
+    elif objective == "profit" and not cost_evidence_available and profit_valid:
+        warnings.append("Себестоимость не передана отдельным полем; используем уже рассчитанную прибыль как источник financial evidence.")
     if cost_proxied:
         warnings.append("Прибыль оценочная: себестоимость проксирована.")
     if objective == "profit" and revenue_delta_pct > 0 and profit_delta_pct < 0:
@@ -445,7 +467,7 @@ def _economic(candidate: Dict[str, Any], scenario: Dict[str, Any], baseline: Dic
         warnings.append("Вероятность положительного profit uplift ниже 75% по uncertainty estimate.")
         score = min(score, 62.0)
     level = "negative" if conservative_profit_delta_pct <= 0 and objective == "profit" else ("strong" if conservative_profit_delta_pct >= min_profit_uplift_pct * 2 else "moderate" if conservative_profit_delta_pct >= min_profit_uplift_pct else "weak")
-    details = {"profit_delta_pct": profit_delta_pct, "conservative_profit_delta_pct": conservative_profit_delta_pct, "risk_haircut_pct": risk_haircut_pct, "demand_delta_pct": demand_delta_pct, "revenue_delta_pct": revenue_delta_pct, "margin_delta_pp": margin_delta_pp, "cost_proxied": cost_proxied, "uncertainty": uncertainty, "level": level, "reasons": []}
+    details = {"profit_delta_pct": profit_delta_pct, "conservative_profit_delta_pct": conservative_profit_delta_pct, "risk_haircut_pct": risk_haircut_pct, "demand_delta_pct": demand_delta_pct, "revenue_delta_pct": revenue_delta_pct, "margin_delta_pp": margin_delta_pp, "cost_proxied": cost_proxied, "cost_missing": cost_missing, "uncertainty": uncertainty, "level": level, "reasons": []}
     return score_0_100(score), details, warnings, blockers
 
 
@@ -463,6 +485,8 @@ def _status(score: float, risk: str, blockers: List[str], candidate: Dict[str, A
             return "experimental_only"
         return "test_recommended" if score >= 65 else "experimental_only"
     if wape is not None and wape > 60:
+        return "not_recommended"
+    if wape is not None and wape > 40:
         return "experimental_only"
     if score >= 80 and risk == "low":
         return "recommended"
@@ -528,6 +552,17 @@ def evaluate_decision_reliability(results: dict, trained_bundle: dict, candidate
         support_level = "moderate"
     else:
         support_level = "weak"
+    monotonicity_policy = (scenario_result or {}).get("monotonicity_policy") or {}
+    if not monotonicity_policy and str((candidate or {}).get("action_type")) == "price_change":
+        params = (candidate or {}).get("scenario_params") or {}
+        monotonicity_policy = evaluate_price_monotonic_sanity(
+            (candidate or {}).get("current_value"),
+            params.get("manual_price", (candidate or {}).get("target_value")),
+            (baseline_result or {}).get("demand_total"),
+            (scenario_result or {}).get("demand_total"),
+        )
+    if str(monotonicity_policy.get("status", "")).lower() == "failed":
+        warnings.extend(monotonicity_policy.get("warnings", []))
     status = _status(score, risk, blockers, candidate or {}, scenario_meta, wape)
     if data_meta.get("flat_sales") and status == "recommended":
         status = "test_recommended"
@@ -550,14 +585,18 @@ def evaluate_decision_reliability(results: dict, trained_bundle: dict, candidate
         factor_policy={
             **dict(factor_meta or {}),
             "manual_demand_shock_main_driver": str((candidate or {}).get("action_type")) == "demand_shock",
+            "ood_importance_score": safe_float((scenario_result or {}).get("ood_importance_score"), 0.0),
+            "important_factor_out_of_range": bool((scenario_result or {}).get("important_factor_ood", False)),
         },
         economic_significance=econ_meta,
-        cost_policy={"cost_proxied": bool(econ_meta.get("cost_proxied"))},
+        cost_policy={"cost_proxied": bool(econ_meta.get("cost_proxied")), "cost_missing": bool(econ_meta.get("cost_missing")), "profit_action": objective == "profit"},
         decision_reliability={
             "base_status": status,
             "status_namespace": "decision",
             "warnings": warnings,
             "blockers": blockers,
+            "monotonicity_policy": monotonicity_policy,
+            "allow_unknown_wape_for_test_recommendation": True,
         },
     )
     status = gate["decision_status"]
@@ -573,6 +612,7 @@ def evaluate_decision_reliability(results: dict, trained_bundle: dict, candidate
         "score": round(score, 2), "label": label, "risk_level": risk, "decision_status": status, "recommendation_gate": gate["recommendation_gate"], "recommendation_gate_details": {"calculation_gate": gate["calculation_gate"], "reasons": gate["reasons"], "warnings": gate["warnings"], "blockers": gate["blockers"]}, "effect_nature": _effect_nature(candidate or {}, scenario_result or {}, scenario_meta),
         "statistical_support": {"level": support_level, "reasons": negatives[:6]},
         "economic_significance": econ_meta,
+        "monotonicity_policy": monotonicity_policy,
         "components": {"data_quality": round(data_score, 2), "model_quality": round(model_score, 2), "factor_support": round(factor_score, 2), "scenario_support": round(scenario_score, 2), "economic_consistency": round(econ_score, 2), "validation_readiness": round(validation_score, 2)},
         "component_details": {"data_quality": data_meta, "model_quality": model_meta, "factor_support": factor_meta, "scenario_support": scenario_meta},
         "reasons_positive": positives,

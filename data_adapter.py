@@ -140,7 +140,16 @@ def run_data_quality_checks(df: pd.DataFrame) -> Dict[str, Any]:
     issues["stats"]["duplicates"] = int(df.duplicated().sum())
     history_days = int((df["date"].max() - df["date"].min()).days + 1)
     issues["stats"]["history_days"] = history_days
+    if "quantity" in df.columns:
+        active_sales_days = int(df.loc[pd.to_numeric(df["quantity"], errors="coerce").fillna(0.0) > 0, "date"].dt.normalize().nunique())
+    else:
+        active_sales_days = int(df["date"].dt.normalize().nunique())
+    issues["stats"]["active_sales_days"] = active_sales_days
 
+    if len(df) < 30:
+        issues["warnings"].append("Small dataset (<30 rows): recommendations are unstable and should be treated as advisory")
+    if active_sales_days < 14:
+        issues["warnings"].append("Small dataset (<14 active sales days): demand estimates are unstable")
     if issues["stats"]["missing_share"] > 0.2:
         issues["warnings"].append("Высокая доля пропусков (>20%)")
     if issues["stats"]["duplicates"] > 0:

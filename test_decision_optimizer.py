@@ -42,3 +42,10 @@ def test_aggressive_option_filters_blocked_and_technical_errors():
     ok = ev("ok_aggressive",10,70,"medium","test_recommended")
     out=rank_decision_candidates([blocked, tech, ok], objective="profit")
     assert out["aggressive_option"]["candidate_id"] == "ok_aggressive"
+
+
+def test_decision_optimizer_can_rank_test_candidates_without_wape():
+    candidate = ev("safe_no_wape", 8, 82, "low", "test_recommended")
+    candidate["reliability"]["component_details"] = {"model_quality": {}}
+    out = rank_decision_candidates([candidate])
+    assert out["best_action"]["candidate_id"] == "safe_no_wape"

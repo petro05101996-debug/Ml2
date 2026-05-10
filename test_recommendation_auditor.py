@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from recommendation_auditor import audit_and_improve_recommendation, build_candidate_from_recommendation, generate_alternatives_around_recommendation
+from recommendation_auditor import audit_and_improve_recommendation, build_candidate_from_recommendation, generate_alternatives_around_recommendation, _verdict
 
 
 def make_bundle(max_price=110):
@@ -148,3 +148,29 @@ def test_discount_absolute_delta_pp_is_not_treated_as_relative_percent():
     c=build_candidate_from_recommendation(rec,tb,None,30)
     assert c["target_value"] == pytest.approx(0.15)
     assert round(c["absolute_delta_pp"], 2) == 10.0
+
+
+def test_external_recommendation_unknown_wape_becomes_test_only_not_reject():
+    tb, res = make_bundle(max_price=120)
+    res["quality_report"] = {"holdout_metrics": {}}
+    rec = {"source_name": "manual", "action_type": "price_change", "target_value": 105.0, "change_pct": 5, "objective": "profit", "comment": "+5%", "metadata": {}}
+    out = audit_and_improve_recommendation(res, tb, rec, fake_runner, "enhanced_local_factors", "safe_clip")
+    assert out["audit_verdict"]["verdict"] in {"test_only", "modify", "accept"}
+    assert out["audit_verdict"]["verdict"] != "reject"
+
+
+def test_auditor_positive_nominal_negative_conservative_is_test_only_not_reject():
+    input_eval = {
+        "candidate": {"objective": "profit"},
+        "reliability": {
+            "decision_status": "test_recommended",
+            "risk_level": "medium",
+            "economic_significance": {"profit_delta_pct": 8.0, "conservative_profit_delta_pct": -1.0},
+            "component_details": {"model_quality": {}},
+            "warnings": [],
+            "blockers": [],
+        },
+        "blockers": [],
+    }
+    out = _verdict(input_eval, {"best_action": None}, {"evidence_quality": "weak", "source_type": "management_opinion"})
+    assert out["verdict"] == "test_only"

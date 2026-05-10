@@ -76,11 +76,115 @@ def _numeric_column(df: Any, name: str):
 def _dedupe(candidates: List[dict]) -> List[dict]:
     seen = set(); deduped: List[dict] = []
     for c in candidates:
-        key = (c.get("action_type"), round(safe_float(c.get("target_value"), -999999), 6), c.get("source"))
+        key = (c.get("candidate_id") if c.get("action_type") == "combined_change" else c.get("action_type"), round(safe_float(c.get("target_value"), -999999), 6), c.get("source"))
         if key not in seen:
             seen.add(key); deduped.append(c)
     return deduped
 
+
+
+def _combined_candidate(
+    cid: str,
+    title: str,
+    current_price: float,
+    target_price: float,
+    current_discount: float,
+    target_discount: float,
+    current_promo: float,
+    target_promo: float,
+    current_freight: float,
+    target_freight: float,
+    objective: str,
+    horizon_days: int,
+    factor_overrides: Optional[dict] = None,
+) -> dict:
+    return _candidate(
+        cid,
+        "combined_change",
+        title,
+        "generated_combined",
+        1.0,
+        1.0,
+        objective,
+        {
+            "manual_price": target_price,
+            "freight_multiplier": 1.0,
+            "discount_multiplier": 1.0,
+            "demand_multiplier": 1.0,
+            "factor_overrides": dict(factor_overrides or {}),
+            "overrides": {"discount": target_discount, "promotion": target_promo, "freight_value": target_freight},
+        },
+        {
+            "horizon_days": horizon_days,
+            "support_zone": "safe",
+            "combined_actions": {
+                "price_change_pct": safe_pct_delta(target_price, current_price),
+                "discount_delta_pp": (target_discount - current_discount) * 100.0,
+                "promotion_delta_pp": (target_promo - current_promo) * 100.0,
+                "freight_change_pct": safe_pct_delta(target_freight, current_freight),
+            },
+        },
+    )
+
+
+def _first_positive_cost(*values) -> float | None:
+    for value in values:
+        parsed = finite_or_none(value)
+        if parsed is not None and parsed > 0:
+            return float(parsed)
+    return None
+
+
+def _scenario_cost(scenario: dict, context: dict | None = None) -> float | None:
+    effective = (scenario or {}).get("effective_scenario") or {}
+    daily = (scenario or {}).get("daily")
+    daily_cost = None
+    if hasattr(daily, "columns") and "cost" in daily.columns:
+        try:
+            daily_cost = float(daily["cost"].dropna().astype(float).median())
+        except Exception:
+            daily_cost = None
+    return _first_positive_cost(
+        (scenario or {}).get("scenario_cost"),
+        effective.get("scenario_cost"),
+        effective.get("cost"),
+        daily_cost,
+        (context or {}).get("cost"),
+    )
+
+
+def _violates_constraints(candidate: dict, scenario: dict, baseline: dict, constraints: dict | None, context: dict | None = None) -> List[str]:
+    constraints = constraints or {}
+    if not constraints:
+        return []
+    issues: List[str] = []
+    eff = _effect(scenario, baseline)
+    params = (candidate.get("scenario_params") or {})
+    price = safe_float(params.get("manual_price", candidate.get("target_value")), 0.0)
+    revenue = safe_float(scenario.get("revenue_total"), 0.0)
+    profit = safe_float(scenario.get("profit_total_adjusted", scenario.get("profit_total", 0.0)), 0.0)
+    margin_pct = profit / max(revenue, 1e-9) * 100.0 if revenue > 0 else -999.0
+    current_price = safe_float(candidate.get("current_value"), price) if candidate.get("action_type") == "price_change" else safe_float((baseline or {}).get("applied_price_gross", price), price)
+    max_price_change = constraints.get("max_price_change_pct")
+    if max_price_change is not None and abs(safe_pct_delta(price, current_price)) > safe_float(max_price_change, 999):
+        issues.append("max_price_change_pct")
+    if constraints.get("forbid_negative_profit", False) and profit < 0:
+        issues.append("forbid_negative_profit")
+    if constraints.get("min_margin_pct") is not None and margin_pct < safe_float(constraints.get("min_margin_pct"), -999):
+        issues.append("min_margin_pct")
+    if constraints.get("max_demand_drop_pct") is not None and eff.get("demand_delta_pct", 0.0) < -abs(safe_float(constraints.get("max_demand_drop_pct"), 999)):
+        issues.append("max_demand_drop_pct")
+    if constraints.get("max_revenue_drop_pct") is not None and eff.get("revenue_delta_pct", 0.0) < -abs(safe_float(constraints.get("max_revenue_drop_pct"), 999)):
+        issues.append("max_revenue_drop_pct")
+    cost = _scenario_cost(scenario, context) or _scenario_cost(baseline, context)
+    if constraints.get("forbid_price_below_cost", False):
+        if cost is None:
+            issues.append("cost_missing_blocks_profit_recommendation")
+        elif price < cost:
+            issues.append("forbid_price_below_cost")
+    if constraints.get("require_cost_for_profit", False) and cost is None:
+        issues.append("cost_missing_blocks_profit_recommendation")
+    return issues
 
 def _freight_candidate(
     current_price: float,
@@ -229,6 +333,22 @@ def generate_decision_candidates(trained_bundle: dict, current_context: dict | N
     if "demand_shock" in allowed:
         for mult in [0.95, 1.0, 1.05, 1.10]:
             out.append(_candidate(f"demand_{mult:.2f}x", "demand_shock", f"Гипотеза спроса {mult:.0%}", "generated", 1.0, mult, objective, {"manual_price": current_price, "freight_multiplier": 1.0, "discount_multiplier": 1.0, "demand_multiplier": mult, "factor_overrides": dict(factor_overrides), "overrides": {"discount": current_discount, "promotion": current_promo, "freight_value": current_freight}}, {"horizon_days": horizon_days, "manual_hypothesis": True, "external_evidence": False}))
+
+    if any(a in allowed for a in ["price_change", "discount_change", "promotion_change", "freight_change"]):
+        price_targets = [current_price * 0.95, current_price * 1.05]
+        discount_targets = [clamp(current_discount + 0.05, 0.0, 0.95), clamp(current_discount - 0.05, 0.0, 0.95)]
+        promo_targets = [1.0 if current_promo < 0.5 else 0.0]
+        freight_targets = [max(0.0, current_freight * 0.95)]
+        combos = [
+            (price_targets[0], current_discount, promo_targets[0], current_freight, "Цена + промо"),
+            (price_targets[1], current_discount, promo_targets[0], current_freight, "Цена + промо"),
+            (price_targets[0], discount_targets[0], current_promo, current_freight, "Цена + скидка"),
+            (price_targets[1], discount_targets[1], current_promo, current_freight, "Цена + скидка"),
+            (price_targets[0], current_discount, current_promo, freight_targets[0], "Цена + логистика"),
+            (current_price, discount_targets[0], promo_targets[0], current_freight, "Скидка + промо"),
+        ]
+        for idx, (p_t, d_t, promo_t, freight_t, title) in enumerate(combos[:10]):
+            out.append(_combined_candidate(f"combined_{idx}", title, current_price, p_t, current_discount, d_t, current_promo, promo_t, current_freight, freight_t, objective, horizon_days, factor_overrides=factor_overrides))
     for c in out:
         meta = dict(c.get("metadata") or {})
         meta.update(_model_metadata(trained_bundle, str(c.get("action_type", ""))))
@@ -288,7 +408,7 @@ def _failed_candidate_evaluation(candidate: dict, baseline_result: dict, exc: Ex
     }
 
 
-def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates: list[dict], runner: Callable, scenario_calc_mode: str, price_guardrail_mode: str, horizon_days: int, objective: str, current_context: dict | None = None) -> list[dict]:
+def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates: list[dict], runner: Callable, scenario_calc_mode: str, price_guardrail_mode: str, horizon_days: int, objective: str, current_context: dict | None = None, constraints: dict | None = None) -> list[dict]:
     enriched_candidates = [
         _enrich_candidate_metadata(c, trained_bundle, scenario_calc_mode)
         for c in (candidates or [])
@@ -305,6 +425,11 @@ def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates
         try:
             scenario = baseline_result if cand.get("candidate_id") == baseline.get("candidate_id") else run_decision_candidate(trained_bundle, cand, runner, scenario_calc_mode, price_guardrail_mode, horizon_days)
             rel = evaluate_decision_reliability(results, trained_bundle, cand, scenario, baseline_result, objective=objective, price_guardrail_mode=price_guardrail_mode)
+            constraint_issues = _violates_constraints(cand, scenario, baseline_result, constraints or (current_context or {}).get("constraints"), _base_ctx(trained_bundle, current_context))
+            if constraint_issues:
+                rel = dict(rel)
+                rel["decision_status"] = "not_recommended"
+                rel["blockers"] = list(rel.get("blockers", [])) + [f"Business constraint violated: {x}" for x in constraint_issues]
             eff = _effect(scenario, baseline_result)
             eff["conservative_profit_delta_pct"] = rel.get("economic_significance", {}).get("conservative_profit_delta_pct")
             evaluated.append({"candidate": cand, "scenario_result": scenario, "baseline_result": baseline_result, "expected_effect": eff, "reliability": rel, "economic_checks": rel.get("economic_significance", {}), "statistical_support": rel.get("statistical_support", {}), "validation_plan": {}, "status": rel.get("decision_status"), "warnings": rel.get("warnings", []), "blockers": rel.get("blockers", [])})
@@ -333,6 +458,11 @@ def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates
         try:
             scenario = run_decision_candidate(trained_bundle, cand, runner, scenario_calc_mode, price_guardrail_mode, horizon_days)
             rel = evaluate_decision_reliability(results, trained_bundle, cand, scenario, baseline_result, objective=objective, price_guardrail_mode=price_guardrail_mode)
+            constraint_issues = _violates_constraints(cand, scenario, baseline_result, constraints or (current_context or {}).get("constraints"), _base_ctx(trained_bundle, current_context))
+            if constraint_issues:
+                rel = dict(rel)
+                rel["decision_status"] = "not_recommended"
+                rel["blockers"] = list(rel.get("blockers", [])) + [f"Business constraint violated: {x}" for x in constraint_issues]
             eff = _effect(scenario, baseline_result)
             eff["conservative_profit_delta_pct"] = rel.get("economic_significance", {}).get("conservative_profit_delta_pct")
             evaluated.append({"candidate": cand, "scenario_result": scenario, "baseline_result": baseline_result, "expected_effect": eff, "reliability": rel, "economic_checks": rel.get("economic_significance", {}), "statistical_support": rel.get("statistical_support", {}), "validation_plan": {}, "status": rel.get("decision_status"), "warnings": rel.get("warnings", []), "blockers": rel.get("blockers", [])})

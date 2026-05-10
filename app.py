@@ -15,7 +15,19 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
+import importlib.util
+
+if importlib.util.find_spec("streamlit") is not None:
+    import streamlit as st
+else:
+    class _StreamlitUnavailable:
+        """Minimal import-time stub; running the UI still requires streamlit."""
+        session_state = {}
+        def __getattr__(self, name):
+            def _missing(*args, **kwargs):
+                raise RuntimeError("Streamlit is required to render the UI. Install requirements or use core modules.")
+            return _missing
+    st = _StreamlitUnavailable()
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import HuberRegressor, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -50,11 +62,15 @@ from decision_passport import build_decision_passport
 from decision_math import safe_pct_delta
 from recommendation_auditor import audit_and_improve_recommendation
 from recommendation_gate import resolve_recommendation_gate
+from scenario_audit import build_scenario_reproducibility_id
 from ui.theme import apply_theme
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 ACTIONABLE_PRICE_OPT_STATUSES = {"price_increase_recommended", "price_decrease_recommended"}
+PRODUCTION_STABLE_ROLLING_VERDICTS = {"stable", "moderately_stable"}
+TEST_ONLY_ROLLING_VERDICTS = {"test_only_unstable", "unstable_test_only"}
+EXPERIMENTAL_ROLLING_VERDICTS = {"experimental_unstable", "unstable_experimental_only"}
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -161,18 +177,18 @@ def normalize_price_guardrail_mode(value: Any) -> str:
 
 def scenario_mode_label(mode_code: str) -> str:
     mapping = {
-        "legacy_current": "Legacy: старый пересчёт сценария",
-        "enhanced_local_factors": "Enhanced what-if: дневной пересчёт факторов поверх baseline",
-        CATBOOST_FULL_FACTOR_MODE: "CatBoost full factors: модельный what-if по факторам",
+        "legacy_current": "Legacy — безопасный базовый прогноз + простые сценарные множители.",
+        "enhanced_local_factors": "Enhanced — прозрачный what-if по факторам, но не полноценное ML-обучение на всех факторах.",
+        CATBOOST_FULL_FACTOR_MODE: "CatBoost Full Factors — ML-режим, где модель обучается на доступных факторах и пересчитывает прогноз при их изменении.",
     }
     return mapping.get(str(mode_code), str(mode_code))
 
 
 def scenario_contract_label(contract_code: str) -> str:
     mapping = {
-        "legacy_baseline+scenario_recompute": "Legacy baseline + scenario recompute",
-        "legacy_baseline+enhanced_local_factor_layer": "Legacy baseline + local factor layer",
-        "daily_catboost_full_factors+model_reprediction": "Daily CatBoost full factors + model reprediction",
+        "legacy_baseline+scenario_recompute": "Legacy: базовый прогноз + простые сценарные множители; не ML-обучение на факторах.",
+        "legacy_baseline+enhanced_local_factor_layer": "Enhanced: прозрачный локальный слой факторов поверх baseline; не полноценное ML-обучение на всех факторах.",
+        "daily_catboost_full_factors+model_reprediction": "CatBoost Full Factors: ML-модель обучается на доступных факторах и перепрогнозирует спрос при изменениях.",
     }
     return mapping.get(str(contract_code), str(contract_code))
 
@@ -200,6 +216,77 @@ def resolve_scenario_calc_mode(mode: Optional[str]) -> str:
         return DEFAULT_SCENARIO_CALC_MODE
     mode_val = str(mode)
     return mode_val if mode_val in SCENARIO_CALC_MODES else DEFAULT_SCENARIO_CALC_MODE
+
+
+def build_recommended_mode_status(mode: str, catboost_bundle: Optional[Dict[str, Any]] = None, fallback_reason: str = "") -> Dict[str, Any]:
+    cb = dict(catboost_bundle or {})
+    metrics = dict(cb.get("holdout_metrics", {}) or {})
+    wape = safe_float_or_nan(metrics.get("wape", np.nan))
+    naive_improvement = safe_float_or_nan(metrics.get("naive_improvement_pct", np.nan))
+    rolling_verdict = str((cb.get("rolling_retrain_backtest", {}) or metrics.get("rolling_retrain_backtest", {}) or {}).get("verdict", ""))
+    cb_enabled = bool(cb.get("enabled", False))
+    if cb_enabled:
+        recommended_mode = CATBOOST_FULL_FACTOR_MODE
+        if not np.isfinite(wape):
+            recommended_mode = "enhanced_local_factors"
+            status = "quality_unknown"
+            reason = "CatBoost доступен, но WAPE неизвестен; production-рекомендация заблокирована, используйте Enhanced/diagnostic what-if."
+        elif wape <= 15.0 and np.isfinite(naive_improvement) and naive_improvement >= 10.0 and rolling_verdict in PRODUCTION_STABLE_ROLLING_VERDICTS:
+            status = "recommended"
+            reason = "CatBoost проходит production gate: WAPE ≤15%, улучшает naive baseline ≥10%, rolling backtest stable/moderately stable."
+        elif wape <= 30.0:
+            recommended_mode = "enhanced_local_factors"
+            status = "test_recommended"
+            reason = "CatBoost доступен, но качество допускает только controlled test, не автоматическую рекомендацию."
+        elif wape <= 40.0:
+            recommended_mode = "enhanced_local_factors"
+            status = "experimental_only"
+            reason = "CatBoost WAPE 30–40%; это только экспериментальная гипотеза."
+        else:
+            recommended_mode = "enhanced_local_factors"
+            status = "not_recommended"
+            reason = "CatBoost WAPE >40%; использовать как рекомендацию нельзя."
+        if rolling_verdict in TEST_ONLY_ROLLING_VERDICTS and status == "recommended":
+            recommended_mode = "enhanced_local_factors"
+            status = "test_recommended"
+            reason = "Rolling CatBoost backtest нестабилен; допустим только controlled test."
+        elif (rolling_verdict in EXPERIMENTAL_ROLLING_VERDICTS or rolling_verdict.startswith("experimental")) and status in {"recommended", "test_recommended"}:
+            recommended_mode = "enhanced_local_factors"
+            status = "experimental_only"
+            reason = "Rolling CatBoost backtest нестабилен; CatBoost не является production-рекомендацией."
+        return {
+            "recommended_mode": recommended_mode,
+            "active_mode": str(mode),
+            "status": status,
+            "reason": reason,
+            "holdout_wape": wape,
+            "naive_improvement_pct": naive_improvement,
+            "rolling_retrain_verdict": rolling_verdict,
+        }
+    return {
+        "recommended_mode": "enhanced_local_factors",
+        "active_mode": str(mode),
+        "status": "catboost_unavailable",
+        "reason": fallback_reason or f"CatBoost недоступен: {cb.get('reason', 'unknown')}. Используется Enhanced.",
+        "holdout_wape": wape,
+        "naive_improvement_pct": naive_improvement,
+        "rolling_retrain_verdict": rolling_verdict,
+    }
+
+
+def attach_scenario_reproducibility(result: Dict[str, Any], trained_bundle: Dict[str, Any], params: Dict[str, Any], mode: str, price_guardrail_mode: str) -> Dict[str, Any]:
+    result["scenario_reproducibility"] = build_scenario_reproducibility_id(
+        trained_bundle=trained_bundle,
+        scenario_params=params,
+        mode=mode,
+        guardrail_mode=price_guardrail_mode,
+        model_version=ARTIFACT_SCHEMA_VERSION,
+        code_signature=f"app_generation:{APP_GENERATION}",
+        feature_schema_version="universal_csv_what_if_v1",
+        config={"artifact_schema_version": ARTIFACT_SCHEMA_VERSION, "app_generation": APP_GENERATION},
+    )
+    result["scenario_run_id"] = result["scenario_reproducibility"]["scenario_run_id"]
+    return result
 
 
 def normalize_factor_report_for_ui(report: pd.DataFrame) -> pd.DataFrame:
@@ -2168,7 +2255,7 @@ def run_full_pricing_analysis_universal(
 ):
     analysis_scenario_calc_mode = resolve_scenario_calc_mode(scenario_calc_mode)
     if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE:
-        return _run_catboost_full_factor_analysis_universal(
+        catboost_result = _run_catboost_full_factor_analysis_universal(
             normalized_txn=normalized_txn,
             target_category=target_category,
             target_sku=target_sku,
@@ -2177,6 +2264,31 @@ def run_full_pricing_analysis_universal(
             segment=segment,
             horizon_days=int(horizon_days),
         )
+        cb_bundle = (catboost_result.get("_trained_bundle", {}) or {}).get("catboost_full_factor_bundle", {})
+        if catboost_result.get("blocking_error_code") == "catboost_full_factors_unavailable":
+            fallback_result = _run_existing_legacy_enhanced_analysis_universal(
+                normalized_txn=normalized_txn,
+                target_category=target_category,
+                target_sku=target_sku,
+                region=region,
+                channel=channel,
+                segment=segment,
+                scenario_calc_mode="enhanced_local_factors",
+                horizon_days=int(horizon_days),
+            )
+            fallback_result["recommended_mode_status"] = build_recommended_mode_status(
+                "enhanced_local_factors",
+                cb_bundle,
+                fallback_reason=str(catboost_result.get("blocking_error_message", "CatBoost unavailable; fallback to Enhanced.")),
+            )
+            fallback_result["catboost_full_factor_attempt"] = {
+                "enabled": False,
+                "reason": cb_bundle.get("reason", catboost_result.get("blocking_error_message", "unknown")),
+                "warnings": catboost_result.get("warnings", []),
+            }
+            return refresh_excel_export(fallback_result)
+        catboost_result["recommended_mode_status"] = build_recommended_mode_status(CATBOOST_FULL_FACTOR_MODE, cb_bundle)
+        return refresh_excel_export(catboost_result)
     return _run_existing_legacy_enhanced_analysis_universal(
         normalized_txn=normalized_txn,
         target_category=target_category,
@@ -4463,7 +4575,7 @@ def _finalize_scenario_contract(result: Dict[str, Any], mode: str, price_guardra
             "cost_proxied": out.get("cost_proxied", out.get("cost_is_proxy", False)),
         },
         cost_policy={"cost_proxied": bool(out.get("cost_proxied", out.get("cost_is_proxy", False)))},
-        decision_reliability={"warnings": out.get("guardrail_warnings", [])},
+        decision_reliability={"warnings": out.get("guardrail_warnings", []), "allow_unknown_wape_for_test_recommendation": True},
     )
     out["calculation_gate"] = gate["calculation_gate"]
     out["recommendation_gate"] = gate["recommendation_gate"]
@@ -4492,6 +4604,17 @@ def run_what_if_projection(
         raise ValueError(f"Unknown scenario_calc_mode: {scenario_calc_mode}")
     selected_mode = scenario_calc_mode if scenario_calc_mode is not None else trained_bundle.get("analysis_scenario_calc_mode")
     mode = resolve_scenario_calc_mode(selected_mode)
+    scenario_audit_params = {
+        "manual_price": manual_price,
+        "freight_multiplier": freight_multiplier,
+        "demand_multiplier": demand_multiplier,
+        "horizon_days": horizon_days,
+        "discount_multiplier": discount_multiplier,
+        "cost_multiplier": cost_multiplier,
+        "stock_cap": stock_cap,
+        "overrides": overrides or {},
+        "factor_overrides": factor_overrides or {},
+    }
     if mode == CATBOOST_FULL_FACTOR_MODE:
         result = predict_catboost_full_factor_projection(
             trained_bundle=trained_bundle,
@@ -4506,7 +4629,13 @@ def run_what_if_projection(
             factor_overrides=factor_overrides,
             price_guardrail_mode=price_guardrail_mode,
         )
-        return _finalize_scenario_contract(result, mode, price_guardrail_mode)
+        return attach_scenario_reproducibility(
+            _finalize_scenario_contract(result, mode, price_guardrail_mode),
+            trained_bundle,
+            scenario_audit_params,
+            mode,
+            price_guardrail_mode,
+        )
     if mode == "legacy_current":
         result = _run_what_if_projection_legacy(
             trained_bundle=trained_bundle,
@@ -4527,7 +4656,13 @@ def run_what_if_projection(
         result.setdefault("daily_effects_summary", [])
         result.setdefault("legacy_or_enhanced_label", "legacy")
         result.setdefault("scenario_calc_mode_label", scenario_mode_label("legacy_current"))
-        return _finalize_scenario_contract(result, mode, price_guardrail_mode)
+        return attach_scenario_reproducibility(
+            _finalize_scenario_contract(result, mode, price_guardrail_mode),
+            trained_bundle,
+            scenario_audit_params,
+            mode,
+            price_guardrail_mode,
+        )
     if mode == "enhanced_local_factors":
         result = _run_what_if_projection_enhanced(
             trained_bundle=trained_bundle,
@@ -4541,7 +4676,13 @@ def run_what_if_projection(
             overrides=overrides,
             price_guardrail_mode=price_guardrail_mode,
         )
-        return _finalize_scenario_contract(result, mode, price_guardrail_mode)
+        return attach_scenario_reproducibility(
+            _finalize_scenario_contract(result, mode, price_guardrail_mode),
+            trained_bundle,
+            scenario_audit_params,
+            mode,
+            price_guardrail_mode,
+        )
     raise ValueError(f"Unknown scenario_calc_mode: {scenario_calc_mode}")
 
 
@@ -5502,7 +5643,7 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
                         "Сценарий улучшает спрос и прибыль относительно текущего плана."
                         if scenario_profit >= as_is_profit and scenario_demand >= as_is_demand
                         else (
-                            "Сценарий может быть экономически лучше текущего плана, но проверьте влияние на спрос."
+                            "Сценарий может быть экономически лучше текущего плана, но проверьте модельную оценку спроса."
                             if scenario_profit >= as_is_profit
                             else (
                                 "Сценарий увеличивает спрос, но снижает прибыль. Проверьте скидку, цену и затраты."
@@ -5529,6 +5670,41 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         [{"status": "not_applied", "reason": "manual_scenario_not_applied"}]
     )
 
+    recommended_mode_status_obj = dict(result_dict.get("recommended_mode_status", {}) or {})
+    recommendation_gate_obj = dict((what_if_result or {}).get("recommendation_gate_details", {}) or {}) if isinstance(what_if_result, dict) else {}
+    decision_gate_df = pd.DataFrame([
+        {
+            "main_status": str((what_if_result or {}).get("recommendation_gate", recommendation_gate_obj.get("decision_status", "not_available"))) if isinstance(what_if_result, dict) else "not_available",
+            "calculation_gate": str((what_if_result or {}).get("calculation_gate", recommendation_gate_obj.get("calculation_gate", "not_available"))) if isinstance(what_if_result, dict) else "not_available",
+            "can_show_forecast": bool((recommendation_gate_obj.get("usage_policy", {}) or {}).get("can_show_forecast", True)),
+            "can_show_what_if": bool((recommendation_gate_obj.get("usage_policy", {}) or {}).get("can_show_what_if", True)),
+            "can_recommend_action": bool((recommendation_gate_obj.get("usage_policy", {}) or {}).get("can_recommend_action", False)),
+            "top_reasons": "; ".join([str(x) for x in (what_if_result or {}).get("recommendation_gate_reasons", recommendation_gate_obj.get("reasons", []))[:3]]) if isinstance(what_if_result, dict) else "",
+            "warnings": "; ".join([str(x) for x in (what_if_result or {}).get("recommendation_gate_warnings", recommendation_gate_obj.get("warnings", []))[:5]]) if isinstance(what_if_result, dict) else "",
+            "recommended_mode_status": str(recommended_mode_status_obj.get("status", "")),
+            "recommended_mode_reason": str(recommended_mode_status_obj.get("reason", "")),
+            "important_factor_ood": bool((what_if_result or {}).get("important_factor_ood", False)) if isinstance(what_if_result, dict) else False,
+            "factor_ood_flag": bool((what_if_result or {}).get("factor_ood_flag", (what_if_result or {}).get("ood_flag", False))) if isinstance(what_if_result, dict) else False,
+            "monotonicity_label": "Проверка экономической правдоподобности, не абсолютный бизнес-закон",
+        }
+    ])
+    scenario_audit_df = pd.json_normalize((what_if_result or {}).get("scenario_reproducibility", {}), sep=".") if isinstance(what_if_result, dict) else pd.DataFrame()
+    scenario_audit_df = non_empty_or_stub(scenario_audit_df, "Scenario Audit", "scenario_reproducibility_unavailable")
+    model_quality_source = dict((what_if_result or {}).get("scenario_engine_meta", {}).get("holdout_metrics", {}) or {}) if isinstance(what_if_result, dict) else {}
+    model_quality_source.update({f"recommended_mode.{k}": v for k, v in recommended_mode_status_obj.items()})
+    model_quality_df = pd.json_normalize(model_quality_source, sep=".") if model_quality_source else holdout_metrics_sheet.copy()
+    model_quality_df = non_empty_or_stub(model_quality_df, "Model Quality", "model_quality_unavailable")
+    limitations_rows = [
+        {"limitation": "predicted_demand_raw = модельный спрос до складского ограничения; это не доказанный истинный спрос."},
+        {"limitation": "realized_sales_after_stock = ожидаемые продажи после складского ограничения."},
+        {"limitation": "Модель обучена на наблюдаемых продажах; при stockout истинный спрос мог быть выше."},
+    ]
+    if recommended_mode_status_obj.get("reason"):
+        limitations_rows.append({"limitation": str(recommended_mode_status_obj.get("reason"))})
+    if isinstance(what_if_result, dict):
+        limitations_rows.extend({"limitation": str(w)} for w in list(what_if_result.get("warnings", []))[:20])
+    limitations_df = pd.DataFrame(limitations_rows).drop_duplicates()
+
     sheet_meta: List[Dict[str, Any]] = [
         {"group": "A_CORE_INPUTS", "sheet": "A_history", "description": "История продаж и факторов.", "df": history, "optional": False, "note_absent": ""},
         {"group": "B_FORECASTS", "sheet": "B_as_is", "description": "Текущий план (без изменений).", "df": as_is, "optional": False, "note_absent": ""},
@@ -5543,6 +5719,10 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         {"group": "C_SUMMARY", "sheet": "effect_breakdown", "description": "Разложение эффектов сценария.", "df": effect_breakdown_df, "optional": False, "note_absent": ""},
         {"group": "C_SUMMARY", "sheet": "daily_effects_summary", "description": "Дневные эффекты сценария.", "df": daily_effects_df, "optional": False, "note_absent": ""},
         {"group": "C_SUMMARY", "sheet": "Feature Usage", "description": "Что реально используется в baseline/scenario/diagnostics.", "df": feature_usage, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Decision Gate", "description": "Главный статус: можно рекомендовать, только тест, экспериментально или не рекомендовать.", "df": decision_gate_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Scenario Audit", "description": "Воспроизводимость сценария: hash, run id и параметры расчёта.", "df": scenario_audit_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Model Quality", "description": "Качество модели и статус рекомендуемого режима.", "df": model_quality_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Limitations", "description": "Ограничения интерпретации спроса, stockout, OOD и gate.", "df": limitations_df, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_metrics", "description": "Метрики holdout.", "df": holdout_metrics_sheet, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_holdout_predictions", "description": "Дневные предсказания holdout.", "df": diagnostics_holdout_predictions, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_feature_report", "description": "Использование признаков.", "df": diagnostics_feature_report, "optional": False, "note_absent": ""},
@@ -5604,6 +5784,10 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         effect_breakdown_df.to_excel(writer, sheet_name="effect_breakdown", index=False)
         daily_effects_df.to_excel(writer, sheet_name="daily_effects_summary", index=False)
         feature_usage.to_excel(writer, sheet_name="Feature Usage", index=False)
+        decision_gate_df.to_excel(writer, sheet_name="Decision Gate", index=False)
+        scenario_audit_df.to_excel(writer, sheet_name="Scenario Audit", index=False)
+        model_quality_df.to_excel(writer, sheet_name="Model Quality", index=False)
+        limitations_df.to_excel(writer, sheet_name="Limitations", index=False)
         diagnostics_holdout_predictions.to_excel(writer, sheet_name="D_holdout_predictions", index=False)
         diagnostics_feature_report.to_excel(writer, sheet_name="D_feature_report", index=False)
         diagnostics_baseline_vs_as_is.to_excel(writer, sheet_name="D_baseline_vs_as_is", index=False)
@@ -5738,7 +5922,21 @@ def build_trust_block(results: Dict[str, Any], what_if_result: Optional[Dict[str
         "calculation_contract": str((what_if_result or {}).get("active_path_contract_label", scenario_contract_label((what_if_result or {}).get("active_path_contract", active_path)))),
         "factor_source": str((what_if_result or {}).get("effect_source_label", effect_source_label((what_if_result or {}).get("effect_source", "")))),
         "support_label": str((what_if_result or {}).get("support_label", "unknown")),
+        "model_quality": (what_if_result or {}).get("scenario_engine_meta", {}).get("holdout_metrics", {}),
+        "rolling_backtest": (what_if_result or {}).get("scenario_engine_meta", {}).get("rolling_backtest", {}),
+        "price_in_historical_range": bool(scenario_range_status.get("price") == "ok"),
+        "factors_in_historical_range": bool(in_range and not (what_if_result or {}).get("ood_flag", False)),
+        "cost_policy": "estimated_proxy" if bool((what_if_result or {}).get("cost_proxied", (what_if_result or {}).get("cost_is_proxy", False))) else "provided_or_not_used",
+        "effect_bigger_than_model_error": "effect_smaller_than_model_error" not in (what_if_result or {}).get("recommendation_gate_reasons", []),
+        "monotonicity_policy": (what_if_result or {}).get("monotonicity_policy", {}),
+        "recommended_mode_status": results.get("recommended_mode_status", {}),
+        "scenario_reproducibility": (what_if_result or {}).get("scenario_reproducibility", {}),
         "fallback_used": bool((what_if_result or {}).get("fallback_multiplier_used", False)),
+        "limitations": list(dict.fromkeys([
+            "Модель обучена на наблюдаемых продажах; при stockout это может быть ниже истинного спроса.",
+            *warnings_local,
+            *list((what_if_result or {}).get("warnings", [])),
+        ])),
         "warnings": sufficiency.get("warnings", []) + warnings_local + list((what_if_result or {}).get("warnings", [])),
     }
 
@@ -5845,6 +6043,7 @@ def build_business_report_payload(
             "price_clipped": bool((what_if_result or {}).get("price_clipped", False)),
             "clip_reason": str((what_if_result or {}).get("clip_reason", "")),
         },
+        "trust_block": trust,
         "warnings_reliability_notes": trust["warnings"] + (["scenario payload missing; fell back to as-is"] if scenario_payload_missing else []),
         "scenario_confidence": {"score": conf_score, "label": conf_label},
         "data_quality": {"data_quality_label": str(trust.get("data_sufficiency", "unknown")), "data_quality_score": _finite(results.get("_trained_bundle", {}).get("confidence", 0.0))},
@@ -7327,7 +7526,7 @@ def render_upload_screen() -> dict[str, Any]:
     for col, (num, title, text) in zip([c1, c2, c3], [("1","Загрузите продажи","Добавьте историю продаж, цену, спрос и доступные факторы. Система подготовит данные к анализу."),("2","Измените сценарий","Проверьте цену, скидку, промо, логистику или внешний шок спроса."),("3","Получите вывод","Система покажет спрос, выручку, прибыль, надёжность и объяснение результата.")]):
         with col: st.markdown(f'<div class="landing-card"><div style="width:38px;height:38px;border-radius:14px;background:rgba(111,112,255,0.10);display:flex;align-items:center;justify-content:center;color:#4F46E5;font-weight:850;margin-bottom:14px;">{num}</div><div class="landing-card-title">{title}</div><div class="landing-card-text">{text}</div></div>', unsafe_allow_html=True)
     st.markdown('<h2 class="landing-section-title">Что можно проверить</h2><div class="landing-section-subtitle">Не нужно гадать — проверьте решение до запуска.</div>', unsafe_allow_html=True)
-    items=[("💰","Цена","Что будет, если повысить или снизить цену."),("🏷️","Скидка","Окупится ли скидка за счёт роста спроса."),("📣","Промо","Даст ли акция дополнительную прибыль."),("🌊","Внешний спрос","Что будет при росте или падении рынка."),("🚚","Логистика","Как расходы повлияют на прибыль."),("📈","Факторы рынка","Как реклама, трафик, сезонность и конкуренты меняют прогноз.")]
+    items=[("💰","Цена","Что будет, если повысить или снизить цену."),("🏷️","Скидка","Окупится ли скидка за счёт роста спроса."),("📣","Промо","Даст ли акция дополнительную прибыль."),("🌊","Внешний спрос","Что будет при росте или падении рынка."),("🚚","Логистика","Как расходы меняют расчётную прибыль."),("📈","Факторы рынка","Как модель связывает рекламу, трафик, сезонность и конкурентов с прогнозом.")]
     for row in [items[:3], items[3:]]:
         cols = st.columns(3, gap="medium")
         for col, (icon, title, text) in zip(cols, row):

@@ -200,7 +200,7 @@ def test_legacy_and_enhanced_modes_do_not_train_catboost(monkeypatch):
     assert result.get("blocking_error", False) is False
 
 
-def test_catboost_unavailable_returns_blocking_error_not_fallback(monkeypatch):
+def test_catboost_unavailable_returns_enhanced_fallback(monkeypatch):
     import app
 
     def fake_train(*args, **kwargs):
@@ -215,9 +215,10 @@ def test_catboost_unavailable_returns_blocking_error_not_fallback(monkeypatch):
         target_sku="A",
         scenario_calc_mode="catboost_full_factors",
     )
-    assert result["blocking_error"] is True
-    assert result["blocking_error_code"] == "catboost_full_factors_unavailable"
-    assert "catboost_full_factor_bundle" in result["_trained_bundle"]
+    assert result.get("blocking_error", False) is False
+    assert result.get("analysis_scenario_calc_mode") == "enhanced_local_factors"
+    assert result.get("catboost_full_factor_attempt", {}).get("enabled") is False
+    assert result.get("recommended_mode_status", {}).get("recommended_mode") == "enhanced_local_factors"
 
 
 def test_catboost_full_mode_trains_only_when_selected(monkeypatch):
@@ -565,3 +566,27 @@ def test_extra_factor_no_backward_fill_in_daily_builder():
     assert int(mid["factor__custom_factor__was_missing"]) == 1
     assert int(third["factor__custom_factor__was_missing"]) == 0
     assert int(fourth["factor__custom_factor__was_missing"]) == 0
+
+
+def test_catboost_train_without_is_stockout_column_does_not_crash():
+    pytest.importorskip("catboost")
+    from catboost_full_factor_engine import train_catboost_full_factor_bundle
+
+    n = 90
+    daily = pd.DataFrame({
+        "date": pd.date_range("2024-01-01", periods=n),
+        "sales": [20 + (i % 5) for i in range(n)],
+        "price": [100.0 + (i % 4) for i in range(n)],
+        "discount": [0.0] * n,
+        "net_unit_price": [100.0 + (i % 4) for i in range(n)],
+        "freight_value": [5.0] * n,
+        "cost": [65.0] * n,
+        "promotion": [0.0, 1.0] * (n // 2),
+        "review_score": [4.5] * n,
+        "reviews_count": [10.0] * n,
+        "stock": [999.0] * n,
+    })
+    future = pd.DataFrame({"date": pd.date_range(daily["date"].max() + pd.Timedelta(days=1), periods=14)})
+    bundle = train_catboost_full_factor_bundle(daily, future, min_train_days=60)
+    assert "target_semantics" in bundle
+    assert float(bundle.get("target_semantics", {}).get("stockout_share", 0.0)) == 0.0

@@ -5,6 +5,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from recommendation_gate import evaluate_price_monotonic_sanity, resolve_recommendation_gate
+
 
 PRICE_OPT_STATUS_CURRENT_OK = "current_price_ok"
 PRICE_OPT_STATUS_INCREASE = "price_increase_recommended"
@@ -102,7 +104,10 @@ def _row_from_result(price: float, result: Dict[str, Any], current_price: float)
     confidence = _finite_float(result.get("confidence", 0.0), 0.0)
     margin_pct = float((profit / max(revenue, 1e-9)) * 100.0) if revenue > 0 else 0.0
     price_clipped = bool(result.get("price_clipped", False) or result.get("clip_applied", False) or effective.get("price_clipped", False))
-    ood_flag = bool(result.get("ood_flag", False) or effective.get("price_out_of_range", False))
+    ood_flag = bool(result.get("ood_flag", False) or result.get("factor_ood_flag", False) or effective.get("price_out_of_range", False))
+    meta = result.get("scenario_engine_meta", {}) if isinstance(result.get("scenario_engine_meta", {}), dict) else {}
+    metrics = meta.get("holdout_metrics", {}) if isinstance(meta.get("holdout_metrics", {}), dict) else {}
+    target_semantics = meta.get("target_semantics", {}) if isinstance(meta.get("target_semantics", {}), dict) else {}
     return {
         "price": float(price),
         "is_current": bool(abs(float(price) - float(current_price)) <= max(0.01, abs(current_price) * 1e-6)),
@@ -116,8 +121,41 @@ def _row_from_result(price: float, result: Dict[str, Any], current_price: float)
         "price_clipped": price_clipped,
         "ood_flag": ood_flag,
         "validation_ok": bool((result.get("validation_gate", {}) or {}).get("ok", True)),
+        "monotonicity_status": str((result.get("monotonicity_policy", {}) or {}).get("status", "passed")),
+        "ood_importance_score": _finite_float(result.get("ood_importance_score", 0.0), 0.0),
+        "model_wape": _finite_float(metrics.get("wape", result.get("wape", np.nan)), np.nan),
+        "naive_improvement_pct": _finite_float(metrics.get("naive_improvement_pct", np.nan), np.nan),
+        "rolling_retrain_verdict": str((meta.get("rolling_retrain_backtest", {}) or metrics.get("rolling_retrain_backtest", {}) or {}).get("verdict", "")),
+        "stockout_share": _finite_float(target_semantics.get("stockout_share", result.get("stockout_share", 0.0)), 0.0),
+        "cost_proxied": bool(result.get("cost_proxied", result.get("cost_is_proxy", False))),
+        "cost_missing": bool(result.get("cost_missing", False)),
     }
 
+
+
+def _price_stability(best_row: Dict[str, Any], valid: pd.DataFrame) -> Dict[str, Any]:
+    if len(valid) <= 1:
+        return {"stability_score": 0.0, "stable": False, "near_best_range": [float(best_row["price"]), float(best_row["price"])]}
+    work = valid.copy().sort_values("price").reset_index(drop=True)
+    prices = pd.to_numeric(work["price"], errors="coerce")
+    best_price = float(best_row["price"])
+    idx = int((prices - best_price).abs().idxmin())
+    lo = max(0, idx - 2)
+    hi = min(len(work), idx + 3)
+    neigh = work.iloc[lo:hi].copy()
+    best_profit = max(abs(float(best_row.get("profit", 0.0))), 1e-9)
+    profits = pd.to_numeric(neigh["profit"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    demands = pd.to_numeric(neigh["demand"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    profit_cv = float(np.std(profits) / best_profit) if len(profits) else 1.0
+    demand_den = max(abs(float(np.nanmean(demands))) if len(demands) else 0.0, 1e-9)
+    demand_cv = float(np.std(demands) / demand_den) if len(demands) else 1.0
+    score = float(np.clip(1.0 - (0.7 * profit_cv + 0.3 * demand_cv), 0.0, 1.0))
+    near = work[pd.to_numeric(work["profit"], errors="coerce") >= best_profit * 0.98]
+    return {
+        "stability_score": score,
+        "stable": bool(score >= 0.55 and len(neigh) >= 3),
+        "near_best_range": [float(near["price"].min()), float(near["price"].max())] if len(near) else [best_price, best_price],
+    }
 
 def _classify_recommendation(current_row: Dict[str, Any], best_row: Dict[str, Any], grid_meta: Dict[str, Any], min_profit_uplift_pct: float) -> Dict[str, Any]:
     current_price = float(current_row["price"])
@@ -170,6 +208,7 @@ def analyze_price_optimization(trained_bundle: Dict[str, Any], current_price: fl
         & (~candidates["ood_flag"].astype(bool))
         & (candidates["validation_ok"].astype(bool))
         & (~candidates["support_label"].astype(str).str.lower().isin(["low", "низкая", "низкий"]))
+        & (~candidates["monotonicity_status"].astype(str).str.lower().eq("failed"))
     )
     valid = candidates[candidates["valid_for_recommendation"]].copy()
     if len(valid) == 0:
@@ -181,10 +220,50 @@ def analyze_price_optimization(trained_bundle: Dict[str, Any], current_price: fl
     near_best = valid[valid["score"] >= best_score * 0.98].copy()
     rec_min = float(near_best["price"].min()) if len(near_best) else float(best_row["price"])
     rec_max = float(near_best["price"].max()) if len(near_best) else float(best_row["price"])
+    stability = _price_stability(best_row, valid)
     classification = _classify_recommendation(current_row, best_row, grid_meta, float(min_profit_uplift_pct))
+    monotonicity_policy = evaluate_price_monotonic_sanity(
+        current_row.get("price"), best_row.get("price"), current_row.get("demand"), best_row.get("demand")
+    )
+    gate = resolve_recommendation_gate(
+        model_quality={
+            "wape": best_row.get("model_wape"),
+            "naive_improvement_pct": best_row.get("naive_improvement_pct"),
+            "stockout_share": best_row.get("stockout_share"),
+            "rolling_retrain_backtest": {"verdict": best_row.get("rolling_retrain_verdict", "")},
+        },
+        factor_policy={"ood_importance_score": float(best_row.get("ood_importance_score", 0.0))},
+        economic_significance={"profit_delta_pct": float(classification["profit_delta_pct"]), "profit_action": True, "cost_proxied": bool(best_row.get("cost_proxied", False)), "cost_missing": bool(best_row.get("cost_missing", False))},
+        price_policy={"monotonicity_policy": monotonicity_policy},
+        cost_policy={"cost_proxied": bool(best_row.get("cost_proxied", False)), "cost_missing": bool(best_row.get("cost_missing", False)), "profit_action": True},
+        decision_reliability={"status_namespace": "decision", "base_status": "recommended", "allow_unknown_wape_for_test_recommendation": True},
+    )
     warnings = list(grid_meta.get("warnings", []))
     warnings.extend(errors[:5])
-    return {"status": classification["status"], "current_price": float(current_price), "recommended_price": float(best_row["price"]), "recommended_price_min": rec_min, "recommended_price_max": rec_max, "current_demand": float(current_row.get("demand", 0.0)), "recommended_demand": float(best_row.get("demand", 0.0)), "current_revenue": float(current_row.get("revenue", 0.0)), "recommended_revenue": float(best_row.get("revenue", 0.0)), "current_profit": float(current_row.get("profit", 0.0)), "recommended_profit": float(best_row.get("profit", 0.0)), "profit_delta": float(classification["profit_delta"]), "profit_delta_pct": float(classification["profit_delta_pct"]), "demand_delta_pct": float(classification["demand_delta_pct"]), "revenue_delta_pct": float(classification["revenue_delta_pct"]), "confidence": float(best_row.get("confidence", 0.0)), "confidence_label": str(best_row.get("confidence_label", "")), "support_label": str(best_row.get("support_label", "")), "recommendation_title": classification["title"], "recommendation_text": classification["text"], "warnings": warnings, "candidates": candidates.sort_values("price").reset_index(drop=True), "grid_meta": grid_meta, "scenario_calc_mode": str(scenario_calc_mode), "price_guardrail_mode": str(price_guardrail_mode)}
+    warnings.extend(monotonicity_policy.get("warnings", []))
+    warnings.extend(gate.get("warnings", []))
+    if not stability["stable"] and classification["status"] in {PRICE_OPT_STATUS_INCREASE, PRICE_OPT_STATUS_DECREASE}:
+        classification["status"] = PRICE_OPT_STATUS_RISKY_ONLY
+        classification["title"] = "Цена выглядит неустойчивой"
+        classification["text"] = "Лучшая точка на сетке не подтверждается соседними ценами. Используйте диапазон как гипотезу для теста, а не как автоматическую рекомендацию."
+        warnings.append("Оптимум цены неустойчив на соседних точках сетки.")
+
+    gate_status = str(gate.get("decision_status", "not_recommended"))
+    if gate_status == "not_recommended":
+        classification["status"] = PRICE_OPT_STATUS_RISKY_ONLY
+        classification["title"] = "Рекомендация заблокирована"
+        classification["text"] = "Расчёт можно посмотреть как симуляцию, но использовать как рекомендацию нельзя."
+    elif gate_status == "experimental_only":
+        classification["status"] = PRICE_OPT_STATUS_RISKY_ONLY
+        classification["title"] = "Только экспериментальная гипотеза"
+        classification["text"] = "Сценарий можно проверять только через controlled test, не внедрять автоматически."
+    elif gate_status == "test_recommended":
+        classification["status"] = PRICE_OPT_STATUS_RISKY_ONLY
+        classification["title"] = "Только через тест"
+        classification["text"] = "Модель видит потенциальный эффект, но надёжности недостаточно для прямой рекомендации."
+
+    price_label_key = "recommended_price" if gate_status == "recommended" else "hypothesis_price"
+    return {"status": classification["status"], "decision_status": gate_status, "usage_policy": gate.get("usage_policy", {}), "price_label_key": price_label_key, "current_price": float(current_price), "recommended_price": float(best_row["price"]), "recommended_price_min": rec_min, "recommended_price_max": rec_max, "stability_score": float(stability["stability_score"]), "near_best_range": stability["near_best_range"], "recommendation_gate": gate.get("decision_status"), "recommendation_gate_details": gate, "monotonicity_policy": monotonicity_policy, "current_demand": float(current_row.get("demand", 0.0)), "recommended_demand": float(best_row.get("demand", 0.0)), "current_revenue": float(current_row.get("revenue", 0.0)), "recommended_revenue": float(best_row.get("revenue", 0.0)), "current_profit": float(current_row.get("profit", 0.0)), "recommended_profit": float(best_row.get("profit", 0.0)), "profit_delta": float(classification["profit_delta"]), "profit_delta_pct": float(classification["profit_delta_pct"]), "demand_delta_pct": float(classification["demand_delta_pct"]), "revenue_delta_pct": float(classification["revenue_delta_pct"]), "confidence": float(best_row.get("confidence", 0.0)), "confidence_label": str(best_row.get("confidence_label", "")), "support_label": str(best_row.get("support_label", "")), "recommendation_title": classification["title"], "recommendation_text": classification["text"], "warnings": warnings, "candidates": candidates.sort_values("price").reset_index(drop=True), "grid_meta": grid_meta, "scenario_calc_mode": str(scenario_calc_mode), "price_guardrail_mode": str(price_guardrail_mode)}
 
 
 def build_price_optimizer_signature(current_price: float, horizon_days: int, scenario_calc_mode: str, price_guardrail_mode: str, overrides: Optional[Dict[str, Any]] = None, factor_overrides: Optional[Dict[str, Any]] = None, freight_multiplier: float = 1.0, demand_multiplier: float = 1.0, candidate_count: int = 25, search_pct: float = 0.20) -> Dict[str, Any]:
