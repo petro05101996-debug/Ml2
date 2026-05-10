@@ -23,6 +23,14 @@ def _runner_factory(conf=0.8, clipped=False, ood=False, support='high', fail_bel
             "ood_flag": ood,
             "validation_gate": {"ok": True},
             "effective_scenario": {"applied_price_gross": price},
+            "scenario_engine_meta": {
+                "holdout_metrics": {
+                    "wape": 10.0,
+                    "naive_improvement_pct": 20.0,
+                    "rolling_retrain_backtest": {"verdict": "stable"},
+                },
+                "target_semantics": {"stockout_share": 0.0},
+            },
         }
     return runner
 
@@ -100,7 +108,106 @@ def test_current_price_ok_not_actionable_status():
             "ood_flag": False,
             "validation_gate": {"ok": True},
             "effective_scenario": {"applied_price_gross": price},
+            "scenario_engine_meta": {
+                "holdout_metrics": {
+                    "wape": 10.0,
+                    "naive_improvement_pct": 20.0,
+                    "rolling_retrain_backtest": {"verdict": "stable"},
+                },
+                "target_semantics": {"stockout_share": 0.0},
+            },
         }
 
     opt = analyze_price_optimization(bundle, 100.0, flat_runner, 30, "enhanced_local_factors", "safe_clip")
     assert opt["status"] == "current_price_ok"
+
+
+def test_optimizer_final_status_is_gate_driven_for_bad_wape():
+    bundle = {"daily_base": pd.DataFrame({"price": [90, 95, 100, 105, 110, 115, 120]})}
+
+    def bad_wape_runner(_bundle, manual_price, **kwargs):
+        price = float(manual_price)
+        demand = max(1.0, 1000.0 - (price - 100.0) * 5.0)
+        profit = demand * (price - 60.0)
+        return {
+            "demand_total": demand,
+            "revenue_total": demand * price,
+            "profit_total": profit,
+            "profit_total_adjusted": profit,
+            "confidence": 0.9,
+            "confidence_label": "Высокая",
+            "support_label": "high",
+            "validation_gate": {"ok": True},
+            "effective_scenario": {"applied_price_gross": price},
+            "scenario_engine_meta": {
+                "holdout_metrics": {
+                    "wape": 65.0,
+                    "naive_improvement_pct": 20.0,
+                    "rolling_retrain_backtest": {"verdict": "stable"},
+                },
+                "target_semantics": {"stockout_share": 0.0},
+            },
+        }
+
+    opt = analyze_price_optimization(bundle, 100.0, bad_wape_runner, 30, "enhanced_local_factors", "safe_clip", min_profit_uplift_pct=1.0)
+    assert opt["decision_status"] == "not_recommended"
+    assert opt["status"] == "risky_only"
+    assert opt["price_label_key"] == "hypothesis_price"
+
+
+def test_optimizer_monotonicity_failure_is_experimental_only():
+    bundle = {"daily_base": pd.DataFrame({"price": [90, 95, 100, 105, 110, 115, 120]})}
+
+    def positive_price_demand_runner(_bundle, manual_price, **kwargs):
+        price = float(manual_price)
+        demand = 1000.0 + (price - 100.0) * 10.0
+        profit = demand * (price - 60.0)
+        return {
+            "demand_total": demand,
+            "revenue_total": demand * price,
+            "profit_total": profit,
+            "profit_total_adjusted": profit,
+            "confidence": 0.9,
+            "confidence_label": "Высокая",
+            "support_label": "high",
+            "validation_gate": {"ok": True},
+            "effective_scenario": {"applied_price_gross": price},
+            "scenario_engine_meta": {
+                "holdout_metrics": {
+                    "wape": 10.0,
+                    "naive_improvement_pct": 20.0,
+                    "rolling_retrain_backtest": {"verdict": "stable"},
+                },
+                "target_semantics": {"stockout_share": 0.0},
+            },
+        }
+
+    opt = analyze_price_optimization(bundle, 100.0, positive_price_demand_runner, 30, "enhanced_local_factors", "safe_clip", min_profit_uplift_pct=1.0)
+    assert opt["decision_status"] == "experimental_only"
+    assert opt["status"] == "risky_only"
+
+
+def test_optimizer_unknown_wape_outputs_hypothesis_not_hidden_what_if():
+    bundle = {"daily_base": pd.DataFrame({"price": [90, 95, 100, 105, 110, 115, 120]})}
+
+    def no_quality_runner(_bundle, manual_price, **kwargs):
+        price = float(manual_price)
+        demand = max(1.0, 1000.0 - (price - 100.0) * 5.0)
+        profit = demand * (price - 60.0)
+        return {
+            "demand_total": demand,
+            "revenue_total": demand * price,
+            "profit_total": profit,
+            "profit_total_adjusted": profit,
+            "confidence": 0.9,
+            "confidence_label": "Высокая",
+            "support_label": "high",
+            "validation_gate": {"ok": True},
+            "effective_scenario": {"applied_price_gross": price},
+        }
+
+    opt = analyze_price_optimization(bundle, 100.0, no_quality_runner, 30, "enhanced_local_factors", "safe_clip", min_profit_uplift_pct=1.0)
+    assert opt["decision_status"] == "test_recommended"
+    assert opt["price_label_key"] == "hypothesis_price"
+    assert opt["usage_policy"]["can_recommend_action"] is False
+    assert opt["usage_policy"]["can_show_what_if"] is True

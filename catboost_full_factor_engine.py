@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from recommendation_gate import evaluate_price_monotonic_sanity
+
 try:
     import catboost
 
@@ -25,6 +27,235 @@ MAX_PRICE_ELASTICITY = -0.3
 MIN_EXTRAPOLATION_TAIL_MULTIPLIER = 0.15
 MAX_EXTRAPOLATION_TAIL_MULTIPLIER = 2.0
 MODEL_ELASTICITY_WEIGHT = 0.5
+OWN_PRICE_FEATURES = {"price", "net_unit_price", "own_price", "scenario_price", "price_idx"}
+COMPETITOR_OR_MARKET_PRICE_FEATURES = {"competitor_price", "market_price", "benchmark_price", "category_price", "reference_price"}
+
+
+def _build_monotone_constraints(feature_cols: List[str]) -> List[int]:
+    constraints: List[int] = []
+    for col in feature_cols:
+        name = str(col).lower()
+        raw_name = name.replace("factor__", "", 1)
+        if raw_name in OWN_PRICE_FEATURES:
+            constraints.append(-1)
+        else:
+            # v1 safety: competitor/market/benchmark price and arbitrary *_price factors
+            # are not constrained as own price because their economics can be opposite.
+            constraints.append(0)
+    return constraints
+
+
+def _fit_catboost_with_optional_constraints(model_params: Dict[str, Any], X: pd.DataFrame, y: pd.Series, cat_indices: List[int], feature_cols: List[str]) -> Tuple[Any, bool, str]:
+    constraints = _build_monotone_constraints(feature_cols)
+    constrained_params = dict(model_params)
+    if any(constraints):
+        constrained_params["monotone_constraints"] = constraints
+    model = CatBoostRegressor(**constrained_params)
+    try:
+        model.fit(X, y, cat_features=cat_indices)
+        return model, bool(any(constraints)), "constrained" if any(constraints) else "unconstrained_no_price_features"
+    except Exception as exc:
+        fallback = CatBoostRegressor(**model_params)
+        fallback.fit(X, y, cat_features=cat_indices)
+        return fallback, False, f"constrained_failed_fallback_unconstrained: {exc}"
+
+
+def _window_metrics(actual: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
+    denom = float(np.sum(np.abs(actual)))
+    errors = actual - pred
+    return {
+        "wape": float(np.sum(np.abs(errors)) / denom * 100.0) if denom > 0 else float("nan"),
+        "mape": float(np.mean(np.abs(errors / np.clip(np.abs(actual), 1e-9, None))) * 100.0) if len(actual) else float("nan"),
+        "smape": float(np.mean(2.0 * np.abs(errors) / np.clip(np.abs(actual) + np.abs(pred), 1e-9, None)) * 100.0) if len(actual) else float("nan"),
+        "bias": float(np.sum(pred - actual) / max(denom, 1e-9) * 100.0) if len(actual) else float("nan"),
+        "underforecast_rate": float(np.mean(pred < actual)) if len(actual) else float("nan"),
+        "overforecast_rate": float(np.mean(pred > actual)) if len(actual) else float("nan"),
+    }
+
+
+def _rolling_backtest_summary(actual: np.ndarray, pred: np.ndarray, windows: Tuple[int, ...] = (14, 28, 56)) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"windows": []}
+    for window in windows:
+        if len(actual) < window:
+            continue
+        metrics = _window_metrics(actual[-window:], pred[-window:])
+        metrics["window_days"] = int(window)
+        out["windows"].append(metrics)
+    wapes = [float(x["wape"]) for x in out["windows"] if np.isfinite(float(x.get("wape", np.nan)))]
+    if not wapes:
+        out["verdict"] = "insufficient_windows"
+    elif max(wapes) <= 30 and (max(wapes) - min(wapes) <= 15):
+        out["verdict"] = "moderately_stable"
+    elif max(wapes) <= 40:
+        out["verdict"] = "unstable_test_only"
+    else:
+        out["verdict"] = "unstable_experimental_only"
+    return out
+
+
+def _naive_holdout_benchmark(train_part: pd.DataFrame, holdout_part: pd.DataFrame) -> Dict[str, Any]:
+    train_sales = _safe_numeric(train_part.get("sales", pd.Series(dtype="float64")), 0.0).clip(lower=0.0)
+    actual = _safe_numeric(holdout_part.get("sales", pd.Series(dtype="float64")), 0.0).clip(lower=0.0).to_numpy(dtype=float)
+    if len(train_sales) == 0 or len(actual) == 0:
+        return {"best_wape": float("nan"), "benchmarks": []}
+    preds: List[Dict[str, Any]] = []
+    for window in (7, 28):
+        avg = float(train_sales.tail(min(window, len(train_sales))).mean())
+        pred = np.repeat(max(0.0, avg), len(actual))
+        metrics = _window_metrics(actual, pred)
+        metrics.update({"name": f"last_{window}d_average"})
+        preds.append(metrics)
+    try:
+        train_dates = pd.to_datetime(train_part["date"], errors="coerce")
+        holdout_dates = pd.to_datetime(holdout_part["date"], errors="coerce")
+        dow_avg = train_sales.groupby(train_dates.dt.dayofweek).mean()
+        global_avg = float(train_sales.mean())
+        pred = np.asarray([float(dow_avg.get(int(d.dayofweek), global_avg)) for d in holdout_dates], dtype=float)
+        metrics = _window_metrics(actual, pred)
+        metrics.update({"name": "same_weekday_average"})
+        preds.append(metrics)
+    except Exception:
+        pass
+    wapes = [float(x.get("wape", np.nan)) for x in preds if np.isfinite(float(x.get("wape", np.nan)))]
+    return {"best_wape": min(wapes) if wapes else float("nan"), "benchmarks": preds}
+
+
+LEAKAGE_NAME_PATTERNS = (
+    "future_sales", "future_revenue", "future_profit", "sales_next",
+    "target", "revenue", "profit", "margin_after_fact", "actual_demand",
+    "realized_after_scenario", "post_fact_stock",
+)
+
+
+def _feature_leakage_reason(column: Any) -> str:
+    name = str(column).lower().replace("factor__", "", 1)
+    compact = name.replace(" ", "_").replace("-", "_")
+    if compact in LEAKAGE_NAME_PATTERNS or any(pattern in compact for pattern in LEAKAGE_NAME_PATTERNS):
+        return "target_leakage_risk"
+    return ""
+
+
+def _rolling_naive_reference_backtest(frame: pd.DataFrame, min_train_days: int = 60, validation_days: int = 14, max_windows: int = 4) -> Dict[str, Any]:
+    trainable = frame.dropna(subset=["sales"]).copy().reset_index(drop=True)
+    if len(trainable) < min_train_days + validation_days:
+        return {"windows": [], "verdict": "insufficient_history"}
+    windows: List[Dict[str, Any]] = []
+    end = len(trainable)
+    starts = []
+    while end - validation_days >= min_train_days and len(starts) < max_windows:
+        starts.append(end - validation_days)
+        end -= validation_days
+    for val_start in reversed(starts):
+        train_slice = trainable.iloc[:val_start]
+        val_slice = trainable.iloc[val_start:val_start + validation_days]
+        if len(val_slice) == 0:
+            continue
+        pred_level = float(_safe_numeric(train_slice.get("sales", pd.Series(dtype="float64")), 0.0).tail(28).mean())
+        pred = np.repeat(max(0.0, pred_level), len(val_slice))
+        actual = _safe_numeric(val_slice.get("sales", pd.Series(dtype="float64")), 0.0).clip(lower=0.0).to_numpy(dtype=float)
+        metrics = _window_metrics(actual, pred)
+        metrics.update({
+            "train_start": str(pd.to_datetime(train_slice["date"], errors="coerce").min().date()),
+            "train_end": str(pd.to_datetime(train_slice["date"], errors="coerce").max().date()),
+            "validation_start": str(pd.to_datetime(val_slice["date"], errors="coerce").min().date()),
+            "validation_end": str(pd.to_datetime(val_slice["date"], errors="coerce").max().date()),
+            "validation_days": int(len(val_slice)),
+            "method": "rolling_naive_reference_backtest",
+        })
+        windows.append(metrics)
+    wapes = [float(x.get("wape", np.nan)) for x in windows if np.isfinite(float(x.get("wape", np.nan)))]
+    verdict = "insufficient_windows"
+    if wapes and max(wapes) <= 30 and (max(wapes) - min(wapes) <= 15):
+        verdict = "stable"
+    elif wapes and max(wapes) <= 40:
+        verdict = "test_only_unstable"
+    elif wapes:
+        verdict = "experimental_unstable"
+    return {"windows": windows, "verdict": verdict, "method": "rolling_naive_reference_backtest"}
+
+
+def _rolling_catboost_retrain_backtest_summary(
+    frame: pd.DataFrame,
+    feature_cols: List[str],
+    cat_feature_names: List[str],
+    model_params: Dict[str, Any],
+    min_train_days: int = 60,
+    validation_days: int = 14,
+    max_windows: int = 4,
+) -> Dict[str, Any]:
+    if not USE_CATBOOST or CatBoostRegressor is None:
+        return {"windows": [], "verdict": "catboost_unavailable", "method": "rolling_catboost_retrain"}
+    trainable = frame.dropna(subset=["sales", "target_log_sales"]).copy().reset_index(drop=True)
+    if len(trainable) < min_train_days + validation_days or not feature_cols:
+        return {"windows": [], "verdict": "insufficient_history", "method": "rolling_catboost_retrain"}
+    windows: List[Dict[str, Any]] = []
+    end = len(trainable)
+    starts: List[int] = []
+    while end - validation_days >= min_train_days and len(starts) < max_windows:
+        starts.append(end - validation_days)
+        end -= validation_days
+    cat_set = set(cat_feature_names)
+    cat_indices = [feature_cols.index(c) for c in cat_feature_names if c in feature_cols]
+    params = dict(model_params)
+    params["iterations"] = min(int(params.get("iterations", 300)), 250)
+    for val_start in reversed(starts):
+        train_slice = trainable.iloc[:val_start].copy()
+        val_slice = trainable.iloc[val_start:val_start + validation_days].copy()
+        if len(val_slice) == 0:
+            continue
+        X_train = train_slice[feature_cols].copy()
+        X_val = val_slice[feature_cols].copy()
+        fill_values: Dict[str, Any] = {}
+        for col in feature_cols:
+            if col in cat_set:
+                X_train[col] = X_train[col].astype(str).fillna("unknown")
+                X_val[col] = X_val[col].astype(str).fillna("unknown")
+                fill_values[col] = "unknown"
+            else:
+                median_val = pd.to_numeric(X_train[col], errors="coerce").median()
+                if not np.isfinite(median_val):
+                    median_val = 0.0
+                X_train[col] = pd.to_numeric(X_train[col], errors="coerce").fillna(median_val)
+                X_val[col] = pd.to_numeric(X_val[col], errors="coerce").fillna(median_val)
+                fill_values[col] = float(median_val)
+        try:
+            model, constrained, constraint_status = _fit_catboost_with_optional_constraints(
+                params, X_train, train_slice["target_log_sales"].astype(float), cat_indices, feature_cols
+            )
+            pred = np.expm1(model.predict(X_val)).astype(float)
+            pred = np.clip(pred, 0.0, None)
+            actual = _safe_numeric(val_slice.get("sales", pd.Series(dtype="float64")), 0.0).clip(lower=0.0).to_numpy(dtype=float)
+            metrics = _window_metrics(actual, pred)
+            metrics.update({
+                "train_start": str(pd.to_datetime(train_slice["date"], errors="coerce").min().date()),
+                "train_end": str(pd.to_datetime(train_slice["date"], errors="coerce").max().date()),
+                "validation_start": str(pd.to_datetime(val_slice["date"], errors="coerce").min().date()),
+                "validation_end": str(pd.to_datetime(val_slice["date"], errors="coerce").max().date()),
+                "validation_days": int(len(val_slice)),
+                "method": "rolling_catboost_retrain",
+                "monotone_constraints_active": bool(constrained),
+                "monotone_constraints_status": str(constraint_status),
+            })
+        except Exception as exc:
+            metrics = {
+                "wape": float("nan"),
+                "mape": float("nan"),
+                "smape": float("nan"),
+                "bias": float("nan"),
+                "validation_days": int(len(val_slice)),
+                "method": "rolling_catboost_retrain",
+                "error": str(exc),
+            }
+        windows.append(metrics)
+    wapes = [float(x.get("wape", np.nan)) for x in windows if np.isfinite(float(x.get("wape", np.nan)))]
+    verdict = "insufficient_windows"
+    if wapes and max(wapes) <= 30 and (max(wapes) - min(wapes) <= 15):
+        verdict = "stable"
+    elif wapes and max(wapes) <= 40:
+        verdict = "test_only_unstable"
+    elif wapes:
+        verdict = "experimental_unstable"
+    return {"windows": windows, "verdict": verdict, "method": "rolling_catboost_retrain"}
 
 
 def normalize_price_guardrail_mode(value: Any) -> str:
@@ -225,6 +456,23 @@ def _infer_feature_columns(frame: pd.DataFrame) -> Tuple[List[str], List[str], p
             role = "driver"
             dtype_label = "numeric" if pd.api.types.is_numeric_dtype(s) else "categorical"
             raw_column = str(col).replace("factor__", "", 1) if str(col).startswith("factor__") else str(col)
+            leakage_reason = _feature_leakage_reason(col)
+            if leakage_reason:
+                report_rows.append(
+                    {
+                        "feature": col,
+                        "raw_column": raw_column,
+                        "source": source,
+                        "dtype": dtype_label,
+                        "role": role,
+                        "used_in_active_model": False,
+                        "reason": leakage_reason,
+                        "missing_share": missing_share,
+                        "unique_count": nunique,
+                        "std": std_val,
+                    }
+                )
+                continue
 
             if missing_share > 0.8 or nunique < 2:
                 report_rows.append(
@@ -279,6 +527,8 @@ def train_catboost_full_factor_bundle(
 
     trainable = frame.dropna(subset=["target_log_sales"]).copy()
     trainable = trainable[trainable["sales"].notna()].copy()
+    stockout_series = trainable["is_stockout"] if "is_stockout" in trainable.columns else pd.Series(0.0, index=trainable.index)
+    stockout_share = float(pd.to_numeric(stockout_series, errors="coerce").fillna(0.0).mean()) if len(trainable) else 0.0
 
     warnings = []
     factor_catalog = []
@@ -304,6 +554,36 @@ def train_catboost_full_factor_bundle(
                 "source": "extra_factor" if str(col).startswith("factor__") else ("calendar" if col in CALENDAR_FEATURES else ("lag" if col in LAG_FEATURES else "core")),
             }
         )
+
+    if len(feature_report):
+        used_catalog_features = {str(row.get("feature")) for row in factor_catalog}
+        for _, rep in feature_report.iterrows():
+            feature_name = str(rep.get("feature", ""))
+            if bool(rep.get("used_in_active_model", False)) or feature_name in used_catalog_features:
+                continue
+            s = frame[feature_name] if feature_name in frame.columns else pd.Series(dtype="float64")
+            numeric = pd.api.types.is_numeric_dtype(s)
+            non_na = s.dropna()
+            factor_catalog.append(
+                {
+                    "feature": feature_name,
+                    "raw_column": str(rep.get("raw_column", feature_name)),
+                    "dtype": "numeric" if numeric else "categorical",
+                    "editable": False,
+                    "current_value": non_na.iloc[-1] if len(non_na) else ("unknown" if not numeric else np.nan),
+                    "fill_value": np.nan,
+                    "train_min": float(pd.to_numeric(non_na, errors="coerce").min()) if numeric and len(non_na) else np.nan,
+                    "train_p10": float(pd.to_numeric(non_na, errors="coerce").quantile(0.10)) if numeric and len(non_na) else np.nan,
+                    "train_median": float(pd.to_numeric(non_na, errors="coerce").median()) if numeric and len(non_na) else np.nan,
+                    "train_p90": float(pd.to_numeric(non_na, errors="coerce").quantile(0.90)) if numeric and len(non_na) else np.nan,
+                    "train_max": float(pd.to_numeric(non_na, errors="coerce").max()) if numeric and len(non_na) else np.nan,
+                    "missing_share": float(s.isna().mean()) if len(s) else 1.0,
+                    "nunique": int(s.nunique(dropna=True)) if len(s) else 0,
+                    "source": str(rep.get("source", "excluded")),
+                    "used_in_active_model": False,
+                    "exclusion_reason": str(rep.get("reason", "excluded")),
+                }
+            )
 
     if len(trainable) < min_train_days:
         warnings.append(f"Недостаточно дневной истории для CatBoost full factors: {len(trainable)} < {min_train_days}.")
@@ -366,19 +646,25 @@ def train_catboost_full_factor_bundle(
 
     cat_indices = [feature_cols.index(c) for c in cat_feature_names if c in feature_cols]
 
-    model = CatBoostRegressor(
-        iterations=700,
-        learning_rate=0.03,
-        depth=5,
-        l2_leaf_reg=8.0,
-        loss_function="RMSE",
-        random_seed=42,
-        verbose=0,
-        allow_writing_files=False,
-        thread_count=1,
-    )
+    model_params = {
+        "iterations": 700,
+        "learning_rate": 0.03,
+        "depth": 5,
+        "l2_leaf_reg": 8.0,
+        "loss_function": "RMSE",
+        "random_seed": 42,
+        "verbose": 0,
+        "allow_writing_files": False,
+        "thread_count": 1,
+    }
 
-    model.fit(X_train, y_train, cat_features=cat_indices)
+    model, monotone_constraints_active, monotone_constraints_status = _fit_catboost_with_optional_constraints(
+        model_params, X_train, y_train, cat_indices, feature_cols
+    )
+    if not monotone_constraints_active:
+        warnings.append(
+            "CatBoost price monotonic constraints are not active; model can be used for forecast, but price recommendations require post-checks."
+        )
 
     train_fill_values = {}
     for col in feature_cols:
@@ -421,6 +707,17 @@ def train_catboost_full_factor_bundle(
     mape = float(np.mean(np.abs((actual - holdout_pred) / np.clip(np.abs(actual), 1e-9, None))) * 100.0) if len(actual) else float("nan")
     smape = float(np.mean(2.0 * np.abs(actual - holdout_pred) / np.clip(np.abs(actual) + np.abs(holdout_pred), 1e-9, None)) * 100.0) if len(actual) else float("nan")
     bias = float(np.mean(holdout_pred - actual)) if len(actual) else float("nan")
+    naive_benchmark = _naive_holdout_benchmark(train_part, holdout_part)
+    naive_best_wape = float(naive_benchmark.get("best_wape", np.nan))
+    naive_improvement_pct = (
+        float((naive_best_wape - wape) / max(naive_best_wape, 1e-9) * 100.0)
+        if np.isfinite(naive_best_wape) and np.isfinite(wape)
+        else float("nan")
+    )
+    rolling_naive_reference_backtest = _rolling_naive_reference_backtest(trainable)
+    rolling_retrain_backtest = _rolling_catboost_retrain_backtest_summary(
+        trainable, feature_cols, cat_feature_names, model_params
+    )
 
     X_full = trainable[feature_cols].copy()
     y_full = trainable["target_log_sales"].astype(float)
@@ -447,7 +744,11 @@ def train_catboost_full_factor_bundle(
             row["exclusion_reason"] = str(meta.get("reason", ""))
             row["importance"] = meta.get("importance", np.nan)
 
-    model.fit(X_full, y_full, cat_features=cat_indices)
+    model, full_monotone_active, full_monotone_status = _fit_catboost_with_optional_constraints(
+        model_params, X_full, y_full, cat_indices, feature_cols
+    )
+    monotone_constraints_active = bool(monotone_constraints_active and full_monotone_active)
+    monotone_constraints_status = full_monotone_status if not full_monotone_active else monotone_constraints_status
 
     importances = []
     try:
@@ -457,6 +758,12 @@ def train_catboost_full_factor_bundle(
         if len(feature_report):
             imp_map = {str(x["feature"]): float(x["importance"]) for x in importances}
             feature_report["importance"] = feature_report["feature"].astype(str).map(imp_map)
+        imp_map = {str(x["feature"]): float(x["importance"]) for x in importances}
+        for row in factor_catalog:
+            row["importance"] = imp_map.get(str(row.get("feature", "")), np.nan)
+            row["used_in_active_model"] = str(row.get("feature", "")) in feature_cols
+            if "exclusion_reason" not in row:
+                row["exclusion_reason"] = "" if row["used_in_active_model"] else "not_selected"
     except Exception:
         importances = []
 
@@ -472,6 +779,11 @@ def train_catboost_full_factor_bundle(
         "fill_values": fill_values,
         "feature_report": feature_report,
         "feature_importances": importances,
+        "target_semantics": {
+            "trained_on": "realized_sales",
+            "demand_model_note": "Sales can understate demand during stockouts; outputs separate predicted_demand_raw and realized_sales_after_stock.",
+            "stockout_share": stockout_share,
+        },
         "holdout_metrics": {
             "wape": wape,
             "mae": mae,
@@ -481,7 +793,18 @@ def train_catboost_full_factor_bundle(
             "bias": bias,
             "mode": "recursive_daily_holdout",
             "holdout_days": int(holdout_size),
+            "naive_best_wape": naive_best_wape,
+            "naive_improvement_pct": naive_improvement_pct,
+            "rolling_backtest": _rolling_backtest_summary(actual, holdout_pred),
+            "rolling_retrain_backtest": rolling_retrain_backtest,
+            "rolling_naive_reference_backtest": rolling_naive_reference_backtest,
         },
+        "naive_benchmark": naive_benchmark,
+        "rolling_backtest": _rolling_backtest_summary(actual, holdout_pred),
+        "rolling_retrain_backtest": rolling_retrain_backtest,
+        "rolling_naive_reference_backtest": rolling_naive_reference_backtest,
+        "monotone_constraints_active": bool(monotone_constraints_active),
+        "monotone_constraints_status": str(monotone_constraints_status),
         "holdout_predictions": pd.DataFrame(
             {
                 "date": pd.to_datetime(holdout_part["date"], errors="coerce"),
@@ -603,6 +926,7 @@ def predict_catboost_full_factor_projection(
     factor_catalog_df = full_bundle.get("factor_catalog", pd.DataFrame())
     factor_guardrails: Dict[str, Dict[str, Any]] = {}
     ood_count = 0
+    ood_importance_score = 0.0
     guardrail_warnings: List[str] = []
     if isinstance(factor_catalog_df, pd.DataFrame) and len(factor_catalog_df):
         for _, row in factor_catalog_df.iterrows():
@@ -619,13 +943,21 @@ def predict_catboost_full_factor_projection(
                     if num_val < lo or num_val > hi:
                         status = "out_of_range"
                         ood_count += 1
+                        factor_importance = float(row.get("importance", 0.0)) if np.isfinite(pd.to_numeric(row.get("importance", 0.0), errors="coerce")) else 0.0
+                        ood_importance_score += max(0.0, factor_importance)
                         guardrail_warnings.append(f"Фактор {f} вне исторического диапазона CatBoost.")
-                factor_guardrails[f] = {"value": val, "train_min": lo, "train_max": hi, "status": status}
+                importance = float(row.get("importance", 0.0)) if np.isfinite(pd.to_numeric(row.get("importance", 0.0), errors="coerce")) else 0.0
+                factor_guardrails[f] = {"value": val, "train_min": lo, "train_max": hi, "status": status, "importance": importance}
             else:
                 factor_guardrails[f] = {"value": val, "status": "categorical"}
 
+    factor_ood_flag = bool(ood_count > 0)
+    important_factor_ood = bool(ood_importance_score >= 10.0)
+
     work_history = history.copy()
     rows = []
+    monotonicity_base_total = 0.0
+    monotonicity_scenario_total = 0.0
 
     for _, fd_row in future_dates.iterrows():
         dt = pd.Timestamp(fd_row["date"])
@@ -664,23 +996,23 @@ def predict_catboost_full_factor_projection(
                 x[col] = pd.to_numeric(x[col], errors="coerce").fillna(float(fill_values.get(col, 0.0)))
 
         boundary_pred_sales = max(0.0, float(np.expm1(model.predict(x)[0])))
+        rec_base_same_context = dict(rec)
+        rec_base_same_context["price"] = float(base_price)
+        rec_base_same_context["net_unit_price"] = max(0.01, float(base_price) * (1.0 - scenario_discount))
+        tmp_base_same_context = pd.concat([work_history, pd.DataFrame([rec_base_same_context])], ignore_index=True)
+        tmp_base_same_context_model = _build_model_frame(tmp_base_same_context)
+        x_base_same_context = tmp_base_same_context_model.tail(1)[feature_cols].copy()
+        for col in feature_cols:
+            if col in cat_feature_names:
+                x_base_same_context[col] = x_base_same_context[col].astype(str).fillna(str(fill_values.get(col, "unknown")))
+            else:
+                x_base_same_context[col] = pd.to_numeric(x_base_same_context[col], errors="coerce").fillna(float(fill_values.get(col, 0.0)))
+        base_pred_same_context = max(0.0, float(np.expm1(model.predict(x_base_same_context)[0])))
         pred_sales = boundary_pred_sales
         elasticity_used = np.nan
         elasticity_source = ""
         tail_multiplier = 1.0
         if extrapolation_applied:
-            rec_base = dict(rec)
-            rec_base["price"] = float(base_price)
-            rec_base["net_unit_price"] = max(0.01, float(base_price) * (1.0 - scenario_discount))
-            tmp_base = pd.concat([work_history, pd.DataFrame([rec_base])], ignore_index=True)
-            tmp_base_model = _build_model_frame(tmp_base)
-            x_base = tmp_base_model.tail(1)[feature_cols].copy()
-            for col in feature_cols:
-                if col in cat_feature_names:
-                    x_base[col] = x_base[col].astype(str).fillna(str(fill_values.get(col, "unknown")))
-                else:
-                    x_base[col] = pd.to_numeric(x_base[col], errors="coerce").fillna(float(fill_values.get(col, 0.0)))
-            base_pred_same_context = max(0.0, float(np.expm1(model.predict(x_base)[0])))
             elasticity_used, elasticity_source = _estimate_model_price_elasticity(base_pred_same_context, boundary_pred_sales, base_price, model_price_gross)
             tail_multiplier = _price_extrapolation_tail_multiplier(financial_price_gross, model_price_gross, elasticity_used)
             if financial_price_gross > model_price_gross:
@@ -690,6 +1022,8 @@ def predict_catboost_full_factor_projection(
             pred_sales = boundary_pred_sales * tail_multiplier
 
         pred_sales *= float(demand_multiplier)
+        monotonicity_base_total += float(base_pred_same_context) * float(demand_multiplier)
+        monotonicity_scenario_total += float(pred_sales)
 
         available_stock = rec["stock"]
         lost_sales = 0.0
@@ -697,6 +1031,11 @@ def predict_catboost_full_factor_projection(
             lost_sales = max(0.0, pred_sales - float(available_stock))
             pred_sales = min(pred_sales, float(available_stock))
 
+        predicted_demand_raw = float(pred_sales + lost_sales)
+        rec["predicted_demand_raw"] = predicted_demand_raw
+        rec["scenario_demand_raw"] = predicted_demand_raw
+        rec["realized_sales_after_stock"] = pred_sales
+        rec["stock_limited_flag"] = bool(lost_sales > 1e-9)
         rec["sales"] = pred_sales
         rec["actual_sales"] = pred_sales
         rec["lost_sales"] = lost_sales
@@ -773,7 +1112,19 @@ def predict_catboost_full_factor_projection(
         warnings.append(f"Высокий holdout WAPE CatBoost full factors: {float(wape):.1f}%.")
 
     confidence = float(1.0 / (1.0 + max(0.0, float(wape) / 100.0))) if np.isfinite(wape) else 0.5
-    if ood_count >= 3:
+    stockout_share = float((full_bundle.get("target_semantics", {}) or {}).get("stockout_share", 0.0) or 0.0)
+    if stockout_share > 0.30:
+        support_label = "low"
+        confidence *= 0.6
+        warnings.append("Высокая доля stockout в истории: модель продаж нельзя трактовать как чистую модель спроса.")
+    elif stockout_share > 0.15:
+        confidence *= 0.8
+        warnings.append("Заметная доля stockout в истории: спрос мог быть выше наблюдаемых продаж.")
+    if ood_importance_score >= 10.0:
+        support_label = "low"
+        confidence *= 0.6
+        warnings.append(f"Важные факторы вне исторического диапазона: importance-weighted OOD={ood_importance_score:.1f}.")
+    elif ood_count >= 3:
         support_label = "low"
         confidence *= 0.7
     reliability_verdict = ""
@@ -781,6 +1132,12 @@ def predict_catboost_full_factor_projection(
         confidence = min(float(confidence), 0.45)
         support_label = "low"
         reliability_verdict = "Рискованная экстраполяция"
+
+    monotonicity_policy = evaluate_price_monotonic_sanity(base_price, applied_price_gross, monotonicity_base_total, monotonicity_scenario_total)
+    monotonicity_policy["comparison_basis"] = "same_future_context_counterfactual"
+    if not monotonicity_policy.get("ok", True):
+        warnings.extend(monotonicity_policy.get("warnings", []))
+        support_label = "low" if np.isfinite(wape) and float(wape) > 40.0 else support_label
 
     return {
         "daily": daily,
@@ -791,13 +1148,18 @@ def predict_catboost_full_factor_projection(
         "uncertainty_penalty": 0.0,
         "disagreement_penalty": 0.0,
         "revenue_total": revenue_total,
+        "predicted_demand_raw": float(demand_total + lost_sales_total),
+        "realized_sales_after_stock": demand_total,
         "lost_sales_total": lost_sales_total,
+        "stock_limited_flag": bool(lost_sales_total > 1e-9),
         "confidence": confidence,
         "confidence_base": confidence,
         "confidence_scenario": confidence,
         "confidence_label": "medium" if confidence >= 0.5 else "low",
         "uncertainty": 1.0 - confidence,
-        "ood_flag": bool(price_clipped or (price_guardrail_mode == PRICE_GUARDRAIL_EXTRAPOLATE and price_out_of_range)),
+        "ood_flag": bool(price_clipped or (price_guardrail_mode == PRICE_GUARDRAIL_EXTRAPOLATE and price_out_of_range) or factor_ood_flag),
+        "factor_ood_flag": bool(factor_ood_flag),
+        "important_factor_ood": bool(important_factor_ood),
         "price_guardrail_mode": price_guardrail_mode,
         "requested_price": requested_price,
         "model_price": model_price,
@@ -846,6 +1208,13 @@ def predict_catboost_full_factor_projection(
             "cat_feature_count": len(cat_feature_names),
             "top_features": full_bundle.get("feature_importances", [])[:15],
             "holdout_metrics": metrics,
+            "rolling_backtest": full_bundle.get("rolling_backtest", metrics.get("rolling_backtest", {})),
+            "rolling_retrain_backtest": full_bundle.get("rolling_retrain_backtest", metrics.get("rolling_retrain_backtest", {})),
+            "rolling_naive_reference_backtest": full_bundle.get("rolling_naive_reference_backtest", metrics.get("rolling_naive_reference_backtest", {})),
+            "naive_benchmark": full_bundle.get("naive_benchmark", {}),
+            "target_semantics": full_bundle.get("target_semantics", {}),
+            "monotone_constraints_active": bool(full_bundle.get("monotone_constraints_active", False)),
+            "monotone_constraints_status": str(full_bundle.get("monotone_constraints_status", "")),
         },
         "applied_overrides": scenario_overrides,
         "effects": {
@@ -905,8 +1274,8 @@ def predict_catboost_full_factor_projection(
             "scenario_price_effect_source": "catboost_boundary_plus_elasticity_extrapolation" if extrapolation_applied else "catboost_full_factor_reprediction",
         },
         "scenario_calc_mode": CATBOOST_FULL_FACTOR_MODE,
-        "scenario_calc_mode_label": "CatBoost full factors: модельный what-if по факторам",
-        "active_path_contract_label": "Daily CatBoost full factors + model reprediction",
+        "scenario_calc_mode_label": "CatBoost Full Factors — ML-режим, где модель обучается на доступных факторах и пересчитывает прогноз при их изменении.",
+        "active_path_contract_label": "CatBoost Full Factors: ML-модель обучается на доступных факторах и перепрогнозирует спрос при изменениях.",
         "effect_source": "catboost_full_factor_reprediction",
         "effect_source_label": "CatBoost повторно прогнозирует спрос по изменённым факторам",
         "support_label": support_label,
@@ -915,9 +1284,14 @@ def predict_catboost_full_factor_projection(
             "warnings": warnings,
         },
         "reliability_verdict": reliability_verdict,
+        "monotonicity_policy": monotonicity_policy,
+        "ood_importance_score": float(ood_importance_score),
+        "factor_ood_flag": bool(factor_ood_flag),
+        "important_factor_ood": bool(important_factor_ood),
+        "factor_guardrails": factor_guardrails,
         "legacy_or_enhanced_label": "catboost_full_factors",
         "applied_path_summary": {
-            "mode": "CatBoost full factors: модельный what-if по факторам",
+            "mode": "CatBoost Full Factors — ML-режим, где модель обучается на доступных факторах и пересчитывает прогноз при их изменении.",
             "segment_count": 0,
             "price_net_min": float(_price_net_public.min()) if len(daily) else np.nan,
             "price_net_avg": float(_price_net_public.mean()) if len(daily) else np.nan,

@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-import streamlit as st
+import importlib.util
+
+if importlib.util.find_spec("streamlit") is not None:
+    import streamlit as st
+else:
+    st = None
 
 
 def apply_theme() -> None:
+    if st is None:
+        return
     st.markdown(
         """
 <style>

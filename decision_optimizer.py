@@ -38,16 +38,34 @@ def _eligible_best(e: dict, objective: str, min_profit_uplift_pct: float) -> boo
     rel = e.get("reliability") or {}; eff = e.get("expected_effect") or {}; econ = rel.get("economic_significance") or {}
     if (e.get("blockers") or rel.get("blockers")):
         return False
-    gate = resolve_recommendation_gate(
-        price_policy=(rel.get("component_details") or {}).get("scenario_support", {}),
-        data_quality=(rel.get("component_details") or {}).get("data_quality", {}),
-        model_quality=(rel.get("component_details") or {}).get("model_quality", {}),
-        factor_policy=(rel.get("component_details") or {}).get("factor_support", {}),
-        economic_significance=econ,
-        cost_policy={"cost_proxied": bool(econ.get("cost_proxied"))},
-        decision_reliability={"base_status": rel.get("decision_status"), "status_namespace": "decision", "warnings": rel.get("warnings", []), "blockers": e.get("blockers") or rel.get("blockers", [])},
-    )
-    if gate.get("decision_status") not in {"recommended", "test_recommended"}:
+
+    status = str(rel.get("decision_status", ""))
+    gate_details = rel.get("recommendation_gate_details") if isinstance(rel.get("recommendation_gate_details"), dict) else {}
+    if gate_details and gate_details.get("blockers"):
+        return False
+
+    component_details = rel.get("component_details") if isinstance(rel.get("component_details"), dict) else {}
+    model_quality = component_details.get("model_quality") if isinstance(component_details.get("model_quality"), dict) else {}
+    has_full_model_quality = "wape" in model_quality and model_quality.get("wape") is not None
+    if has_full_model_quality:
+        gate = resolve_recommendation_gate(
+            price_policy=component_details.get("scenario_support", {}),
+            data_quality=component_details.get("data_quality", {}),
+            model_quality=model_quality,
+            factor_policy=component_details.get("factor_support", {}),
+            economic_significance=econ,
+            cost_policy={"cost_proxied": bool(econ.get("cost_proxied")), "cost_missing": bool(econ.get("cost_missing")), "profit_action": objective == "profit"},
+            decision_reliability={
+                "base_status": status,
+                "status_namespace": "decision",
+                "warnings": rel.get("warnings", []),
+                "blockers": e.get("blockers") or rel.get("blockers", []),
+                "allow_unknown_wape_for_test_recommendation": True,
+            },
+        )
+        status = str(gate.get("decision_status", status))
+
+    if status not in {"recommended", "test_recommended"}:
         return False
     if safe_float(rel.get("score"), 0) < 65 or rel.get("risk_level") == "high":
         return False

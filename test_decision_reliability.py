@@ -196,3 +196,23 @@ def test_out_of_safe_range_fallback_elasticity_extrapolation_is_experimental_onl
     assert out["decision_status"] == "experimental_only"
     assert out["recommendation_gate"] == "experimental_only"
     assert out["effect_nature"] == "prior_based"
+
+
+def test_decision_reliability_unknown_wape_limits_to_test_not_full_block():
+    tb, res = bundle()
+    res["quality_report"] = {"holdout_metrics": {}}
+    out = evaluate_decision_reliability(res, tb, cand(), scenario(), BASE)
+    assert out["decision_status"] in {"test_recommended", "experimental_only"}
+    assert out["decision_status"] != "not_recommended"
+    assert "wape_unknown_test_only" in out["recommendation_gate_details"]["reasons"]
+
+
+def test_valid_profit_not_blocked_when_cost_field_absent():
+    tb, res = bundle(include_cost=False)
+    scenario_result = scenario(profit=39000)
+    baseline = dict(BASE)
+    baseline["profit_total_adjusted"] = 35000
+    out = evaluate_decision_reliability(res, tb, cand(), scenario_result, baseline, objective="profit")
+    assert "cost_missing_blocks_profit_recommendation" not in out["recommendation_gate_details"]["reasons"]
+    assert not any("Себестоимость отсутствует" in str(b) for b in out["blockers"])
+    assert out["decision_status"] in {"recommended", "test_recommended", "experimental_only"}

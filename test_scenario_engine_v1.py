@@ -285,10 +285,10 @@ def test_enhanced_model_price_path_controls_demand_financial_price_controls_mone
     assert float(profile["revenue"].iloc[0]) == pytest.approx(float(profile["actual_sales"].iloc[0]) * 150.0)
 
 
-def _enhanced_baseline(days: int = 4) -> pd.DataFrame:
+def _enhanced_baseline(days: int = 4, units: float = 20.0) -> pd.DataFrame:
     return pd.DataFrame({
         "date": pd.date_range("2025-02-01", periods=days, freq="D"),
-        "base_pred_sales": np.full(days, 20.0),
+        "base_pred_sales": np.full(days, units),
         "stock": np.full(days, 15.0),
     })
 
