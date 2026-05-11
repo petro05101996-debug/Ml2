@@ -11,12 +11,14 @@ MODE_DESCRIPTIONS = {
 }
 
 STATUS_LABELS = {
-    "recommended": "Можно рекомендовать",
-    "eligible": "Можно рекомендовать",
-    "test_recommended": "Лучше проверить тестом",
-    "test_only": "Лучше проверить тестом",
-    "experimental_only": "Только экспериментальный сценарий",
-    "not_recommended": "Не рекомендовать",
+    "recommended": "Рекомендация",
+    "eligible": "Можно рассмотреть",
+    "test_recommended": "Можно рассмотреть",
+    "controlled_test_only": "Можно рассмотреть",
+    "test_only": "Можно рассмотреть",
+    "experimental_only": "Гипотеза",
+    "not_recommended": "Не рекомендуется",
+    "blocked": "Заблокировано",
 }
 
 

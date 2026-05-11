@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.slow
+
 
 def _build_synthetic_txn(n: int = 140) -> pd.DataFrame:
     dates = pd.date_range("2024-01-01", periods=n, freq="D")

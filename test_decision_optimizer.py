@@ -49,3 +49,40 @@ def test_decision_optimizer_can_rank_test_candidates_without_wape():
     candidate["reliability"]["component_details"] = {"model_quality": {}}
     out = rank_decision_candidates([candidate])
     assert out["best_action"]["candidate_id"] == "safe_no_wape"
+
+
+def test_decision_analysis_uses_ranked_candidates_source_of_truth():
+    from decision_analysis_engine import DecisionAnalysisInput, analyze_decision
+    from decision_optimizer import rank_decision_candidates
+
+    raw = [
+        {
+            "candidate": {"candidate_id": "low", "action_type": "price_change", "objective": "profit"},
+            "expected_effect": {"profit_delta_pct": 1.0, "conservative_profit_delta_pct": 1.0},
+            "reliability": {"decision_status": "test_recommended", "risk_level": "low", "score": 70, "economic_significance": {"conservative_profit_delta_pct": 1.0}},
+            "blockers": [],
+        },
+        {
+            "candidate": {"candidate_id": "high", "action_type": "price_change", "objective": "profit"},
+            "expected_effect": {"profit_delta_pct": 10.0, "conservative_profit_delta_pct": 10.0},
+            "reliability": {"decision_status": "recommended", "risk_level": "low", "score": 90, "economic_significance": {"conservative_profit_delta_pct": 10.0}},
+            "blockers": [],
+        },
+    ]
+    opt = rank_decision_candidates(raw, objective="profit")
+    ranked_for_analysis = opt.get("ranked_candidates", raw)
+    result = analyze_decision(
+        DecisionAnalysisInput(
+            baseline={},
+            trained_bundle={},
+            data_contract={},
+            model_quality_gate={},
+            current_context={},
+            allowed_actions=["price_change"],
+            business_constraints={},
+            objective="profit",
+            horizon=30,
+        ),
+        evaluated_candidates=ranked_for_analysis,
+    ).to_dict()
+    assert result["best_action"]["candidate"]["candidate_id"] == opt["best_action"]["candidate_id"] == "high"

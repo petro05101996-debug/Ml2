@@ -1,6 +1,9 @@
 import io
 
 import pandas as pd
+import pytest
+
+pytestmark = pytest.mark.slow
 
 
 def _synthetic_txn(n_days: int = 120) -> pd.DataFrame:

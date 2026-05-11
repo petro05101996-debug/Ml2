@@ -197,3 +197,45 @@ def test_freight_candidates_use_absolute_current_context_freight_override():
     assert baseline["scenario_params"]["freight_multiplier"] == 1.0
     assert freight["scenario_params"]["overrides"]["freight_value"] == 18.0
     assert freight["scenario_params"]["freight_multiplier"] == 1.0
+
+
+def test_unsupported_discount_single_candidates_are_generated_but_blocked():
+    b = tb()
+    b["daily_base"]["discount"] = 0.1
+    cs = generate_decision_candidates(b, None, allowed_actions=["discount_change"])
+    discount_candidates = [c for c in cs if c["action_type"] == "discount_change"]
+    assert discount_candidates
+    assert all((c.get("metadata") or {}).get("support_zone") == "unsupported_hypothesis" for c in discount_candidates)
+    assert all("factor_support_missing:discount" in ((c.get("metadata") or {}).get("blockers") or []) for c in discount_candidates)
+
+
+def test_unsupported_freight_single_candidates_are_generated_but_blocked():
+    b = tb()
+    b["base_ctx"]["freight_value"] = 10.0
+    b["daily_base"]["freight_value"] = 10.0
+    cs = generate_decision_candidates(b, {"price": 100.0, "discount": 0.0, "promotion": 0.0, "freight_value": 10.0}, allowed_actions=["freight_change"])
+    freight_candidates = [c for c in cs if c["action_type"] == "freight_change"]
+    assert freight_candidates
+    assert all((c.get("metadata") or {}).get("support_zone") == "unsupported_hypothesis" for c in freight_candidates)
+    assert all("factor_support_missing:freight_value" in ((c.get("metadata") or {}).get("blockers") or []) for c in freight_candidates)
+
+
+def test_unsupported_single_candidates_are_not_eligible_best_action():
+    from decision_optimizer import rank_decision_candidates
+
+    b = tb()
+    b["daily_base"]["discount"] = 0.1
+    cs = [c for c in generate_decision_candidates(b, None, allowed_actions=["discount_change"]) if c["action_type"] == "discount_change"][:2]
+    evaluated = evaluate_decision_candidates(
+        {"history_daily": b["daily_base"], "quality_report": {"holdout_metrics": {"wape": 10}}},
+        b,
+        [{"candidate_id": "baseline", "action_type": "baseline", "current_value": 100.0, "target_value": 100.0, "scenario_params": {"manual_price": 100.0}, "objective": "profit"}] + cs,
+        simple_runner,
+        "enhanced_local_factors",
+        "safe_clip",
+        30,
+        "profit",
+    )
+    assert any(e["candidate"].get("action_type") == "discount_change" and e.get("blockers") for e in evaluated)
+    opt = rank_decision_candidates(evaluated, objective="profit")
+    assert (opt.get("best_action") or {}).get("action_type") != "discount_change"

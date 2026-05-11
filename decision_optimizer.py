@@ -94,12 +94,13 @@ def rank_decision_candidates(evaluated_candidates: list[dict], objective: str = 
 def select_decision_options(ranked_candidates: list[dict], objective: str = "profit", min_profit_uplift_pct: float = 3.0) -> dict:
     valid = [e for e in ranked_candidates if _eligible_best(e, objective, min_profit_uplift_pct)]
     best = valid[0] if valid else None
-    safe = next((e for e in ranked_candidates if (e.get("reliability") or {}).get("risk_level") == "low" and safe_float((e.get("reliability") or {}).get("score"), 0) >= 75 and safe_float((e.get("expected_effect") or {}).get("conservative_profit_delta_pct", (e.get("expected_effect") or {}).get("profit_delta_pct")), -1) > 0 and not (e.get("blockers") or [])), None)
+    safe = next((e for e in ranked_candidates if _eligible_best(e, objective, min_profit_uplift_pct) and (e.get("reliability") or {}).get("risk_level") == "low" and safe_float((e.get("reliability") or {}).get("score"), 0) >= 75 and safe_float((e.get("expected_effect") or {}).get("conservative_profit_delta_pct", (e.get("expected_effect") or {}).get("profit_delta_pct")), -1) > 0 and not (e.get("blockers") or [])), None)
     balanced = valid[0] if valid else None
     aggressive_pool = [
         e for e in ranked_candidates
         if not (e.get("blockers") or (e.get("reliability") or {}).get("blockers"))
         and not bool((e.get("reliability") or {}).get("technical_error"))
+        and (e.get("reliability") or {}).get("decision_status") in {"recommended", "test_recommended", "controlled_test_only", "experimental_only"}
     ]
     aggressive_pool = sorted(aggressive_pool, key=lambda e: _econ(e, objective), reverse=True)
     aggressive = aggressive_pool[0] if aggressive_pool else None

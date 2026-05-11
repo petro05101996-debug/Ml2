@@ -39,17 +39,24 @@ def build_candidate_from_recommendation(recommendation: dict, trained_bundle: di
     current_price = safe_float(ctx.get("price"), 0.0); current_discount = clamp(ctx.get("discount", 0.0), 0, 0.95); current_promo = clamp(ctx.get("promotion", 0.0), 0, 1); current_freight = safe_float(ctx.get("freight_value"), 0.0)
     factor_overrides = dict(ctx.get("factor_overrides") or {})
     target = recommendation.get("target_value")
+    target_missing = target is None
     if target is None and recommendation.get("absolute_delta_pp") is not None and action in {"discount_change", "promotion_change"}:
         base = current_discount if action == "discount_change" else current_promo
         target = round(base + safe_float(recommendation.get("absolute_delta_pp"), 0.0) / 100.0, 10)
+        target_missing = False
     if target is None and recommendation.get("relative_change_pct") is not None:
         base = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else current_freight if action == "freight_change" else 1.0
         target = base * (1.0 + safe_float(recommendation.get("relative_change_pct"), 0.0) / 100.0)
+        target_missing = False
     if target is None and recommendation.get("change_pct") is not None:
         base = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else current_freight if action == "freight_change" else 1.0
         target = base * (1.0 + safe_float(recommendation.get("change_pct"), 0.0) / 100.0)
-    target = safe_float(target, current_price if action == "price_change" else current_freight if action == "freight_change" else 1.0)
+        target_missing = False
     current = current_price if action == "price_change" else current_discount if action == "discount_change" else current_promo if action == "promotion_change" else current_freight if action == "freight_change" else 1.0
+    if target_missing:
+        target = current
+    else:
+        target = safe_float(target, current)
     params = {"manual_price": current_price, "freight_multiplier": 1.0, "discount_multiplier": 1.0, "demand_multiplier": 1.0, "factor_overrides": dict(factor_overrides), "overrides": {"discount": current_discount, "promotion": current_promo, "freight_value": current_freight}}
     if action == "price_change": params["manual_price"] = target
     elif action == "discount_change": params["overrides"]["discount"] = clamp(target, 0, 0.95)
@@ -59,10 +66,15 @@ def build_candidate_from_recommendation(recommendation: dict, trained_bundle: di
         params["overrides"]["freight_value"] = safe_float(target, current_freight)
     elif action == "demand_shock": params["demand_multiplier"] = max(0.01, target)
     metadata = {"source_name": recommendation.get("source_name"), "horizon_days": horizon_days, **(recommendation.get("metadata") or {})}
+    blockers = []
+    if target_missing:
+        blockers.append("target_value_required")
+        metadata["invalid_recommendation"] = True
+        metadata["blockers"] = blockers
     relative_change_pct = safe_pct_delta(target, current)
     if action in {"discount_change", "promotion_change"}:
         metadata["absolute_delta_pp"] = (safe_float(target, 0.0) - safe_float(current, 0.0)) * 100.0
-    return {"candidate_id": "external_recommendation", "mode": "improve_external_recommendation", "action_type": action, "title": recommendation.get("comment") or "Внешняя рекомендация", "source": "external", "current_value": current, "target_value": target, "change_pct": relative_change_pct, "relative_change_pct": relative_change_pct, "absolute_delta_pp": metadata.get("absolute_delta_pp"), "objective": recommendation.get("objective", "profit"), "scenario_params": params, "metadata": metadata}
+    return {"candidate_id": "external_recommendation", "mode": "improve_external_recommendation", "action_type": action, "title": recommendation.get("comment") or "Внешняя рекомендация", "source": "external", "current_value": current, "target_value": target, "change_pct": relative_change_pct, "relative_change_pct": relative_change_pct, "absolute_delta_pp": metadata.get("absolute_delta_pp"), "objective": recommendation.get("objective", "profit"), "scenario_params": params, "metadata": metadata, "blockers": blockers}
 
 
 def _make_alt(cid, base, target, action, objective, ctx, source="improved"):

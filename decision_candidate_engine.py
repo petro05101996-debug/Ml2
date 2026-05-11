@@ -24,6 +24,20 @@ def _candidate(cid: str, action_type: str, title: str, source: str, current, tar
 
 
 
+
+
+def _support_metadata(horizon_days: int, supported: bool, reason: str = "") -> dict:
+    meta = {
+        "horizon_days": horizon_days,
+        "support_zone": "safe" if supported else "unsupported_hypothesis",
+        "extrapolated": not supported,
+    }
+    if not supported:
+        meta["unsupported_hypothesis"] = True
+        meta["blockers"] = [reason or "factor_support_missing"]
+        meta["warnings"] = ["factor_support_missing"]
+    return meta
+
 def _model_metadata(trained_bundle: dict, action_type: str, scenario_calc_mode: str | None = None) -> dict:
     bundle = trained_bundle or {}
     scenario_calc_mode = str(scenario_calc_mode or bundle.get("analysis_scenario_calc_mode", ""))
@@ -182,8 +196,20 @@ def _violates_constraints(candidate: dict, scenario: dict, baseline: dict, const
             issues.append("cost_missing_blocks_profit_recommendation")
         elif price < cost:
             issues.append("forbid_price_below_cost")
-    if constraints.get("require_cost_for_profit", False) and cost is None:
-        issues.append("cost_missing_blocks_profit_recommendation")
+    if constraints.get("require_cost_for_profit", False) and str(candidate.get("objective", "profit")) == "profit":
+        cost_source = str((scenario or {}).get("cost_source") or (baseline or {}).get("cost_source") or (context or {}).get("cost_source") or "")
+        profit_reliable = (scenario or {}).get("profit_is_reliable")
+        if cost is None:
+            issues.append("cost_missing_blocks_profit_recommendation")
+        if bool((scenario or {}).get("cost_proxied") or (baseline or {}).get("cost_proxied") or (scenario or {}).get("cost_is_proxy") or (baseline or {}).get("cost_is_proxy")):
+            issues.append("require_cost_for_profit_proxy_cost")
+        if cost_source and cost_source != "provided":
+            issues.append("require_cost_for_profit_non_provided_cost")
+        if profit_reliable is False:
+            issues.append("require_cost_for_profit_unreliable_profit")
+    min_uplift = constraints.get("min_expected_profit_uplift_pct")
+    if candidate.get("action_type") != "baseline" and min_uplift is not None and eff.get("profit_delta_pct", 0.0) < safe_float(min_uplift, 0.0):
+        issues.append("min_expected_profit_uplift_pct")
     return issues
 
 def _freight_candidate(
@@ -253,6 +279,11 @@ def generate_decision_candidates(trained_bundle: dict, current_context: dict | N
     out: List[dict] = []
     out.append(_candidate("baseline_current", "baseline", "Текущий вариант", "baseline", current_price, current_price, objective, {"manual_price": current_price, "discount_multiplier": 1.0, "demand_multiplier": 1.0, "freight_multiplier": 1.0, "factor_overrides": dict(factor_overrides), "overrides": {"discount": current_discount, "promotion": current_promo, "freight_value": current_freight}}, {"horizon_days": horizon_days, "support_zone": "baseline"}))
 
+    price_supported = False
+    discount_supported = False
+    promotion_supported = False
+    freight_supported = False
+
     if current_price > 0 and "price_change" in allowed:
         price_series = _numeric_column(daily, "price")
         hard_min = max(0.01, current_price * 0.5)
@@ -282,21 +313,37 @@ def generate_decision_candidates(trained_bundle: dict, current_context: dict | N
             if target > 0 and not (hist_min <= target <= hist_max):
                 out.append(_price_candidate(current_price, float(target), objective, current_discount, current_promo, current_freight, horizon_days, "generated", "near_range", factor_overrides=factor_overrides))
 
+    price_supported = price_supported or any(c.get("action_type") == "price_change" for c in out)
+
     if "discount_change" in allowed:
         values = {0.0, current_discount, 0.05, 0.10, 0.15, 0.20}
         disc_series = _numeric_column(daily, "discount")
         if disc_series is not None and len(disc_series) >= 5:
+            discount_supported = int(disc_series.dropna().round(4).nunique()) >= 3 and float(disc_series.max() - disc_series.min()) > 0.01
             for q in (0.25, 0.50, 0.75):
                 values.add(float(disc_series.quantile(q)))
+        else:
+            discount_supported = False
         for target in sorted(clamp(v, 0.0, 0.95) for v in values):
-            out.append(_candidate(f"discount_abs_{target:.4f}", "discount_change", f"Скидка {target:.0%}", "generated", current_discount, target, objective, {"manual_price": current_price, "freight_multiplier": 1.0, "discount_multiplier": 1.0, "demand_multiplier": 1.0, "factor_overrides": dict(factor_overrides), "overrides": {"discount": target, "promotion": current_promo, "freight_value": current_freight}}, {"horizon_days": horizon_days, "support_zone": "safe"}))
+            out.append(_candidate(
+                f"discount_abs_{target:.4f}",
+                "discount_change",
+                f"Скидка {target:.0%}",
+                "generated" if discount_supported else "unsupported_hypothesis",
+                current_discount,
+                target,
+                objective,
+                {"manual_price": current_price, "freight_multiplier": 1.0, "discount_multiplier": 1.0, "demand_multiplier": 1.0, "factor_overrides": dict(factor_overrides), "overrides": {"discount": target, "promotion": current_promo, "freight_value": current_freight}},
+                _support_metadata(horizon_days, discount_supported, "factor_support_missing:discount"),
+            ))
 
     promo_series = _numeric_column(daily, "promotion")
     has_promo_support = False
     if promo_series is not None and len(promo_series) >= 10:
         positive = int((promo_series > 0).sum()); zero = int((promo_series <= 0).sum())
         has_promo_support = positive >= 5 and zero >= 5
-    if has_promo_support and "promotion_change" in allowed:
+    promotion_supported = bool(has_promo_support and "promotion_change" in allowed)
+    if promotion_supported:
         for target in [0.0, current_promo, 1.0]:
             out.append(_candidate(f"promotion_{target:.0f}", "promotion_change", f"Промо {target:.0%}", "generated", current_promo, target, objective, {"manual_price": current_price, "freight_multiplier": 1.0, "discount_multiplier": 1.0, "demand_multiplier": 1.0, "factor_overrides": dict(factor_overrides), "overrides": {"discount": current_discount, "promotion": target, "freight_value": current_freight}}, {"horizon_days": horizon_days, "support_zone": "safe"}))
 
@@ -311,44 +358,56 @@ def generate_decision_candidates(trained_bundle: dict, current_context: dict | N
         }
 
         if freight_series is not None and len(freight_series.dropna()) >= 5:
+            freight_supported = int(freight_series.dropna().round(4).nunique()) >= 3
             for q in (0.10, 0.25, 0.50, 0.75, 0.90):
                 values.add(float(freight_series.quantile(q)))
+        else:
+            freight_supported = False
 
         for target in sorted(v for v in values if v >= 0):
-            out.append(
-                _freight_candidate(
-                    current_price=current_price,
-                    current_discount=current_discount,
-                    current_promo=current_promo,
-                    current_freight=current_freight,
-                    target_freight=float(target),
-                    objective=objective,
-                    horizon_days=horizon_days,
-                    source="generated",
-                    support_zone="safe",
-                    factor_overrides=factor_overrides,
-                )
+            cand = _freight_candidate(
+                current_price=current_price,
+                current_discount=current_discount,
+                current_promo=current_promo,
+                current_freight=current_freight,
+                target_freight=float(target),
+                objective=objective,
+                horizon_days=horizon_days,
+                source="generated" if freight_supported else "unsupported_hypothesis",
+                support_zone="safe" if freight_supported else "unsupported_hypothesis",
+                factor_overrides=factor_overrides,
             )
+            if not freight_supported:
+                meta = dict(cand.get("metadata") or {})
+                meta.update(_support_metadata(horizon_days, False, "factor_support_missing:freight_value"))
+                cand["metadata"] = meta
+            out.append(cand)
 
     if "demand_shock" in allowed:
         for mult in [0.95, 1.0, 1.05, 1.10]:
             out.append(_candidate(f"demand_{mult:.2f}x", "demand_shock", f"Гипотеза спроса {mult:.0%}", "generated", 1.0, mult, objective, {"manual_price": current_price, "freight_multiplier": 1.0, "discount_multiplier": 1.0, "demand_multiplier": mult, "factor_overrides": dict(factor_overrides), "overrides": {"discount": current_discount, "promotion": current_promo, "freight_value": current_freight}}, {"horizon_days": horizon_days, "manual_hypothesis": True, "external_evidence": False}))
 
-    if any(a in allowed for a in ["price_change", "discount_change", "promotion_change", "freight_change"]):
-        price_targets = [current_price * 0.95, current_price * 1.05]
-        discount_targets = [clamp(current_discount + 0.05, 0.0, 0.95), clamp(current_discount - 0.05, 0.0, 0.95)]
-        promo_targets = [1.0 if current_promo < 0.5 else 0.0]
-        freight_targets = [max(0.0, current_freight * 0.95)]
-        combos = [
+    price_targets = [current_price * 0.95, current_price * 1.05]
+    discount_targets = [clamp(current_discount + 0.05, 0.0, 0.95), clamp(current_discount - 0.05, 0.0, 0.95)]
+    promo_targets = [1.0 if current_promo < 0.5 else 0.0]
+    freight_targets = [max(0.0, current_freight * 0.95)]
+    combos = []
+    if price_supported and promotion_supported:
+        combos.extend([
             (price_targets[0], current_discount, promo_targets[0], current_freight, "Цена + промо"),
             (price_targets[1], current_discount, promo_targets[0], current_freight, "Цена + промо"),
+        ])
+    if price_supported and discount_supported:
+        combos.extend([
             (price_targets[0], discount_targets[0], current_promo, current_freight, "Цена + скидка"),
             (price_targets[1], discount_targets[1], current_promo, current_freight, "Цена + скидка"),
-            (price_targets[0], current_discount, current_promo, freight_targets[0], "Цена + логистика"),
-            (current_price, discount_targets[0], promo_targets[0], current_freight, "Скидка + промо"),
-        ]
-        for idx, (p_t, d_t, promo_t, freight_t, title) in enumerate(combos[:10]):
-            out.append(_combined_candidate(f"combined_{idx}", title, current_price, p_t, current_discount, d_t, current_promo, promo_t, current_freight, freight_t, objective, horizon_days, factor_overrides=factor_overrides))
+        ])
+    if price_supported and freight_supported:
+        combos.append((price_targets[0], current_discount, current_promo, freight_targets[0], "Цена + логистика"))
+    if discount_supported and promotion_supported:
+        combos.append((current_price, discount_targets[0], promo_targets[0], current_freight, "Скидка + промо"))
+    for idx, (p_t, d_t, promo_t, freight_t, title) in enumerate(combos[:10]):
+        out.append(_combined_candidate(f"combined_{idx}", title, current_price, p_t, current_discount, d_t, current_promo, promo_t, current_freight, freight_t, objective, horizon_days, factor_overrides=factor_overrides))
     for c in out:
         meta = dict(c.get("metadata") or {})
         meta.update(_model_metadata(trained_bundle, str(c.get("action_type", ""))))
@@ -408,6 +467,31 @@ def _failed_candidate_evaluation(candidate: dict, baseline_result: dict, exc: Ex
     }
 
 
+
+
+def _apply_model_quality_gate(rel: dict, trained_bundle: dict, results: dict) -> dict:
+    gate = dict((trained_bundle or {}).get("model_quality_gate") or (results or {}).get("model_quality_gate") or {})
+    status = str(gate.get("status", "")).strip()
+    if not status:
+        return rel
+    out = dict(rel or {})
+    warnings = list(out.get("warnings", []) or [])
+    blockers = list(out.get("blockers", []) or [])
+    warnings.extend([f"Model quality gate: {w}" for w in gate.get("warnings", []) or []])
+    if status == "blocked":
+        out["decision_status"] = "not_recommended"
+        blockers.extend([f"Model quality gate: {b}" for b in gate.get("blockers", []) or ["blocked"]])
+    elif status == "experimental_only" and out.get("decision_status") in {"recommended", "test_recommended", "controlled_test_only"}:
+        out["decision_status"] = "experimental_only"
+        warnings.append("Model quality gate limits decision to experimental_only.")
+    elif status == "controlled_test_only" and out.get("decision_status") == "recommended":
+        out["decision_status"] = "test_recommended"
+        warnings.append("Model quality gate limits decision to controlled_test_only.")
+    out["model_quality_gate"] = gate
+    out["warnings"] = list(dict.fromkeys(str(x) for x in warnings if x))
+    out["blockers"] = list(dict.fromkeys(str(x) for x in blockers if x))
+    return out
+
 def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates: list[dict], runner: Callable, scenario_calc_mode: str, price_guardrail_mode: str, horizon_days: int, objective: str, current_context: dict | None = None, constraints: dict | None = None) -> list[dict]:
     enriched_candidates = [
         _enrich_candidate_metadata(c, trained_bundle, scenario_calc_mode)
@@ -425,11 +509,13 @@ def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates
         try:
             scenario = baseline_result if cand.get("candidate_id") == baseline.get("candidate_id") else run_decision_candidate(trained_bundle, cand, runner, scenario_calc_mode, price_guardrail_mode, horizon_days)
             rel = evaluate_decision_reliability(results, trained_bundle, cand, scenario, baseline_result, objective=objective, price_guardrail_mode=price_guardrail_mode)
+            rel = _apply_model_quality_gate(rel, trained_bundle, results)
+            candidate_blockers = list(cand.get("blockers") or (cand.get("metadata") or {}).get("blockers") or [])
             constraint_issues = _violates_constraints(cand, scenario, baseline_result, constraints or (current_context or {}).get("constraints"), _base_ctx(trained_bundle, current_context))
-            if constraint_issues:
+            if candidate_blockers or constraint_issues:
                 rel = dict(rel)
                 rel["decision_status"] = "not_recommended"
-                rel["blockers"] = list(rel.get("blockers", [])) + [f"Business constraint violated: {x}" for x in constraint_issues]
+                rel["blockers"] = list(rel.get("blockers", [])) + [f"Candidate invalid: {x}" for x in candidate_blockers] + [f"Business constraint violated: {x}" for x in constraint_issues]
             eff = _effect(scenario, baseline_result)
             eff["conservative_profit_delta_pct"] = rel.get("economic_significance", {}).get("conservative_profit_delta_pct")
             evaluated.append({"candidate": cand, "scenario_result": scenario, "baseline_result": baseline_result, "expected_effect": eff, "reliability": rel, "economic_checks": rel.get("economic_significance", {}), "statistical_support": rel.get("statistical_support", {}), "validation_plan": {}, "status": rel.get("decision_status"), "warnings": rel.get("warnings", []), "blockers": rel.get("blockers", [])})
@@ -458,11 +544,13 @@ def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates
         try:
             scenario = run_decision_candidate(trained_bundle, cand, runner, scenario_calc_mode, price_guardrail_mode, horizon_days)
             rel = evaluate_decision_reliability(results, trained_bundle, cand, scenario, baseline_result, objective=objective, price_guardrail_mode=price_guardrail_mode)
+            rel = _apply_model_quality_gate(rel, trained_bundle, results)
+            candidate_blockers = list(cand.get("blockers") or (cand.get("metadata") or {}).get("blockers") or [])
             constraint_issues = _violates_constraints(cand, scenario, baseline_result, constraints or (current_context or {}).get("constraints"), _base_ctx(trained_bundle, current_context))
-            if constraint_issues:
+            if candidate_blockers or constraint_issues:
                 rel = dict(rel)
                 rel["decision_status"] = "not_recommended"
-                rel["blockers"] = list(rel.get("blockers", [])) + [f"Business constraint violated: {x}" for x in constraint_issues]
+                rel["blockers"] = list(rel.get("blockers", [])) + [f"Candidate invalid: {x}" for x in candidate_blockers] + [f"Business constraint violated: {x}" for x in constraint_issues]
             eff = _effect(scenario, baseline_result)
             eff["conservative_profit_delta_pct"] = rel.get("economic_significance", {}).get("conservative_profit_delta_pct")
             evaluated.append({"candidate": cand, "scenario_result": scenario, "baseline_result": baseline_result, "expected_effect": eff, "reliability": rel, "economic_checks": rel.get("economic_significance", {}), "statistical_support": rel.get("statistical_support", {}), "validation_plan": {}, "status": rel.get("decision_status"), "warnings": rel.get("warnings", []), "blockers": rel.get("blockers", [])})
