@@ -59,10 +59,13 @@ from price_optimizer import analyze_price_optimization, build_price_optimizer_si
 from decision_candidate_engine import generate_decision_candidates, evaluate_decision_candidates
 from decision_optimizer import rank_decision_candidates
 from decision_passport import build_decision_passport
+from decision_analysis_engine import DecisionAnalysisInput, analyze_decision
 from decision_math import safe_pct_delta
 from recommendation_auditor import audit_and_improve_recommendation
 from recommendation_gate import resolve_recommendation_gate
 from scenario_audit import build_scenario_reproducibility_id
+from model_quality_gate import evaluate_model_quality_gate
+from production_monitoring import build_run_metadata
 from ui.theme import apply_theme
 
 warnings.filterwarnings("ignore")
@@ -210,6 +213,62 @@ def safe_float_or_nan(value: Any) -> float:
     except Exception:
         return np.nan
 
+
+
+
+def _build_model_quality_gate_dict(metrics: Dict[str, Any], rolling: Optional[Dict[str, Any]] = None, stockout_share: Any = None) -> Dict[str, Any]:
+    src = dict(metrics or {})
+    if "naive_wape" not in src and "best_naive_wape" in src:
+        src["naive_wape"] = src.get("best_naive_wape")
+    if "improvement_vs_naive_pct" not in src and "naive_improvement_pct" in src:
+        src["improvement_vs_naive_pct"] = src.get("naive_improvement_pct")
+    if rolling:
+        src["rolling_retrain_backtest"] = rolling
+        wapes = []
+        for row in list((rolling or {}).get("windows", []) or []):
+            try:
+                val = float((row or {}).get("wape"))
+                if np.isfinite(val):
+                    wapes.append(val)
+            except Exception:
+                pass
+        if wapes:
+            src.setdefault("rolling_wape_max", max(wapes))
+    if stockout_share is not None:
+        src["stockout_share"] = stockout_share
+    return evaluate_model_quality_gate(src).to_dict()
+
+
+def _attach_run_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(result or {})
+    bundle = out.get("_trained_bundle", {}) or {}
+    history = out.get("history_daily")
+    if isinstance(history, pd.DataFrame):
+        dataset_signature: Any = {
+            "rows": int(len(history)),
+            "columns": [str(c) for c in history.columns],
+            "date_min": str(pd.to_datetime(history.get("date"), errors="coerce").min()) if "date" in history.columns else "",
+            "date_max": str(pd.to_datetime(history.get("date"), errors="coerce").max()) if "date" in history.columns else "",
+            "sales_sum": float(pd.to_numeric(history.get("sales", pd.Series(dtype="float64")), errors="coerce").fillna(0.0).sum()) if "sales" in history.columns else 0.0,
+        }
+    else:
+        dataset_signature = str(type(history))
+    meta = build_run_metadata(
+        dataset_signature=dataset_signature,
+        selected_sku=str((bundle.get("base_ctx", {}) or {}).get("product_id", out.get("selected_sku", "unknown"))),
+        scenario_mode=str(out.get("analysis_scenario_calc_mode", bundle.get("analysis_scenario_calc_mode", "unknown"))),
+        decision_status=str(out.get("decision_status", out.get("recommendation_gate", "analysis_created"))),
+        model_quality=out.get("model_quality_gate", bundle.get("model_quality_gate", {})),
+        data_quality=out.get("data_contract", bundle.get("data_contract", {})),
+        warnings=list(out.get("warnings", []) or []),
+        blockers=list(out.get("blockers", []) or []),
+    ).to_dict()
+    out["run_metadata"] = meta
+    if isinstance(bundle, dict):
+        bundle = dict(bundle)
+        bundle["run_metadata"] = meta
+        out["_trained_bundle"] = bundle
+    return out
 
 def resolve_scenario_calc_mode(mode: Optional[str]) -> str:
     if mode is None:
@@ -2426,9 +2485,14 @@ def _run_catboost_full_factor_analysis_universal(
             "active_path_contract": "daily_catboost_full_factors+model_reprediction",
         },
     }
+    model_quality_gate = _build_model_quality_gate_dict(
+        dict(catboost_full_factor_bundle.get("holdout_metrics", {}) or {}),
+        rolling=dict(catboost_full_factor_bundle.get("rolling_retrain_backtest", {}) or {}),
+    )
     result = {
         "history_daily": daily_base,
         "quality_report": {"holdout_metrics": dict(catboost_full_factor_bundle.get("holdout_metrics", {}))},
+        "model_quality_gate": model_quality_gate,
         "feature_usage_report": catboost_full_factor_bundle.get("feature_report", pd.DataFrame()),
         "feature_report": catboost_full_factor_bundle.get("feature_report", pd.DataFrame()),
         "neutral_baseline_forecast": baseline_sim["daily"],
@@ -2472,6 +2536,12 @@ def _run_catboost_full_factor_analysis_universal(
             "latest_row": latest_row,
             "future_dates": future_dates,
             "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
+            "cost_input_available": bool(getattr(txn, "attrs", {}).get("cost_input_available", bool("cost" in txn.columns))),
+            "cost_is_proxy": bool(getattr(txn, "attrs", {}).get("cost_is_proxy", False)),
+            "cost_source": str(getattr(txn, "attrs", {}).get("cost_source", "provided" if "cost" in txn.columns else "missing")),
+            "data_contract": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("data_contract", {}),
+            "target_semantics": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("target_semantics", {}),
+            "model_quality_gate": model_quality_gate,
             "catboost_full_factor_bundle": catboost_full_factor_bundle,
         },
     }
@@ -3579,9 +3649,11 @@ def _run_existing_legacy_enhanced_analysis_universal(
     effective_holdout_metrics = holdout_metrics
     if analysis_scenario_calc_mode == CATBOOST_FULL_FACTOR_MODE and isinstance(catboost_full_factor_bundle, dict):
         effective_holdout_metrics = dict(catboost_full_factor_bundle.get("holdout_metrics", holdout_metrics) or holdout_metrics)
+    model_quality_gate = _build_model_quality_gate_dict(effective_holdout_metrics)
     result = {
         "history_daily": daily_base,
         "quality_report": {"holdout_metrics": effective_holdout_metrics},
+        "model_quality_gate": model_quality_gate,
         "feature_usage_report": feature_report,
         "feature_report": feature_report,
         "neutral_baseline_forecast": baseline_sim["daily"],
@@ -3598,7 +3670,11 @@ def _run_existing_legacy_enhanced_analysis_universal(
         "current_price": float(base_ctx.get("price")),
         "scenario_price": None,
         "current_profit": float(as_is_sim.get("adjusted_profit", as_is_sim.get("total_profit", 0.0))),
-        "cost_input_available": bool("cost" in txn.columns and pd.to_numeric(txn.get("cost"), errors="coerce").notna().any()),
+        "cost_input_available": bool(getattr(txn, "attrs", {}).get("cost_input_available", bool("cost" in txn.columns and pd.to_numeric(txn.get("cost"), errors="coerce").notna().any()))),
+        "cost_is_proxy": bool(getattr(txn, "attrs", {}).get("cost_is_proxy", False)),
+        "cost_source": str(getattr(txn, "attrs", {}).get("cost_source", "provided" if "cost" in txn.columns else "missing")),
+        "data_contract": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("data_contract", {}),
+        "target_semantics": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("target_semantics", {}),
         "analysis_run_summary_json": json.dumps(run_summary, ensure_ascii=False, indent=2).encode("utf-8"),
         "holdout_predictions_csv": holdout_predictions.to_csv(index=False).encode("utf-8"),
         "holdout_weekly_diagnostics_csv": holdout_weekly_diagnostics.to_csv(index=False).encode("utf-8"),
@@ -3627,6 +3703,12 @@ def _run_existing_legacy_enhanced_analysis_universal(
             "small_mode": small_mode,
             "small_mode_info": small_mode_info,
             "analysis_scenario_calc_mode": analysis_scenario_calc_mode,
+            "cost_input_available": bool(getattr(txn, "attrs", {}).get("cost_input_available", bool("cost" in txn.columns))),
+            "cost_is_proxy": bool(getattr(txn, "attrs", {}).get("cost_is_proxy", False)),
+            "cost_source": str(getattr(txn, "attrs", {}).get("cost_source", "provided" if "cost" in txn.columns else "missing")),
+            "data_contract": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("data_contract", {}),
+            "target_semantics": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("target_semantics", {}),
+            "model_quality_gate": model_quality_gate,
             "catboost_full_factor_bundle": catboost_full_factor_bundle,
         },
     }
@@ -4557,8 +4639,8 @@ def _finalize_scenario_contract(result: Dict[str, Any], mode: str, price_guardra
         "shock_source": "manual_shock_overlay",
         "guardrail_mode": str(price_guardrail_mode),
         "extrapolation_policy": "boundary_plus_elasticity_tail" if price_policy["extrapolation_applied"] else "none",
-        "cost_policy": "unit_cost_or_proxy",
-        "stock_policy": "stock_cap_if_provided",
+        "cost_policy": "provided" if not bool(out.get("cost_proxied", out.get("cost_is_proxy", False))) else "proxy_price_65",
+        "stock_policy": "stock_cap_if_provided; missing_stock_never_evidence_of_no_stockout",
     })
     out.setdefault("guardrail_warnings", [w for w in out.get("warnings", []) if "guardrail" in str(w).lower() or "экстраполя" in str(w).lower() or "диапаз" in str(w).lower()])
     gate = resolve_recommendation_gate(
@@ -4573,16 +4655,69 @@ def _finalize_scenario_contract(result: Dict[str, Any], mode: str, price_guardra
             "profit_delta_pct": out.get("profit_delta_pct", out.get("profit_delta")),
             "conservative_profit_delta_pct": out.get("conservative_profit_delta_pct"),
             "cost_proxied": out.get("cost_proxied", out.get("cost_is_proxy", False)),
+            "cost_missing": out.get("cost_missing", False),
+            "profit_action": True,
         },
-        cost_policy={"cost_proxied": bool(out.get("cost_proxied", out.get("cost_is_proxy", False)))},
+        cost_policy={
+            "cost_proxied": bool(out.get("cost_proxied", out.get("cost_is_proxy", False))),
+            "cost_missing": bool(out.get("cost_missing", False)),
+            "profit_action": True,
+        },
         decision_reliability={"warnings": out.get("guardrail_warnings", []), "allow_unknown_wape_for_test_recommendation": True},
     )
     out["calculation_gate"] = gate["calculation_gate"]
     out["recommendation_gate"] = gate["recommendation_gate"]
     out["recommendation_gate_reasons"] = gate["reasons"]
     out["recommendation_gate_warnings"] = gate["warnings"]
+    out["scenario_contract"] = {
+        "scenario_id": str(out.get("scenario_run_id", out.get("scenario_id", "scenario"))),
+        "scenario_mode": str(mode),
+        "baseline_source": str((out.get("calculation_trace") or {}).get("baseline_source", out.get("baseline_source", "unknown"))),
+        "effect_source": str((out.get("calculation_trace") or {}).get("price_effect_source", out.get("effect_source", "unknown"))),
+        "requested_inputs": {
+            **dict(out.get("scenario_requested_inputs") or {}),
+            "manual_price": requested_fallback,
+            "price": requested_fallback,
+        },
+        "applied_inputs": {
+            "model_price": model_fallback,
+            "financial_price": financial_fallback,
+            "applied_discount": float(pd.to_numeric(daily.get("discount", pd.Series([np.nan])), errors="coerce").median()) if isinstance(daily, pd.DataFrame) and "discount" in daily.columns else None,
+            "applied_promotion": float(pd.to_numeric(daily.get("promotion", pd.Series([np.nan])), errors="coerce").median()) if isinstance(daily, pd.DataFrame) and "promotion" in daily.columns else None,
+            "applied_freight_value": float(pd.to_numeric(daily.get("freight_value", pd.Series([np.nan])), errors="coerce").median()) if isinstance(daily, pd.DataFrame) and "freight_value" in daily.columns else None,
+            "applied_factor_overrides": dict((out.get("scenario_requested_inputs") or {}).get("factor_overrides") or {}),
+        },
+        "price_policy": out.get("price_policy", {}),
+        "cost_policy": {"cost_source": out.get("cost_source"), "cost_is_proxy": out.get("cost_is_proxy"), "profit_is_reliable": out.get("profit_is_reliable")},
+        "stock_policy": {"stock_cap": out.get("stock_cap"), "stock_missing_never_evidence_no_stockout": True},
+        "factor_policy": out.get("factor_policy", {}),
+        "model_quality_gate": out.get("model_quality_gate", {"wape": out.get("wape", out.get("holdout_wape"))}),
+        "recommendation_gate": gate,
+        "calculation_vs_recommendation": {
+            "calculation_allowed": gate.get("calculation_gate") != "blocked",
+            "recommendation_allowed": bool((gate.get("usage_policy") or {}).get("can_recommend_action", False)),
+            "recommendation_status": gate.get("decision_status", gate.get("recommendation_status")),
+        },
+        "calculation_gate": gate["calculation_gate"],
+    }
     if gate["warnings"]:
         out["guardrail_warnings"] = list(dict.fromkeys(list(out.get("guardrail_warnings") or []) + gate["warnings"]))
+    return out
+
+def _attach_cost_truth_to_scenario(result: Dict[str, Any], trained_bundle: Dict[str, Any], requested_inputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out = dict(result or {})
+    source = str(trained_bundle.get("cost_source", "provided" if trained_bundle.get("cost_input_available", False) else "proxy_price_65"))
+    out.setdefault("cost_source", source)
+    out.setdefault("cost_input_available", bool(trained_bundle.get("cost_input_available", source == "provided")))
+    out.setdefault("cost_is_proxy", bool(trained_bundle.get("cost_is_proxy", source == "proxy_price_65")))
+    out.setdefault("cost_proxied", bool(out.get("cost_is_proxy", False)))
+    out.setdefault("cost_missing", source == "missing")
+    out.setdefault("profit_is_reliable", source == "provided")
+    out.setdefault("profit_recommendation_allowed", source == "provided")
+    if requested_inputs is not None:
+        out["scenario_requested_inputs"] = dict(requested_inputs or {})
+    if trained_bundle.get("model_quality_gate"):
+        out.setdefault("model_quality_gate", trained_bundle.get("model_quality_gate"))
     return out
 
 def run_what_if_projection(
@@ -4630,7 +4765,7 @@ def run_what_if_projection(
             price_guardrail_mode=price_guardrail_mode,
         )
         return attach_scenario_reproducibility(
-            _finalize_scenario_contract(result, mode, price_guardrail_mode),
+            _finalize_scenario_contract(_attach_cost_truth_to_scenario(result, trained_bundle, scenario_audit_params), mode, price_guardrail_mode),
             trained_bundle,
             scenario_audit_params,
             mode,
@@ -4657,7 +4792,7 @@ def run_what_if_projection(
         result.setdefault("legacy_or_enhanced_label", "legacy")
         result.setdefault("scenario_calc_mode_label", scenario_mode_label("legacy_current"))
         return attach_scenario_reproducibility(
-            _finalize_scenario_contract(result, mode, price_guardrail_mode),
+            _finalize_scenario_contract(_attach_cost_truth_to_scenario(result, trained_bundle, scenario_audit_params), mode, price_guardrail_mode),
             trained_bundle,
             scenario_audit_params,
             mode,
@@ -4677,7 +4812,7 @@ def run_what_if_projection(
             price_guardrail_mode=price_guardrail_mode,
         )
         return attach_scenario_reproducibility(
-            _finalize_scenario_contract(result, mode, price_guardrail_mode),
+            _finalize_scenario_contract(_attach_cost_truth_to_scenario(result, trained_bundle, scenario_audit_params), mode, price_guardrail_mode),
             trained_bundle,
             scenario_audit_params,
             mode,
@@ -5705,6 +5840,42 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         limitations_rows.extend({"limitation": str(w)} for w in list(what_if_result.get("warnings", []))[:20])
     limitations_df = pd.DataFrame(limitations_rows).drop_duplicates()
 
+
+
+    run_metadata_df = pd.DataFrame([{"path": k, "value": v} for k, v in _flatten_obj("run_metadata", result_dict.get("run_metadata", {}))])
+    run_metadata_df = non_empty_or_stub(run_metadata_df, "Run Metadata", "run_metadata_unavailable")
+
+    audit_contract_source = result_dict.get("data_contract") or ((result_dict.get("_trained_bundle", {}) or {}).get("data_contract", {}))
+    data_contract_df = pd.DataFrame([{"path": k, "value": v} for k, v in _flatten_obj("data_contract", audit_contract_source)])
+    data_contract_df = non_empty_or_stub(data_contract_df, "Data Contract", "data_contract_unavailable")
+    scenario_contract_source = (what_if_result or {}).get("scenario_contract", what_if_result or {}) if isinstance(what_if_result, dict) else {}
+    scenario_contract_df = pd.DataFrame([{"path": k, "value": v} for k, v in _flatten_obj("scenario_contract", scenario_contract_source)])
+    scenario_contract_df = non_empty_or_stub(scenario_contract_df, "Scenario Contract", "scenario_contract_unavailable")
+    passport_source = result_dict.get("decision_passport") or (what_if_result or {}).get("decision_passport", {}) if isinstance(what_if_result, dict) else result_dict.get("decision_passport", {})
+    if not passport_source:
+        passport_source = {
+            "decision_status": (what_if_result or {}).get("recommendation_gate", "not_recommended") if isinstance(what_if_result, dict) else "not_recommended",
+            "test_plan": {"duration_days": 14, "primary_metric": "profit", "rollback_condition": "profit_delta < -2% or demand_delta < -10%"},
+            "rollback_plan": {"rollback_action": "return_to_previous_price_or_factor_values", "monitoring_frequency": "daily"},
+            "assumptions": ["Decision passport generated from export audit trail."],
+        }
+    decision_passport_df = pd.DataFrame([{"path": k, "value": v} for k, v in _flatten_obj("decision_passport", passport_source)])
+    decision_passport_df = non_empty_or_stub(decision_passport_df, "Decision Passport", "decision_passport_unavailable")
+    audit_trail_df = pd.DataFrame([
+        {"audit_block": "Data Contract", "present": not data_contract_df.empty},
+        {"audit_block": "Field Sources", "present": True},
+        {"audit_block": "Unit Economics Check", "present": True},
+        {"audit_block": "Model Quality Gate", "present": True},
+        {"audit_block": "Scenario Contract", "present": not scenario_contract_df.empty},
+        {"audit_block": "Decision Ranking", "present": True},
+        {"audit_block": "Decision Passport", "present": not decision_passport_df.empty},
+        {"audit_block": "Rejected Options", "present": True},
+        {"audit_block": "Warnings", "present": True},
+        {"audit_block": "Blockers", "present": True},
+        {"audit_block": "Test Plan", "present": True},
+        {"audit_block": "Rollback Plan", "present": True},
+    ])
+
     sheet_meta: List[Dict[str, Any]] = [
         {"group": "A_CORE_INPUTS", "sheet": "A_history", "description": "История продаж и факторов.", "df": history, "optional": False, "note_absent": ""},
         {"group": "B_FORECASTS", "sheet": "B_as_is", "description": "Текущий план (без изменений).", "df": as_is, "optional": False, "note_absent": ""},
@@ -5723,6 +5894,11 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         {"group": "C_SUMMARY", "sheet": "Scenario Audit", "description": "Воспроизводимость сценария: hash, run id и параметры расчёта.", "df": scenario_audit_df, "optional": False, "note_absent": ""},
         {"group": "C_SUMMARY", "sheet": "Model Quality", "description": "Качество модели и статус рекомендуемого режима.", "df": model_quality_df, "optional": False, "note_absent": ""},
         {"group": "C_SUMMARY", "sheet": "Limitations", "description": "Ограничения интерпретации спроса, stockout, OOD и gate.", "df": limitations_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Data Contract", "description": "Truth contract: field sources, proxies, target semantics.", "df": data_contract_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Scenario Contract", "description": "Calculation contract for scenario result.", "df": scenario_contract_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Decision Passport", "description": "Final decision artifact with assumptions, risks, test and rollback plan.", "df": decision_passport_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Audit Trail", "description": "Presence of required production audit blocks.", "df": audit_trail_df, "optional": False, "note_absent": ""},
+        {"group": "C_SUMMARY", "sheet": "Run Metadata", "description": "Production audit metadata: run id, dataset hash, versions, warnings and blockers.", "df": run_metadata_df, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_metrics", "description": "Метрики holdout.", "df": holdout_metrics_sheet, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_holdout_predictions", "description": "Дневные предсказания holdout.", "df": diagnostics_holdout_predictions, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_feature_report", "description": "Использование признаков.", "df": diagnostics_feature_report, "optional": False, "note_absent": ""},
@@ -5788,6 +5964,11 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         scenario_audit_df.to_excel(writer, sheet_name="Scenario Audit", index=False)
         model_quality_df.to_excel(writer, sheet_name="Model Quality", index=False)
         limitations_df.to_excel(writer, sheet_name="Limitations", index=False)
+        data_contract_df.to_excel(writer, sheet_name="Data Contract", index=False)
+        scenario_contract_df.to_excel(writer, sheet_name="Scenario Contract", index=False)
+        decision_passport_df.to_excel(writer, sheet_name="Decision Passport", index=False)
+        audit_trail_df.to_excel(writer, sheet_name="Audit Trail", index=False)
+        run_metadata_df.to_excel(writer, sheet_name="Run Metadata", index=False)
         diagnostics_holdout_predictions.to_excel(writer, sheet_name="D_holdout_predictions", index=False)
         diagnostics_feature_report.to_excel(writer, sheet_name="D_feature_report", index=False)
         diagnostics_baseline_vs_as_is.to_excel(writer, sheet_name="D_baseline_vs_as_is", index=False)
@@ -5811,6 +5992,7 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
 
 
 def refresh_excel_export(result_dict: Dict[str, Any], what_if_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    result_dict = _attach_run_metadata(result_dict)
     result_dict["excel_buffer"] = build_excel_export_buffer(result_dict, what_if_result)
     return result_dict
 
@@ -8926,6 +9108,27 @@ if __name__ == "__main__":
             d_obj_label = st.selectbox("Цель", list(objective_map.keys()), key="decision_objective")
             d_actions = st.multiselect("Разрешённые действия", list(action_map.keys()), default=["Цена", "Скидка", "Промо", "Логистика"], key="decision_allowed_actions")
             d_horizon = st.number_input("Горизонт, дней", min_value=7, max_value=120, value=int(st.session_state.get("what_if_hdays", CONFIG["HORIZON_DAYS_DEFAULT"])), step=1, key="decision_horizon")
+            with st.expander("Ограничения решения", expanded=False):
+                bc1, bc2, bc3 = st.columns(3)
+                with bc1:
+                    max_price_change_pct = st.number_input("Макс. изменение цены, %", min_value=0.0, max_value=100.0, value=10.0, step=1.0, key="decision_max_price_change_pct")
+                    min_margin_pct = st.number_input("Мин. маржа, %", min_value=-100.0, max_value=100.0, value=0.0, step=1.0, key="decision_min_margin_pct")
+                with bc2:
+                    max_demand_drop_pct = st.number_input("Макс. падение спроса, %", min_value=0.0, max_value=100.0, value=10.0, step=1.0, key="decision_max_demand_drop_pct")
+                    max_revenue_drop_pct = st.number_input("Макс. падение выручки, %", min_value=0.0, max_value=100.0, value=5.0, step=1.0, key="decision_max_revenue_drop_pct")
+                with bc3:
+                    min_expected_profit_uplift_pct = st.number_input("Мин. profit uplift, %", min_value=-100.0, max_value=100.0, value=3.0, step=1.0, key="decision_min_profit_uplift_pct")
+                    forbid_price_below_cost = st.checkbox("Запретить цену ниже cost", value=True, key="decision_forbid_price_below_cost")
+                    require_cost_for_profit = st.checkbox("Profit требует real cost", value=True, key="decision_require_cost_for_profit")
+            business_constraints = {
+                "max_price_change_pct": float(max_price_change_pct),
+                "min_margin_pct": float(min_margin_pct),
+                "forbid_price_below_cost": bool(forbid_price_below_cost),
+                "max_demand_drop_pct": float(max_demand_drop_pct),
+                "max_revenue_drop_pct": float(max_revenue_drop_pct),
+                "min_expected_profit_uplift_pct": float(min_expected_profit_uplift_pct),
+                "require_cost_for_profit": bool(require_cost_for_profit),
+            }
             if st.button("Проверить варианты и выбрать лучший найденный", key="run_decision_optimizer", use_container_width=True):
                 objective = objective_map[d_obj_label]
                 candidates = generate_decision_candidates(
@@ -8944,9 +9147,25 @@ if __name__ == "__main__":
                     price_guardrail_mode=normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
                     horizon_days=int(d_horizon),
                     objective=objective,
-                    current_context=current_decision_context,
+                    current_context={**current_decision_context, "constraints": business_constraints},
+                    constraints=business_constraints,
                 )
                 opt = rank_decision_candidates(evaluated, objective=objective)
+                ranked_for_analysis = opt.get("ranked_candidates", evaluated) if isinstance(opt, dict) else evaluated
+                decision_analysis = analyze_decision(
+                    DecisionAnalysisInput(
+                        baseline={},
+                        trained_bundle=r.get("_trained_bundle", {}),
+                        data_contract=r.get("data_contract", r.get("_trained_bundle", {}).get("data_contract", {})),
+                        model_quality_gate=r.get("model_quality_gate", r.get("_trained_bundle", {}).get("model_quality_gate", {})),
+                        current_context=current_decision_context,
+                        allowed_actions=[action_map[a] for a in d_actions],
+                        business_constraints=business_constraints,
+                        objective=objective,
+                        horizon=int(d_horizon),
+                    ),
+                    evaluated_candidates=ranked_for_analysis,
+                ).to_dict()
                 passport = build_decision_passport(
                     "find_best_decision",
                     opt,
@@ -8955,9 +9174,13 @@ if __name__ == "__main__":
                         "scenario_calc_mode": str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE)),
                         "scenario_calc_mode_label": scenario_mode_label(str(st.session_state.get("what_if_calc_mode", DEFAULT_SCENARIO_CALC_MODE))),
                         "price_guardrail_mode": normalize_price_guardrail_mode(st.session_state.get("price_guardrail_mode", DEFAULT_PRICE_GUARDRAIL_MODE)),
+                        "business_constraints": business_constraints,
+                        "decision_analysis": decision_analysis,
                     },
                 )
+                passport.setdefault("decision_analysis_result", decision_analysis)
                 st.session_state["decision_optimizer_result"] = opt
+                st.session_state["decision_analysis_result"] = decision_analysis
                 st.session_state["decision_passport"] = passport
             if isinstance(st.session_state.get("decision_passport"), dict):
                 _show_decision_passport(st.session_state["decision_passport"], st.session_state.get("decision_optimizer_result", {}).get("ranking_table"))

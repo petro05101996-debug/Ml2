@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 
 from data_schema import canonical_alias_map, canonical_field_registry, canonical_required_fields
+from data_contracts import build_field_contracts, censoring_risk, infer_stockout_share, TargetSemantics
+from unit_economics import normalize_discount_rate, reconcile_price_revenue_quantity
 
 
 def _norm_col(c: str) -> str:
@@ -37,8 +39,14 @@ def apply_mapping(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.Dat
 
 
 def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    input_columns = [str(c) for c in df.columns]
     out = apply_mapping(df, mapping)
-    quality: Dict[str, Any] = {"warnings": [], "errors": []}
+    field_contracts = build_field_contracts(mapping, input_columns)
+    quality: Dict[str, Any] = {"warnings": [], "errors": [], "blockers": []}
+    ambiguous_sales = "sales" in {_norm_col(c) for c in input_columns} and mapping.get("quantity") is None and mapping.get("revenue") is None
+    if ambiguous_sales:
+        quality["warnings"].append("Поле sales неоднозначно: оно может означать quantity или revenue; требуется подтверждение mapping для production-анализa")
+        quality["blockers"].append("ambiguous_sales_mapping_requires_confirmation")
 
     required = canonical_required_fields()
     missing_required = [c for c in required if c not in out.columns]
@@ -49,30 +57,111 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out = out.dropna(subset=["date"]).copy()
 
-    for c in ["price", "quantity", "revenue", "cost", "discount", "freight_value", "stock", "promotion", "rating", "reviews_count"]:
+    for c in ["price", "quantity", "revenue", "cost", "discount", "discount_pct", "discount_amount", "discount_value", "freight_value", "stock", "promotion", "rating", "reviews_count"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
+    source_contract: Dict[str, str] = {}
+    cost_input_available = bool(mapping.get("cost") is not None and mapping.get("cost") in input_columns and "cost" in out.columns)
+    discount_source_col = _norm_col(mapping.get("discount") or "")
+    discount_semantic = "discount_rate"
+    if discount_source_col in {"discount_amount", "discount_value"} or discount_source_col.endswith("_amount") or discount_source_col.endswith("_value"):
+        discount_semantic = "discount_amount"
+    elif discount_source_col in {"discount_pct", "promo_rate", "discount_percent", "percent_discount"}:
+        discount_semantic = "discount_pct"
+
     if "quantity" not in out.columns:
-        out["quantity"] = 1.0
-        quality["warnings"].append("quantity не найдено — использовано значение 1 для каждой записи")
+        if "revenue" in out.columns and "price" in out.columns:
+            if "discount" in out.columns:
+                tmp_discount = [normalize_discount_rate(v, price=p, semantic=discount_semantic) for v, p in zip(out["discount"], out["price"])]
+            elif "discount_pct" in out.columns:
+                tmp_discount = out["discount_pct"].apply(lambda v: normalize_discount_rate(v, semantic="discount_pct"))
+            elif "discount_amount" in out.columns or "discount_value" in out.columns:
+                amount_col = "discount_amount" if "discount_amount" in out.columns else "discount_value"
+                tmp_discount = [normalize_discount_rate(v, price=p, semantic="discount_amount") for v, p in zip(out[amount_col], out["price"])]
+            else:
+                tmp_discount = 0.0
+            net_price = pd.to_numeric(out["price"], errors="coerce") * (1.0 - pd.Series(tmp_discount, index=out.index, dtype="float64"))
+            inferred_qty = (pd.to_numeric(out["revenue"], errors="coerce") / net_price.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+            if inferred_qty.notna().any():
+                out["quantity"] = inferred_qty.fillna(0.0).clip(lower=0.0)
+                source_contract["quantity_source"] = "inferred_revenue_div_net_price"
+                field_contracts["quantity"].source = "inferred"
+                field_contracts["quantity"].confidence = "medium"
+                quality["warnings"].append("quantity не найдено — выведено как revenue / net_price")
+            else:
+                out["quantity"] = 1.0
+                source_contract["quantity_source"] = "default_1_blocked"
+                field_contracts["quantity"].source = "default"
+                field_contracts["quantity"].warnings.append("quantity defaulted to 1; production decisions blocked")
+                quality["warnings"].append("quantity не найдено и не может быть выведено из revenue/price — production-рекомендации заблокированы")
+                quality["blockers"].append("quantity_missing_not_inferable")
+        else:
+            out["quantity"] = 1.0
+            source_contract["quantity_source"] = "default_1_blocked"
+            field_contracts["quantity"].source = "default"
+            field_contracts["quantity"].warnings.append("quantity defaulted to 1; production decisions blocked")
+            quality["warnings"].append("quantity не найдено — использовано значение 1 только для чернового расчёта; production-рекомендации заблокированы")
+            quality["blockers"].append("quantity_missing_not_inferable")
+    else:
+        source_contract["quantity_source"] = "provided"
+
+    if "discount" not in out.columns:
+        if "discount_pct" in out.columns:
+            out["discount"] = out["discount_pct"].apply(lambda v: normalize_discount_rate(v, semantic="discount_pct"))
+            source_contract["discount_source"] = "provided_pct_normalized"
+        elif "discount_amount" in out.columns or "discount_value" in out.columns:
+            amount_col = "discount_amount" if "discount_amount" in out.columns else "discount_value"
+            out["discount"] = [normalize_discount_rate(v, price=p, semantic="discount_amount") for v, p in zip(out[amount_col], out["price"])]
+            source_contract["discount_source"] = f"provided_{amount_col}_normalized"
+        else:
+            out["discount"] = 0.0
+            source_contract["discount_source"] = "default_zero"
+            field_contracts["discount"].source = "default"
+    else:
+        out["discount"] = [normalize_discount_rate(v, price=p, semantic=discount_semantic) for v, p in zip(out["discount"], out["price"])]
+        source_contract["discount_source"] = f"provided_{discount_semantic}_normalized"
 
     if "revenue" not in out.columns:
-        out["revenue"] = out["price"].fillna(0.0) * out["quantity"].fillna(0.0)
-        quality["warnings"].append("revenue не найдено — рассчитано как price * quantity")
+        out["revenue"] = out["price"].fillna(0.0) * (1.0 - out["discount"].fillna(0.0)) * out["quantity"].fillna(0.0)
+        source_contract["revenue_source"] = "calculated_price_x_quantity_net_discount"
+        field_contracts["revenue"].source = "inferred"
+        quality["warnings"].append("revenue не найдено — рассчитано как price * (1 - discount) * quantity")
+    else:
+        source_contract["revenue_source"] = "provided"
 
     if "cost" not in out.columns:
         out["cost"] = out["price"].fillna(0.0) * 0.65
-        quality["warnings"].append("cost не найдено — использован proxy: 65% от цены")
+        source_contract["cost_source"] = "proxy_price_65"
+        field_contracts["cost"].source = "proxy"
+        field_contracts["cost"].confidence = "low"
+        field_contracts["cost"].warnings.append("cost proxied as 65% of price")
+        quality["warnings"].append("cost не найдено — использован proxy: 65% от цены; profit-рекомендации не являются production")
+    else:
+        source_contract["cost_source"] = "provided" if cost_input_available else "inferred"
 
     if "freight_value" not in out.columns:
         out["freight_value"] = 0.0
+        source_contract["freight_source"] = "default_zero"
+        field_contracts["freight_value"].source = "default"
+    else:
+        source_contract["freight_source"] = "provided"
+    if "stock" not in out.columns:
+        source_contract["stock_source"] = "missing_assumed_unlimited"
+        field_contracts["stock"].source = "missing"
+        field_contracts["stock"].warnings.append("stock missing; absence of stockout is not evidenced")
+    else:
+        source_contract["stock_source"] = "provided"
+
     out, unit_warnings, unit_stats = _normalize_unit_economics(out)
     quality["warnings"].extend(unit_warnings)
     quality["unit_economics"] = unit_stats
-
-    if "discount" not in out.columns:
-        out["discount"] = 0.0
+    quality["source_contract"] = source_contract
+    quality["cost_input_available"] = bool(cost_input_available)
+    quality["cost_is_proxy"] = source_contract.get("cost_source") == "proxy_price_65"
+    quality["cost_source"] = source_contract.get("cost_source", "missing")
+    quality["profit_is_reliable"] = source_contract.get("cost_source") == "provided"
+    quality["profit_recommendation_allowed"] = source_contract.get("cost_source") == "provided"
 
     if "category" not in out.columns:
         out["category"] = "unknown"
@@ -83,7 +172,46 @@ def normalize_transactions(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) 
     checks = run_data_quality_checks(out)
     quality["warnings"].extend(checks.get("warnings", []))
     quality["stats"] = checks.get("stats", {})
+    # Price / revenue / quantity / discount reconciliation guards against gross/net confusion and double-discounting.
+    rec_checks = [reconcile_price_revenue_quantity(p, r, q, d) for p, r, q, d in zip(out["price"], out["revenue"], out["quantity"], out["discount"])]
+    finite_diffs = [x["diff_pct"] for x in rec_checks if x.get("diff_pct") is not None]
+    high_mismatch = any(x.get("status") == "blocked" for x in rec_checks)
+    warn_mismatch = any(x.get("status") == "warning" for x in rec_checks)
+    quality["unit_economics"]["price_revenue_quantity_reconciliation"] = {
+        "status": "blocked" if high_mismatch else "warning" if warn_mismatch else "ok",
+        "median_diff_pct": float(np.nanmedian(finite_diffs)) if finite_diffs else None,
+    }
+    if high_mismatch:
+        quality["blockers"].append("price_revenue_quantity_discount_mismatch_gt_15pct")
+        quality["warnings"].append("price/revenue/quantity/discount mismatch >15%: profit recommendation blocked")
+    elif warn_mismatch:
+        quality["warnings"].append("price/revenue/quantity/discount mismatch 5–15%: decision limited to controlled test")
+
+    stock_present = source_contract.get("stock_source") == "provided"
+    stockout_share = infer_stockout_share(stock_present, out.get("stock"), out.get("quantity"))
+    target = TargetSemantics(
+        observed_sales=True,
+        clean_demand=bool(stock_present and (stockout_share is not None) and stockout_share <= 0.05),
+        stock_observed=stock_present,
+        stockout_share=stockout_share,
+        demand_censoring_risk=censoring_risk(stock_present, stockout_share),
+    )
+    quality["target_semantics"] = target.to_dict()
+    quality["field_contracts"] = {k: v.to_dict() for k, v in field_contracts.items()}
+    quality["data_contract"] = {
+        "fields": quality["field_contracts"],
+        "source_contract": source_contract,
+        "target_semantics": quality["target_semantics"],
+        "input_grain": "unknown",
+        "missing_dates_policy": "unknown",
+        "warnings": quality["warnings"],
+        "blockers": quality["blockers"],
+    }
     quality["feature_eligibility"] = build_feature_eligibility_report(out)
+    out.attrs["data_quality_contract"] = quality
+    out.attrs["cost_input_available"] = quality["cost_input_available"]
+    out.attrs["cost_is_proxy"] = quality["cost_is_proxy"]
+    out.attrs["cost_source"] = quality["cost_source"]
     return out, quality
 
 

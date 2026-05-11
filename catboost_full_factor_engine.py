@@ -121,15 +121,31 @@ def _naive_holdout_benchmark(train_part: pd.DataFrame, holdout_part: pd.DataFram
 
 
 LEAKAGE_NAME_PATTERNS = (
-    "future_sales", "future_revenue", "future_profit", "sales_next",
-    "target", "revenue", "profit", "margin_after_fact", "actual_demand",
+    "sales", "revenue", "profit", "margin", "gmv", "turnover",
+    "target", "label", "forecast", "prediction", "actual", "future",
+    "next", "after", "post", "realized", "demand_actual", "orders",
+    "quantity", "units_sold", "future_sales", "future_revenue",
+    "future_profit", "sales_next", "actual_demand",
     "realized_after_scenario", "post_fact_stock",
 )
+
+SAFE_TARGET_DERIVED_FEATURES = {
+    "sales_lag_1",
+    "sales_lag_7",
+    "sales_lag_14",
+    "sales_lag_28",
+    "sales_roll_7",
+    "sales_roll_14",
+    "sales_roll_28",
+    "sales_ewm_14",
+}
 
 
 def _feature_leakage_reason(column: Any) -> str:
     name = str(column).lower().replace("factor__", "", 1)
     compact = name.replace(" ", "_").replace("-", "_")
+    if compact in SAFE_TARGET_DERIVED_FEATURES:
+        return ""
     if compact in LEAKAGE_NAME_PATTERNS or any(pattern in compact for pattern in LEAKAGE_NAME_PATTERNS):
         return "target_leakage_risk"
     return ""
@@ -308,12 +324,13 @@ CORE_FACTOR_COLUMNS = [
     "discount",
     "net_unit_price",
     "freight_value",
-    "cost",
     "promotion",
     "review_score",
     "reviews_count",
-    "stock",
 ]
+
+ECONOMICS_ONLY_COLUMNS = {"cost", "profit", "margin", "revenue"}
+CONSTRAINT_ONLY_COLUMNS = {"stock"}
 
 
 CALENDAR_FEATURES = [
@@ -390,6 +407,21 @@ def _prepare_base_columns(daily: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = np.nan
 
+    # Technical economics/availability columns are needed for projections and reports,
+    # but must stay out of demand-model features via _infer_feature_columns().
+    if "cost" not in out.columns:
+        out["cost"] = np.nan
+    if "stock" not in out.columns:
+        out["stock"] = np.inf
+    if "freight_value" not in out.columns:
+        out["freight_value"] = 0.0
+    if "revenue" not in out.columns:
+        if "sales" not in out.columns:
+            out["sales"] = 0.0
+        price_for_revenue = pd.to_numeric(out.get("price", 0.0), errors="coerce").fillna(0.0)
+        sales_for_revenue = pd.to_numeric(out.get("sales", 0.0), errors="coerce").fillna(0.0)
+        out["revenue"] = price_for_revenue * sales_for_revenue
+
     out["price"] = _ffill_no_future_numeric(out["price"], 1.0).clip(lower=0.01)
     out["discount"] = _ffill_no_future_numeric(out["discount"], 0.0).clip(0.0, 0.95)
     out["net_unit_price"] = _safe_numeric(out["net_unit_price"], np.nan)
@@ -445,6 +477,20 @@ def _infer_feature_columns(frame: pd.DataFrame) -> Tuple[List[str], List[str], p
 
     for col in frame.columns:
         if col in protected:
+            continue
+        if col in ECONOMICS_ONLY_COLUMNS or col in CONSTRAINT_ONLY_COLUMNS:
+            report_rows.append({
+                "feature": col,
+                "raw_column": str(col),
+                "source": "economics_only" if col in ECONOMICS_ONLY_COLUMNS else "constraint_only",
+                "dtype": "numeric",
+                "role": "economics_only" if col in ECONOMICS_ONLY_COLUMNS else "availability_constraint",
+                "used_in_active_model": False,
+                "reason": "excluded_by_feature_registry",
+                "missing_share": float(frame[col].isna().mean()) if len(frame) else 1.0,
+                "unique_count": int(frame[col].nunique(dropna=True)) if len(frame) else 0,
+                "std": float(pd.to_numeric(frame[col], errors="coerce").std(ddof=0)) if len(frame) else float("nan"),
+            })
             continue
 
         if col in CORE_FACTOR_COLUMNS or col in CALENDAR_FEATURES or col in LAG_FEATURES or str(col).startswith("factor__"):

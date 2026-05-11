@@ -148,7 +148,45 @@ def _factor_support(candidate: Dict[str, Any], df: pd.DataFrame, scenario_result
         return 85.0, {"action_type": action}, [], []
     if len(df) == 0:
         return 0.0, {"action_type": action}, ["Нет истории для оценки поддержки фактора."], ["Нет исторической поддержки сценария."]
-    if action in {"price_change", "combined_change"}:
+    if action == "combined_change":
+        params = dict(candidate.get("scenario_params") or {})
+        overrides = dict(params.get("overrides") or {})
+        combined_meta = dict((candidate.get("metadata") or {}).get("combined_actions") or {})
+        components: List[Tuple[str, Dict[str, Any]]] = []
+        if abs(safe_float(combined_meta.get("price_change_pct"), 0.0)) > 1e-9:
+            price_target = finite_or_none(params.get("manual_price"))
+            pct = safe_float(combined_meta.get("price_change_pct"), 0.0)
+            price_current = price_target / (1.0 + pct / 100.0) if price_target is not None and abs(1.0 + pct / 100.0) > 1e-9 else None
+            components.append(("price", {**candidate, "action_type": "price_change", "current_value": price_current, "target_value": price_target}))
+        if abs(safe_float(combined_meta.get("discount_delta_pp"), 0.0)) > 1e-9:
+            target = finite_or_none(overrides.get("discount"))
+            current = target - safe_float(combined_meta.get("discount_delta_pp"), 0.0) / 100.0 if target is not None else None
+            components.append(("discount", {**candidate, "action_type": "discount_change", "current_value": current, "target_value": target}))
+        if abs(safe_float(combined_meta.get("promotion_delta_pp"), 0.0)) > 1e-9:
+            target = finite_or_none(overrides.get("promotion"))
+            current = target - safe_float(combined_meta.get("promotion_delta_pp"), 0.0) / 100.0 if target is not None else None
+            components.append(("promotion", {**candidate, "action_type": "promotion_change", "current_value": current, "target_value": target}))
+        if abs(safe_float(combined_meta.get("freight_change_pct"), 0.0)) > 1e-9:
+            target = finite_or_none(overrides.get("freight_value"))
+            pct = safe_float(combined_meta.get("freight_change_pct"), 0.0)
+            current = target / (1.0 + pct / 100.0) if target is not None and abs(1.0 + pct / 100.0) > 1e-9 else None
+            components.append(("freight", {**candidate, "action_type": "freight_change", "current_value": current, "target_value": target}))
+        if not components:
+            return 45.0, {"action_type": action, "component_support": {}}, ["Combined scenario has no detectable changed factors."], blockers
+        scores: List[float] = []
+        component_details: Dict[str, Any] = {}
+        for name, sub_candidate in components:
+            comp_score, comp_detail, comp_warnings, comp_blockers = _factor_support(sub_candidate, df, scenario_result)
+            scores.append(comp_score)
+            component_details[name] = {"score": comp_score, **dict(comp_detail or {})}
+            warnings.extend([f"{name}: {w}" for w in comp_warnings])
+            blockers.extend([f"{name}: {b}" for b in comp_blockers])
+            if comp_score < 50:
+                warnings.append(f"{name}: weak historical support in combined scenario.")
+        final_score = min(scores) if scores else 45.0
+        return score_0_100(final_score), {"action_type": action, "component_support": component_details, "changed_factor_count": len(components)}, warnings, blockers
+
+    if action == "price_change":
         price = _series(df, "price")
         uniq = int(price.dropna().round(4).nunique())
         mean = abs(float(price.dropna().mean())) if len(price.dropna()) else 0.0
