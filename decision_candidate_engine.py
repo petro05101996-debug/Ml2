@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from decision_math import clamp, finite_or_none, safe_float, safe_pct_delta
@@ -418,7 +419,11 @@ def generate_decision_candidates(trained_bundle: dict, current_context: dict | N
 def run_decision_candidate(trained_bundle: dict, candidate: dict, runner: Callable, scenario_calc_mode: str, price_guardrail_mode: str, horizon_days: int) -> dict:
     params = dict(candidate.get("scenario_params") or {})
     overrides = dict(params.get("overrides") or {})
-    runner_bundle = copy.deepcopy(trained_bundle)
+    runner_bundle = dict(trained_bundle)
+    if isinstance(runner_bundle.get("base_ctx"), dict):
+        runner_bundle["base_ctx"] = dict(runner_bundle["base_ctx"])
+    if isinstance(runner_bundle.get("latest_row"), dict):
+        runner_bundle["latest_row"] = dict(runner_bundle["latest_row"])
     result = runner(
         runner_bundle,
         manual_price=safe_float(params.get("manual_price", candidate.get("target_value")), 0.0),
@@ -492,11 +497,27 @@ def _apply_model_quality_gate(rel: dict, trained_bundle: dict, results: dict) ->
     out["blockers"] = list(dict.fromkeys(str(x) for x in blockers if x))
     return out
 
-def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates: list[dict], runner: Callable, scenario_calc_mode: str, price_guardrail_mode: str, horizon_days: int, objective: str, current_context: dict | None = None, constraints: dict | None = None) -> list[dict]:
+def evaluate_decision_candidates(
+    results: dict,
+    trained_bundle: dict,
+    candidates: list[dict],
+    runner: Callable,
+    scenario_calc_mode: str,
+    price_guardrail_mode: str,
+    horizon_days: int,
+    objective: str,
+    current_context: dict | None = None,
+    constraints: dict | None = None,
+    max_candidates: int = 24,
+    max_refinements: int = 12,
+    timeout_sec: float = 20.0,
+) -> list[dict]:
+    deadline = time.monotonic() + float(timeout_sec)
     enriched_candidates = [
         _enrich_candidate_metadata(c, trained_bundle, scenario_calc_mode)
         for c in (candidates or [])
     ]
+    enriched_candidates = enriched_candidates[:int(max_candidates)]
     baseline = next((c for c in enriched_candidates if c.get("action_type") == "baseline"), enriched_candidates[0] if enriched_candidates else None)
     if baseline is None:
         return []
@@ -505,7 +526,28 @@ def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates
     except Exception as exc:
         return [_failed_candidate_evaluation(c, {}, exc) for c in enriched_candidates]
     evaluated: List[dict] = []
+
+    def _append_timeout_cutoff() -> None:
+        evaluated.append({
+            "candidate": {"candidate_id": "timeout_cutoff", "action_type": "technical"},
+            "scenario_result": {},
+            "baseline_result": baseline_result,
+            "expected_effect": {},
+            "reliability": {
+                "score": 0,
+                "risk_level": "high",
+                "decision_status": "not_recommended",
+                "technical_error": True,
+            },
+            "status": "not_recommended",
+            "warnings": ["Decision candidate evaluation stopped by timeout."],
+            "blockers": ["decision_evaluation_timeout"],
+        })
+
     for cand in enriched_candidates:
+        if time.monotonic() > deadline:
+            _append_timeout_cutoff()
+            break
         try:
             scenario = baseline_result if cand.get("candidate_id") == baseline.get("candidate_id") else run_decision_candidate(trained_bundle, cand, runner, scenario_calc_mode, price_guardrail_mode, horizon_days)
             rel = evaluate_decision_reliability(results, trained_bundle, cand, scenario, baseline_result, objective=objective, price_guardrail_mode=price_guardrail_mode)
@@ -539,7 +581,10 @@ def evaluate_decision_candidates(results: dict, trained_bundle: dict, candidates
             if target > 0 and key not in existing:
                 existing.add(key)
                 refinements.append(_price_candidate(current_price, target, objective, current_discount, current_promo, safe_float(ctx.get("freight_value"), 0.0), horizon_days, "refined", "safe", factor_overrides=factor_overrides))
-    for cand in refinements:
+    for cand in refinements[:int(max_refinements)]:
+        if time.monotonic() > deadline:
+            _append_timeout_cutoff()
+            break
         cand = _enrich_candidate_metadata(cand, trained_bundle, scenario_calc_mode)
         try:
             scenario = run_decision_candidate(trained_bundle, cand, runner, scenario_calc_mode, price_guardrail_mode, horizon_days)

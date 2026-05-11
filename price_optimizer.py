@@ -176,6 +176,23 @@ def _classify_recommendation(current_row: Dict[str, Any], best_row: Dict[str, An
 
 
 def analyze_price_optimization(trained_bundle: Dict[str, Any], current_price: float, runner: Callable[..., Dict[str, Any]], horizon_days: int, scenario_calc_mode: str, price_guardrail_mode: str, overrides: Optional[Dict[str, Any]] = None, factor_overrides: Optional[Dict[str, Any]] = None, freight_multiplier: float = 1.0, demand_multiplier: float = 1.0, candidate_count: int = 25, search_pct: float = 0.20, min_confidence: float = 0.45, min_profit_uplift_pct: float = 3.0) -> Dict[str, Any]:
+    data_gate = trained_bundle.get("data_quality_gate", {}) or {}
+    usage = data_gate.get("usage_policy", {}) or {}
+
+    if data_gate.get("status") in {"blocked", "diagnostic_only"} or usage.get("can_recommend_action") is False:
+        return {
+            "status": PRICE_OPT_STATUS_RISKY_ONLY,
+            "decision_status": "not_recommended",
+            "current_price": float(current_price),
+            "recommended_price": None,
+            "recommendation_title": "Оптимизация цены заблокирована качеством данных",
+            "recommendation_text": "Расчёт цены нельзя использовать как рекомендацию: во входных данных есть блокирующие проблемы или недостаточная экономическая достоверность.",
+            "warnings": list(data_gate.get("warnings", []) or []) + list(data_gate.get("blockers", []) or []),
+            "candidates": pd.DataFrame(),
+            "grid_meta": {},
+            "recommendation_gate_details": data_gate,
+        }
+
     overrides = dict(overrides or {})
     factor_overrides = dict(factor_overrides or {})
     grid, grid_meta = build_price_candidate_grid(trained_bundle, float(current_price), int(candidate_count), float(search_pct))
@@ -236,6 +253,10 @@ def analyze_price_optimization(trained_bundle: Dict[str, Any], current_price: fl
         economic_significance={"profit_delta_pct": float(classification["profit_delta_pct"]), "profit_action": True, "cost_proxied": bool(best_row.get("cost_proxied", False)), "cost_missing": bool(best_row.get("cost_missing", False))},
         price_policy={"monotonicity_policy": monotonicity_policy},
         cost_policy={"cost_proxied": bool(best_row.get("cost_proxied", False)), "cost_missing": bool(best_row.get("cost_missing", False)), "profit_action": True},
+        data_quality={
+            **dict(data_gate or {}),
+            "data_contract": trained_bundle.get("data_contract", {}),
+        },
         decision_reliability={"status_namespace": "decision", "base_status": "recommended", "allow_unknown_wape_for_test_recommendation": True},
     )
     warnings = list(grid_meta.get("warnings", []))

@@ -88,6 +88,45 @@ def _data_quality(results: Dict[str, Any], trained_bundle: Dict[str, Any]) -> Tu
     if nonzero_days < 30:
         warnings.append("Мало дней с ненулевыми продажами: статистическая поддержка слабая.")
     flat_sales = cv < 0.03 or nonzero_days < 10
+    dq_gate = (
+        results.get("data_quality_gate")
+        or trained_bundle.get("data_quality_gate")
+        or {}
+    )
+
+    dq_contract = (
+        results.get("data_quality_contract")
+        or trained_bundle.get("data_quality_contract")
+        or results.get("data_contract")
+        or trained_bundle.get("data_contract")
+        or {}
+    )
+
+    hard_blockers = list(dq_gate.get("hard_blockers", []) or [])
+    blockers = list(dq_gate.get("blockers", []) or [])
+
+    if isinstance(dq_contract, dict):
+        blockers.extend(dq_contract.get("blockers", []) or [])
+
+    blockers = list(dict.fromkeys(str(x) for x in blockers if x))
+    hard_blockers = list(dict.fromkeys(str(x) for x in hard_blockers if x))
+
+    if blockers:
+        return (
+            0.0,
+            {
+                "history_days": history_days,
+                "nonzero_days": nonzero_days,
+                "missing_share": float(missing_share),
+                "sales_cv": cv,
+                "flat_sales": flat_sales,
+                "invalid_input": True,
+                "blockers": blockers,
+                "hard_blockers": hard_blockers,
+            },
+            ["Data quality blockers present: " + ", ".join(blockers[:5])],
+        )
+
     if flat_sales:
         warnings.append("История продаж почти плоская или почти вся нулевая: рекомендации нельзя считать устойчивыми.")
     if missing_share > 0.2:

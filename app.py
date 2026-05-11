@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import copy
 import gc
 import hashlib
 import json
 import logging
-import os
 import subprocess
 import warnings
 from io import BytesIO
@@ -63,22 +70,19 @@ from decision_analysis_engine import DecisionAnalysisInput, analyze_decision
 from decision_math import safe_pct_delta
 from recommendation_auditor import audit_and_improve_recommendation
 from recommendation_gate import resolve_recommendation_gate
+from production_contract import resolve_data_quality_gate
 from scenario_audit import build_scenario_reproducibility_id
 from model_quality_gate import evaluate_model_quality_gate
 from production_monitoring import build_run_metadata
 from ui.theme import apply_theme
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 ACTIONABLE_PRICE_OPT_STATUSES = {"price_increase_recommended", "price_decrease_recommended"}
 PRODUCTION_STABLE_ROLLING_VERDICTS = {"stable", "moderately_stable"}
 TEST_ONLY_ROLLING_VERDICTS = {"test_only_unstable", "unstable_test_only"}
 EXPERIMENTAL_ROLLING_VERDICTS = {"experimental_unstable", "unstable_experimental_only"}
-
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 
 np.random.seed(42)
 
@@ -2371,6 +2375,8 @@ def _run_catboost_full_factor_analysis_universal(
 ) -> Dict[str, Any]:
     analysis_scenario_calc_mode = CATBOOST_FULL_FACTOR_MODE
     txn = normalized_txn.copy()
+    dq_contract = getattr(txn, "attrs", {}).get("data_quality_contract", {}) or {}
+    data_quality_gate = resolve_data_quality_gate(dq_contract)
     if len(txn) == 0:
         raise ValueError("Пустой датасет после нормализации.")
     daily_base = build_daily_from_transactions(
@@ -2418,6 +2424,11 @@ def _run_catboost_full_factor_analysis_universal(
                     "Выбран CatBoost full factors, но модель не может быть обучена: "
                     f"{catboost_full_factor_bundle.get('reason', 'unknown')}."
                 ),
+                "data_quality_contract": dq_contract,
+                "data_quality_gate": data_quality_gate,
+                "data_contract": dq_contract.get("data_contract", {}),
+                "target_semantics": dq_contract.get("target_semantics", {}),
+                "blockers": list(data_quality_gate.get("blockers", []) or []),
                 "catboost_full_factor_report": catboost_full_factor_bundle.get("feature_report", pd.DataFrame()),
                 "catboost_full_factor_importances": pd.DataFrame(catboost_full_factor_bundle.get("feature_importances", [])),
                 "_trained_bundle": {
@@ -2427,6 +2438,10 @@ def _run_catboost_full_factor_analysis_universal(
                     "future_dates": future_dates,
                     "analysis_scenario_calc_mode": CATBOOST_FULL_FACTOR_MODE,
                     "catboost_full_factor_bundle": catboost_full_factor_bundle,
+                    "data_quality_contract": dq_contract,
+                    "data_quality_gate": data_quality_gate,
+                    "data_contract": dq_contract.get("data_contract", {}),
+                    "target_semantics": dq_contract.get("target_semantics", {}),
                 },
             }
         )
@@ -2514,6 +2529,11 @@ def _run_catboost_full_factor_analysis_universal(
         "current_price": float(base_ctx.get("price")),
         "scenario_price": None,
         "current_profit": float(as_is_sim.get("profit_total", 0.0)),
+        "data_quality_contract": dq_contract,
+        "data_quality_gate": data_quality_gate,
+        "data_contract": dq_contract.get("data_contract", {}),
+        "target_semantics": dq_contract.get("target_semantics", {}),
+        "blockers": list(data_quality_gate.get("blockers", []) or []),
         "analysis_run_summary_json": json.dumps(run_summary, ensure_ascii=False, indent=2).encode("utf-8"),
         "holdout_predictions_csv": catboost_full_factor_bundle.get("holdout_predictions", pd.DataFrame()).to_csv(index=False).encode("utf-8"),
         "analysis_baseline_vs_as_is_csv": pd.DataFrame(
@@ -2539,8 +2559,10 @@ def _run_catboost_full_factor_analysis_universal(
             "cost_input_available": bool(getattr(txn, "attrs", {}).get("cost_input_available", bool("cost" in txn.columns))),
             "cost_is_proxy": bool(getattr(txn, "attrs", {}).get("cost_is_proxy", False)),
             "cost_source": str(getattr(txn, "attrs", {}).get("cost_source", "provided" if "cost" in txn.columns else "missing")),
-            "data_contract": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("data_contract", {}),
-            "target_semantics": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("target_semantics", {}),
+            "data_quality_contract": dq_contract,
+            "data_quality_gate": data_quality_gate,
+            "data_contract": dq_contract.get("data_contract", {}),
+            "target_semantics": dq_contract.get("target_semantics", {}),
             "model_quality_gate": model_quality_gate,
             "catboost_full_factor_bundle": catboost_full_factor_bundle,
         },
@@ -2561,6 +2583,8 @@ def _run_existing_legacy_enhanced_analysis_universal(
     analysis_scenario_calc_mode = resolve_scenario_calc_mode(scenario_calc_mode)
     assert analysis_scenario_calc_mode in {"legacy_current", "enhanced_local_factors"}
     txn = normalized_txn.copy()
+    dq_contract = getattr(txn, "attrs", {}).get("data_quality_contract", {}) or {}
+    data_quality_gate = resolve_data_quality_gate(dq_contract)
     raw_columns = set(normalized_txn.columns.tolist())
     if len(txn) == 0:
         raise ValueError("Пустой датасет после нормализации.")
@@ -3673,8 +3697,11 @@ def _run_existing_legacy_enhanced_analysis_universal(
         "cost_input_available": bool(getattr(txn, "attrs", {}).get("cost_input_available", bool("cost" in txn.columns and pd.to_numeric(txn.get("cost"), errors="coerce").notna().any()))),
         "cost_is_proxy": bool(getattr(txn, "attrs", {}).get("cost_is_proxy", False)),
         "cost_source": str(getattr(txn, "attrs", {}).get("cost_source", "provided" if "cost" in txn.columns else "missing")),
-        "data_contract": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("data_contract", {}),
-        "target_semantics": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("target_semantics", {}),
+        "data_quality_contract": dq_contract,
+        "data_quality_gate": data_quality_gate,
+        "data_contract": dq_contract.get("data_contract", {}),
+        "target_semantics": dq_contract.get("target_semantics", {}),
+        "blockers": list(data_quality_gate.get("blockers", []) or []),
         "analysis_run_summary_json": json.dumps(run_summary, ensure_ascii=False, indent=2).encode("utf-8"),
         "holdout_predictions_csv": holdout_predictions.to_csv(index=False).encode("utf-8"),
         "holdout_weekly_diagnostics_csv": holdout_weekly_diagnostics.to_csv(index=False).encode("utf-8"),
@@ -3706,8 +3733,10 @@ def _run_existing_legacy_enhanced_analysis_universal(
             "cost_input_available": bool(getattr(txn, "attrs", {}).get("cost_input_available", bool("cost" in txn.columns))),
             "cost_is_proxy": bool(getattr(txn, "attrs", {}).get("cost_is_proxy", False)),
             "cost_source": str(getattr(txn, "attrs", {}).get("cost_source", "provided" if "cost" in txn.columns else "missing")),
-            "data_contract": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("data_contract", {}),
-            "target_semantics": getattr(txn, "attrs", {}).get("data_quality_contract", {}).get("target_semantics", {}),
+            "data_quality_contract": dq_contract,
+            "data_quality_gate": data_quality_gate,
+            "data_contract": dq_contract.get("data_contract", {}),
+            "target_semantics": dq_contract.get("target_semantics", {}),
             "model_quality_gate": model_quality_gate,
             "catboost_full_factor_bundle": catboost_full_factor_bundle,
         },
@@ -5908,12 +5937,12 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         {"group": "D_DIAGNOSTICS", "sheet": "D_run_summary", "description": "Сводный JSON прогона (flattened).", "df": diagnostics_run_summary, "optional": False, "note_absent": ""},
         {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_feature_report", "description": "Факторы CatBoost full factor mode.", "df": catboost_feature_report_sheet, "optional": True, "note_absent": "CatBoost full factor mode was not used"},
         {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_importances", "description": "Feature importance CatBoost full factor mode.", "df": catboost_importances_sheet, "optional": True, "note_absent": "CatBoost full factor mode was not used"},
-        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_feature_importance", "description": "Alias: Feature importance CatBoost full factor mode.", "df": catboost_importances_sheet, "optional": True, "note_absent": "CatBoost full factor mode was not used"},
-        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_holdout", "description": "Alias: Daily holdout predictions CatBoost.", "df": catboost_holdout_predictions_sheet, "optional": True, "note_absent": "CatBoost holdout predictions unavailable"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_feature_importance", "description": "Deprecated alias: Feature importance CatBoost full factor mode.", "df": catboost_importances_sheet, "optional": True, "note_absent": "CatBoost full factor mode was not used"},
         {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_holdout_predictions", "description": "Daily holdout predictions CatBoost.", "df": catboost_holdout_predictions_sheet, "optional": True, "note_absent": "CatBoost holdout predictions unavailable"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_holdout", "description": "Deprecated alias: Daily holdout predictions CatBoost.", "df": catboost_holdout_predictions_sheet, "optional": True, "note_absent": "CatBoost holdout predictions unavailable"},
         {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_factor_catalog", "description": "Каталог факторов CatBoost.", "df": catboost_factor_catalog_sheet, "optional": True, "note_absent": "CatBoost factor catalog unavailable"},
         {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_guardrails", "description": "Guardrails CatBoost факторов.", "df": catboost_guardrails_sheet, "optional": True, "note_absent": "CatBoost guardrails unavailable"},
-        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_scenario_overrides", "description": "Переопределения factor__* в сценарии.", "df": catboost_scenario_overrides_sheet, "optional": True, "note_absent": "No CatBoost factor overrides in scenario"},
+        {"group": "D_DIAGNOSTICS", "sheet": "D_catboost_scenario_overrides", "description": "Deprecated alias: переопределения factor__* в сценарии.", "df": catboost_scenario_overrides_sheet, "optional": True, "note_absent": "No CatBoost factor overrides in scenario"},
         {"group": "D_DIAGNOSTICS", "sheet": "D_what_if_applied_overrides", "description": "Все применённые overrides сценария.", "df": what_if_applied_overrides_sheet, "optional": True, "note_absent": "No scenario overrides were applied"},
         {"group": "E_METRICS", "sheet": "E_metrics_all", "description": "Все доступные метрики (flattened).", "df": metrics_all, "optional": False, "note_absent": ""},
     ]
@@ -5978,8 +6007,8 @@ def build_excel_export_buffer(result_dict: Dict[str, Any], what_if_result: Optio
         catboost_feature_report_sheet.to_excel(writer, sheet_name="D_catboost_feature_report", index=False)
         catboost_importances_sheet.to_excel(writer, sheet_name="D_catboost_importances", index=False)
         catboost_importances_sheet.to_excel(writer, sheet_name="D_catboost_feature_importance", index=False)
-        catboost_holdout_predictions_sheet.to_excel(writer, sheet_name="D_catboost_holdout", index=False)
         catboost_holdout_predictions_sheet.to_excel(writer, sheet_name="D_catboost_holdout_predictions", index=False)
+        catboost_holdout_predictions_sheet.to_excel(writer, sheet_name="D_catboost_holdout", index=False)
         catboost_factor_catalog_sheet.to_excel(writer, sheet_name="D_catboost_factor_catalog", index=False)
         catboost_guardrails_sheet.to_excel(writer, sheet_name="D_catboost_guardrails", index=False)
         catboost_scenario_overrides_sheet.to_excel(writer, sheet_name="D_catboost_scenario_overrides", index=False)
@@ -7743,6 +7772,7 @@ def render_upload_screen() -> dict[str, Any]:
         schema_valid = False
         schema_errors: list[str] = []
         universal_quality: dict[str, Any] = {}
+        data_gate: dict[str, Any] = resolve_data_quality_gate(universal_quality)
         raw_for_select = None
         universal_mapping: dict[str, Optional[str]] = {}
 
@@ -7771,25 +7801,38 @@ def render_upload_screen() -> dict[str, Any]:
                 schema_errors.append(f"Отсутствуют обязательные поля: {', '.join(missing_required)}")
             else:
                 universal_txn, universal_quality = normalize_transactions(preview, universal_mapping)
-                if universal_quality.get("errors"):
-                    schema_errors.extend(list(universal_quality["errors"]))
+                data_gate = resolve_data_quality_gate(universal_quality)
+                if data_gate["errors"]:
+                    schema_errors.extend(data_gate["errors"])
+                elif data_gate["status"] in {"blocked", "diagnostic_only"}:
+                    schema_valid = False
+                    for b in data_gate["hard_blockers"] or data_gate["blockers"]:
+                        st.error(f"Блокирующая проблема данных: {b}")
+                    render_help_callout(
+                        "Расчёт заблокирован",
+                        "Данные нельзя использовать для production-анализа, пока не исправлено сопоставление колонок или экономическая связка price/revenue/quantity/discount.",
+                        "danger",
+                    )
                 else:
                     schema_valid = True
                     raw_for_select = universal_txn.copy().rename(columns={"category": "product_category_name", "product_id": "product_id"})
                     st.success(f"✅ Данные готовы к расчёту: {len(universal_txn):,} строк после нормализации.")
                     quality_msgs = []
-                    coverage_days = int(universal_quality.get("coverage_days", 0))
+                    stats = universal_quality.get("stats", {}) or {}
+                    coverage_days = int(stats.get("history_days", 0))
+                    price_changes_count = int(stats.get("price_changes_count", 0))
+                    promo_share = float(stats.get("promo_share", 0.0))
                     quality_msgs.append("Данных достаточно для базового прогноза." if coverage_days >= 80 else "История короткая — результат интерпретируйте осторожно.")
-                    if int(universal_quality.get("price_changes_count", 0)) < 4:
+                    if price_changes_count < 4:
                         quality_msgs.append("История цены почти плоская — ценовые сценарии будут оцениваться осторожно.")
-                    if float(universal_quality.get("promo_share", 0.0)) < 0.05:
+                    if promo_share < 0.05:
                         quality_msgs.append("Промо в истории почти не менялось — промо-эффект может быть ограничен guardrails.")
                     quality_warnings = []
                     for qm in quality_msgs:
                         if "осторожно" in qm or "огранич" in qm:
                             quality_warnings.append(qm)
                         render_help_callout("Качество данных", qm, "warning" if ("осторожно" in qm or "огранич" in qm) else "info")
-                    for w in universal_quality.get("warnings", []):
+                    for w in data_gate.get("warnings", []):
                         quality_warnings.append(str(w))
                         render_help_callout("Предупреждение", str(w), "warning")
                     if schema_valid and not quality_warnings:
@@ -7844,7 +7887,8 @@ def render_upload_screen() -> dict[str, Any]:
             )
         if target_category and target_sku:
             st.info(f"Будет рассчитан SKU: **{target_sku}** в категории **{target_category}**.")
-        run_requested = st.button("Запустить анализ", type="primary", use_container_width=True)
+        can_run_calculation = bool(schema_valid and data_gate.get("usage_policy", {}).get("can_run_calculation"))
+        run_requested = st.button("Запустить анализ", type="primary", use_container_width=True, disabled=not can_run_calculation)
         close_surface()
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -7857,6 +7901,8 @@ def render_upload_screen() -> dict[str, Any]:
         "horizon_days": horizon_days,
         "analysis_calc_mode": analysis_calc_mode,
         "auto_price_optimizer": bool(auto_price_optimizer),
+        "data_quality_gate": data_gate,
+        "universal_quality": universal_quality,
     }
 
 
@@ -7984,7 +8030,7 @@ if __name__ == "__main__":
                             st.session_state.price_optimizer_result_base = {"status": "optimizer_error", "recommendation_title": "Оптимизатор цены не был рассчитан", "recommendation_text": f"Базовый анализ выполнен, но оптимизатор цены завершился ошибкой: {exc}", "warnings": [str(exc)], "candidates": pd.DataFrame()}
                             st.session_state.price_optimizer_signature_base = None
                             st.session_state.price_optimizer_context = "base"
-                    st.session_state.results = copy.deepcopy(results)
+                    st.session_state.results = dict(results)
                     st.session_state["what_if_calc_mode"] = str(results.get("analysis_scenario_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
                     st.session_state.selected_category_for_results = ctx["target_category"]
                     st.session_state.selected_sku_for_results = ctx["target_sku"]
@@ -9149,6 +9195,9 @@ if __name__ == "__main__":
                     objective=objective,
                     current_context={**current_decision_context, "constraints": business_constraints},
                     constraints=business_constraints,
+                    max_candidates=12 if str(st.session_state.get("what_if_calc_mode")) == CATBOOST_FULL_FACTOR_MODE else 24,
+                    max_refinements=4 if str(st.session_state.get("what_if_calc_mode")) == CATBOOST_FULL_FACTOR_MODE else 12,
+                    timeout_sec=25.0,
                 )
                 opt = rank_decision_candidates(evaluated, objective=objective)
                 ranked_for_analysis = opt.get("ranked_candidates", evaluated) if isinstance(opt, dict) else evaluated

@@ -287,12 +287,32 @@ def run_data_quality_checks(df: pd.DataFrame) -> Dict[str, Any]:
     if df["product_id"].nunique() < 2:
         issues["warnings"].append("Слишком мало SKU для надежного сравнения")
 
-    if "price" in df.columns and df["price"].notna().sum() > 10:
-        q1, q99 = df["price"].quantile([0.01, 0.99]).tolist()
-        outliers = int(((df["price"] < q1) | (df["price"] > q99)).sum())
-        issues["stats"]["price_outliers"] = outliers
-        if outliers / max(len(df), 1) > 0.03:
-            issues["warnings"].append("Много ценовых выбросов (>3%)")
+    if "price" in df.columns:
+        price = pd.to_numeric(df["price"], errors="coerce").dropna()
+        if len(price):
+            rounded_price = price.round(4)
+            issues["stats"]["unique_price_count"] = int(rounded_price.nunique())
+            issues["stats"]["price_changes_count"] = int(rounded_price.diff().abs().gt(1e-9).sum())
+            mean_price = float(price.mean())
+            issues["stats"]["rel_price_span"] = float((price.max() - price.min()) / max(abs(mean_price), 1e-9))
+        if df["price"].notna().sum() > 10:
+            q1, q99 = df["price"].quantile([0.01, 0.99]).tolist()
+            outliers = int(((df["price"] < q1) | (df["price"] > q99)).sum())
+            issues["stats"]["price_outliers"] = outliers
+            if outliers / max(len(df), 1) > 0.03:
+                issues["warnings"].append("Много ценовых выбросов (>3%)")
+
+    if "promotion" in df.columns:
+        promo = pd.to_numeric(df["promotion"], errors="coerce").fillna(0.0)
+        issues["stats"]["promo_share"] = float((promo > 0).mean()) if len(promo) else 0.0
+    else:
+        issues["stats"]["promo_share"] = 0.0
+
+    if issues["stats"].get("unique_price_count", 0) < 4:
+        issues["warnings"].append("Мало уникальных цен: price-рекомендации ограничены controlled test")
+
+    if issues["stats"].get("rel_price_span", 0.0) < 0.06:
+        issues["warnings"].append("Исторический диапазон цен слишком узкий: эластичность цены ненадёжна")
 
     return issues
 
