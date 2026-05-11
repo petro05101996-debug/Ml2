@@ -107,22 +107,48 @@ def render_object_header(
     return back_to_landing
 
 
-def render_action_row() -> str | None:
-    items = [
-        ("new", "✚", "Новый сценарий"),
-        ("reset_form", "⟲", "Сбросить форму"),
-        ("cancel_active", "⊘", "Отменить активный"),
-        ("compare", "⇄", "К сравнению"),
-        ("export", "⇩", "К отчёту и экспорту"),
+def render_workspace_guide(active_tab: str, has_applied_scenario: bool, has_saved_scenarios: bool, has_decision_analysis: bool = False) -> None:
+    steps = [
+        {"title": "Итог", "caption": "Базовый прогноз", "status": "active" if active_tab == "Итог" else "done"},
+        {"title": "Сценарий", "caption": "Проверка гипотезы", "status": "active" if active_tab == "Сценарий" else ("done" if has_applied_scenario else "pending")},
+        {"title": "Анализ решений", "caption": "Риски и пилот", "status": "active" if active_tab == "Анализ решений" else ("done" if has_decision_analysis else "pending")},
+        {"title": "Сравнение", "caption": "Выбор варианта", "status": "active" if active_tab == "Сравнение" else ("done" if has_saved_scenarios else "pending")},
+        {"title": "Отчёт", "caption": "Выгрузка", "status": "active" if active_tab == "Отчёт" else "pending"},
     ]
+    render_stepper(steps)
+
+
+def render_action_row(has_applied_scenario: bool = False, has_saved_scenarios: bool = False) -> str | None:
+    items = [
+        ("new", "Начать новый сценарий"),
+        ("reset_form", "Сбросить параметры"),
+        ("cancel_active", "Вернуться к базовому прогнозу"),
+        ("compare", "Сравнить варианты"),
+        ("export", "Открыть отчёт"),
+    ]
+    disabled_map = {
+        "cancel_active": not has_applied_scenario,
+        "compare": not (has_applied_scenario or has_saved_scenarios),
+        "export": False,
+        "new": False,
+        "reset_form": False,
+    }
     clicked: str | None = None
     cols = st.columns(5)
-    for i, (action_id, icon, label) in enumerate(items):
+    for i, (action_id, label) in enumerate(items):
         with cols[i]:
-            if st.button(f"{icon}\n{label}", key=f"act_{action_id}", use_container_width=True):
+            if st.button(label, key=f"act_{action_id}", use_container_width=True, disabled=disabled_map.get(action_id, False)):
                 clicked = action_id
     return clicked
 
+
+
+def render_product_empty_state(title: str, text: str, action_label: str | None = None) -> None:
+    open_surface(title)
+    st.markdown(f'<div class="muted">{_safe(text)}</div>', unsafe_allow_html=True)
+    if action_label:
+        st.caption(action_label)
+    close_surface()
 
 def render_tabs(active_tab: str, tabs: Sequence[str], key: str = "workspace_tab_radio") -> str:
     if key not in st.session_state or st.session_state.get(key) not in tabs:

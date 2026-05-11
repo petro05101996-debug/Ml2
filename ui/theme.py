@@ -147,6 +147,9 @@ html, body, .stApp, [class*="css"] { font-family: Inter, -apple-system, BlinkMac
 
 /* Tabs: text-only look with underline on active, like reference */
 [role="radiogroup"] {
+  overflow-x: auto !important;
+  white-space: nowrap !important;
+  flex-wrap: nowrap !important;
   background: transparent !important;
   border: none !important;
   padding: 0 !important;
@@ -260,6 +263,46 @@ html, body, .stApp, [class*="css"] { font-family: Inter, -apple-system, BlinkMac
 .help-callout.warning { border:1px solid rgba(231,183,104,0.35); background:rgba(231,183,104,0.10); color:var(--warning); }
 .help-callout.danger { border:1px solid rgba(230,124,124,0.35); background:rgba(230,124,124,0.10); color:var(--danger); }
 
+.decision-hero {
+  background: linear-gradient(160deg, rgba(111,112,255,0.16), rgba(35,49,66,0.96));
+  border: 1px solid rgba(168,156,255,0.28);
+  border-radius: var(--radius-card);
+  padding: 22px;
+  margin-bottom: 18px;
+}
+.decision-hero.success { border-color: rgba(122,208,169,0.42); }
+.decision-hero.warning { border-color: rgba(231,183,104,0.42); }
+.decision-hero.danger { border-color: rgba(230,124,124,0.42); }
+.decision-hero-title { font-size: 1.25rem; font-weight: 800; color: var(--text); margin-bottom: 8px; }
+.decision-hero-text { color: var(--text-secondary); line-height: 1.5; }
+.decision-section-grid, .decision-hero-grid, .decision-plan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit,minmax(220px,1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+.decision-section-card {
+  background: rgba(255,255,255,0.025);
+  border: 1px solid var(--subtle-border);
+  border-radius: 16px;
+  padding: 14px;
+}
+.decision-section-label { color: var(--text-secondary); font-size: .82rem; margin-bottom: 4px; }
+.decision-section-value { color: var(--text); font-weight: 700; }
+.decision-next-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit,minmax(180px,1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.decision-next-item {
+  border-radius: 14px;
+  background: rgba(255,255,255,0.025);
+  border: 1px solid var(--subtle-border);
+  padding: 12px;
+  color: var(--text-secondary);
+}
+
 @media (max-width: 900px) {
   .block-container { padding: 16px; }
   .top-header { margin: -16px -16px 16px; padding: 0 16px; height:80px; }
@@ -270,7 +313,11 @@ html, body, .stApp, [class*="css"] { font-family: Inter, -apple-system, BlinkMac
   .chip-a, .chip-b, .chip-c { position: static; margin-right:6px; }
   .hero-visual { min-height: auto; }
   .cta-float { position: static; display:inline-flex; margin:8px 4px 0; }
-  .scenario-grid, .result-kpi-grid, .kpi-row, .decision-grid, .stepper { grid-template-columns: 1fr !important; }
+  [role="radiogroup"] { display: flex !important; gap: 16px !important; padding-bottom: 8px !important; }
+  [role="radiogroup"] label { min-width: max-content !important; }
+  .object-row { align-items: flex-start; }
+  .obj-badge { width: 44px; height: 44px; font-size: 1rem; }
+  .scenario-grid, .result-kpi-grid, .kpi-row, .decision-grid, .stepper, .decision-hero-grid, .decision-plan-grid, .decision-next-grid { grid-template-columns: 1fr !important; }
   .scenario-card, .decision-card, .surface-card { padding:16px !important; }
   .top-header-right { display:none !important; }
 }
