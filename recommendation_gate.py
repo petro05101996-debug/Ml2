@@ -172,6 +172,22 @@ def resolve_recommendation_gate(
         severity = max(severity, 3)
         _push_unique(reasons, "blockers_present")
 
+    dq_blockers = []
+    for key in ("blockers", "hard_blockers"):
+        value = data_quality.get(key)
+        if isinstance(value, list):
+            dq_blockers.extend(str(x) for x in value if x)
+
+    nested_contract = data_quality.get("data_contract")
+    if isinstance(nested_contract, dict):
+        dq_blockers.extend(str(x) for x in nested_contract.get("blockers", []) or [])
+
+    if dq_blockers:
+        severity = max(severity, 3)
+        for b in dq_blockers:
+            _push_unique(blockers_out, f"Data quality blocker: {b}")
+        _push_unique(reasons, "data_quality_blockers_present")
+
     price_out_of_range = bool(price_policy.get("price_out_of_range") or price_policy.get("clip_applied"))
     extrapolation = bool(price_policy.get("extrapolation_applied"))
     elasticity_source = str(price_policy.get("elasticity_source") or "")

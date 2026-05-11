@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -16,6 +18,10 @@ except Exception:
     CatBoostRegressor = None
     USE_CATBOOST = False
 
+
+CATBOOST_MAIN_ITERATIONS = int(os.getenv("CATBOOST_MAIN_ITERATIONS", "300"))
+CATBOOST_ROLLING_ITERATIONS = int(os.getenv("CATBOOST_ROLLING_ITERATIONS", "150"))
+CATBOOST_MAX_ROLLING_WINDOWS = int(os.getenv("CATBOOST_MAX_ROLLING_WINDOWS", "2"))
 
 CATBOOST_FULL_FACTOR_MODE = "catboost_full_factors"
 PRICE_GUARDRAIL_SAFE_CLIP = "safe_clip"
@@ -197,7 +203,7 @@ def _rolling_catboost_retrain_backtest_summary(
     model_params: Dict[str, Any],
     min_train_days: int = 60,
     validation_days: int = 14,
-    max_windows: int = 4,
+    max_windows: int = CATBOOST_MAX_ROLLING_WINDOWS,
 ) -> Dict[str, Any]:
     if not USE_CATBOOST or CatBoostRegressor is None:
         return {"windows": [], "verdict": "catboost_unavailable", "method": "rolling_catboost_retrain"}
@@ -213,7 +219,7 @@ def _rolling_catboost_retrain_backtest_summary(
     cat_set = set(cat_feature_names)
     cat_indices = [feature_cols.index(c) for c in cat_feature_names if c in feature_cols]
     params = dict(model_params)
-    params["iterations"] = min(int(params.get("iterations", 300)), 250)
+    params["iterations"] = min(int(params.get("iterations", CATBOOST_ROLLING_ITERATIONS)), CATBOOST_ROLLING_ITERATIONS)
     for val_start in reversed(starts):
         train_slice = trainable.iloc[:val_start].copy()
         val_slice = trainable.iloc[val_start:val_start + validation_days].copy()
@@ -693,7 +699,7 @@ def train_catboost_full_factor_bundle(
     cat_indices = [feature_cols.index(c) for c in cat_feature_names if c in feature_cols]
 
     model_params = {
-        "iterations": 700,
+        "iterations": CATBOOST_MAIN_ITERATIONS,
         "learning_rate": 0.03,
         "depth": 5,
         "l2_leaf_reg": 8.0,
