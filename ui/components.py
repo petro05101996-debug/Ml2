@@ -68,8 +68,9 @@ def render_decision_summary_card(decision_label: str, tone: str, reason: str, me
     metric_html = "".join(
         [f'<div class="decision-metric"><div class="decision-metric-label">{_safe(m.get("label",""))}</div><div class="decision-metric-value">{_safe(m.get("value",""))}</div><div class="decision-metric-delta">{_safe(m.get("delta",""))}</div></div>' for m in metrics]
     )
+    next_step = "Запустить пилот" if str(tone) == "success" else ("Не запускать" if str(tone) == "danger" else "Проверить другой сценарий")
     st.markdown(
-        f'<div class="decision-card {tone}"><div class="decision-title">Решение: {_safe(decision_label)}</div><div class="decision-reason">{_safe(reason)}</div><div class="decision-grid">{metric_html}</div><div class="technical-muted">Экономика: {_safe(economy_label or "—")} · Надёжность: {_safe(reliability_label or "—")}</div></div>',
+        f'<div class="decision-hero {tone}"><div class="decision-hero-title">Вердикт: {_safe(decision_label)}</div><div class="decision-hero-text"><b>Почему:</b> {_safe(reason)}</div><div class="decision-grid">{metric_html}</div><div class="decision-section-grid"><div class="decision-section-card"><div class="decision-section-label">Надёжность</div><div class="decision-section-value">{_safe(reliability_label or "—")}</div></div><div class="decision-section-card"><div class="decision-section-label">Следующий шаг</div><div class="decision-section-value">{_safe(next_step)}</div></div></div><div class="technical-muted">Экономика: {_safe(economy_label or "—")}</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -87,7 +88,7 @@ def render_object_header(
     status_text: str,
     horizon_text: str,
     last_update: str,
-    status_color: str = "#7AD0A9",
+    status_color: str = "success",
 ) -> bool:
     back_to_landing = st.button("← Назад", key="back_to_landing", use_container_width=False)
     st.markdown(
@@ -97,7 +98,7 @@ def render_object_header(
     <div class="obj-badge">◉</div>
     <div>
       <div class="obj-title">{_safe(object_title)}</div>
-      <div class="obj-meta"><span style="color:{_safe(status_color)}">●</span> {_safe(status_text)} · {_safe(horizon_text)} · {_safe(last_update)}</div>
+      <div class="obj-meta"><span class="status-dot status-{_safe(status_color)}">●</span> {_safe(status_text)} · {_safe(horizon_text)} · {_safe(last_update)}</div>
     </div>
   </div>
 </div>
@@ -109,38 +110,91 @@ def render_object_header(
 
 def render_workspace_guide(active_tab: str, has_applied_scenario: bool, has_saved_scenarios: bool, has_decision_analysis: bool = False) -> None:
     steps = [
-        {"title": "Итог", "caption": "Базовый прогноз", "status": "active" if active_tab == "Итог" else "done"},
-        {"title": "Сценарий", "caption": "Проверка гипотезы", "status": "active" if active_tab == "Сценарий" else ("done" if has_applied_scenario else "pending")},
-        {"title": "Анализ решений", "caption": "Риски и пилот", "status": "active" if active_tab == "Анализ решений" else ("done" if has_decision_analysis else "pending")},
-        {"title": "Сравнение", "caption": "Выбор варианта", "status": "active" if active_tab == "Сравнение" else ("done" if has_saved_scenarios else "pending")},
-        {"title": "Отчёт", "caption": "Выгрузка", "status": "active" if active_tab == "Отчёт" else "pending"},
+        {"title": "Что у меня сейчас", "caption": "Текущий план", "status": "done"},
+        {"title": "Что хочу проверить", "caption": "Параметры сценария", "status": "active" if active_tab == "Проверить сценарий" else ("done" if has_applied_scenario else "pending")},
+        {"title": "Что получилось", "caption": "Главное", "status": "done" if has_applied_scenario else "pending"},
+        {"title": "Можно ли доверять", "caption": "Риски", "status": "done" if has_decision_analysis else "pending"},
+        {"title": "Что дальше", "caption": "Сравнение и отчёт", "status": "done" if has_saved_scenarios else "pending"},
     ]
     render_stepper(steps)
 
 
 def render_action_row(has_applied_scenario: bool = False, has_saved_scenarios: bool = False) -> str | None:
-    items = [
-        ("new", "Начать новый сценарий"),
-        ("reset_form", "Сбросить параметры"),
-        ("cancel_active", "Вернуться к базовому прогнозу"),
-        ("compare", "Сравнить варианты"),
-        ("export", "Открыть отчёт"),
-    ]
-    disabled_map = {
-        "cancel_active": not has_applied_scenario,
-        "compare": not (has_applied_scenario or has_saved_scenarios),
-        "export": False,
-        "new": False,
-        "reset_form": False,
-    }
     clicked: str | None = None
-    cols = st.columns(5)
-    for i, (action_id, label) in enumerate(items):
-        with cols[i]:
-            if st.button(label, key=f"act_{action_id}", use_container_width=True, disabled=disabled_map.get(action_id, False)):
-                clicked = action_id
+    primary_label = "Проверить сценарий"
+    cta_col, menu_col = st.columns([0.68, 0.32])
+    with cta_col:
+        if st.button(primary_label, key="act_primary_scenario", type="primary", use_container_width=True):
+            clicked = "scenario"
+    with menu_col:
+        popover = getattr(st, "popover", None)
+        if callable(popover):
+            with st.popover("Другие действия", use_container_width=True):
+                if st.button("Сбросить параметры", key="act_reset_form", use_container_width=True):
+                    clicked = "reset_form"
+                if st.button("Новый сценарий", key="act_new", use_container_width=True):
+                    clicked = "new"
+                if st.button("Вернуться к текущему плану", key="act_cancel_active", use_container_width=True, disabled=not has_applied_scenario):
+                    clicked = "cancel_active"
+                if not has_applied_scenario:
+                    st.caption("Недоступно: сценарий ещё не рассчитан.")
+                if st.button("Сравнить", key="act_compare", use_container_width=True, disabled=not (has_applied_scenario or has_saved_scenarios)):
+                    clicked = "compare"
+                if not (has_applied_scenario or has_saved_scenarios):
+                    st.caption("Недоступно: нет рассчитанных или сохранённых вариантов.")
+                if st.button("Отчёт", key="act_export", use_container_width=True):
+                    clicked = "export"
+        else:
+            with st.expander("Другие действия", expanded=False):
+                if st.button("Сбросить параметры", key="act_reset_form_fallback", use_container_width=True):
+                    clicked = "reset_form"
+                if st.button("Новый сценарий", key="act_new_fallback", use_container_width=True):
+                    clicked = "new"
+                if st.button("Вернуться к текущему плану", key="act_cancel_active_fallback", use_container_width=True, disabled=not has_applied_scenario):
+                    clicked = "cancel_active"
+                if st.button("Сравнить", key="act_compare_fallback", use_container_width=True, disabled=not (has_applied_scenario or has_saved_scenarios)):
+                    clicked = "compare"
+                if st.button("Отчёт", key="act_export_fallback", use_container_width=True):
+                    clicked = "export"
     return clicked
 
+
+
+
+def render_metric_card(label: str, value: str, delta: str | None = None, tone: str = "neutral") -> None:
+    st.markdown(
+        f'<div class="metric-card {tone}"><div class="metric-card-label">{_safe(label)}</div><div class="metric-card-value">{_safe(value)}</div><div class="metric-card-delta">{_safe(delta or "")}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_next_action_card(title: str, text: str, tone: str = "info") -> None:
+    st.markdown(
+        f'<div class="next-action-card {tone}"><div class="card-title">{_safe(title)}</div><div class="muted">{_safe(text)}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_scenario_preview_card(current: Sequence[tuple[str, str]], future: Sequence[tuple[str, str]], status: str) -> None:
+    def rows(items: Sequence[tuple[str, str]]) -> str:
+        return "".join(f'<div class="preview-row"><div class="preview-label">{_safe(k)}</div><div class="preview-value">{_safe(v)}</div></div>' for k, v in items)
+    st.markdown(
+        f'<div class="scenario-preview-card"><div class="card-title">Текущий план</div>{rows(current)}<div class="scenario-divider"></div><div class="card-title">Будущий сценарий</div>{rows(future)}<div class="scenario-divider"></div><div class="preview-row"><div class="preview-label">Статус</div><div class="preview-value">{_safe(status)}</div></div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_risk_card(title: str, items: Sequence[str], tone: str = "warning") -> None:
+    if not items:
+        items = ["Критичных ограничений не найдено."]
+    body = "".join(f"<li>{_safe(item)}</li>" for item in items)
+    st.markdown(f'<div class="risk-card {tone}"><div class="card-title">{_safe(title)}</div><ul>{body}</ul></div>', unsafe_allow_html=True)
+
+
+def render_technical_expander(title: str, payload: Any | None = None) -> None:
+    with st.expander(title, expanded=False):
+        if payload is not None:
+            st.json(payload)
 
 
 def render_product_empty_state(title: str, text: str, action_label: str | None = None) -> None:

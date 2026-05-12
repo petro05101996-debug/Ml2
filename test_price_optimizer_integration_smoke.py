@@ -12,23 +12,33 @@ def test_stale_signature_guard_present_for_apply_button():
     assert 'disabled=not can_apply' in app_text
 
 
-def test_scenario_optimizer_uses_what_if_price_reference():
+def test_scenario_tab_routes_to_price_candidate_section():
     app_text = Path('app.py').read_text(encoding='utf-8')
-    assert 'scenario_reference_price = float(st.session_state.get("what_if_price"' in app_text
+    assert 'Открыть раздел «Цена-кандидат»' in app_text
+    assert 'go_price_candidate_from_scenario' in app_text
+    assert 'st.session_state.active_workspace_tab = "Цена-кандидат"' in app_text
 
 
-def test_base_and_scenario_optimizer_states_are_separated():
+def test_price_optimizer_uses_base_state_only_after_ux_split():
     app_text = Path('app.py').read_text(encoding='utf-8')
     assert 'price_optimizer_result_base' in app_text
-    assert 'price_optimizer_result_scenario' in app_text
+    assert 'price_optimizer_result_scenario' not in app_text
 
 
-def test_scenario_stale_warning_and_inline_chart_table_present():
+def test_scenario_tab_has_no_inline_price_optimizer():
     app_text = Path('app.py').read_text(encoding='utf-8')
-    assert 'is_scenario_price_optimizer_stale' in app_text
-    assert 'Сценарная рекомендация по цене устарела' in app_text
-    assert 'render_price_optimizer_chart(st.session_state.get("price_optimizer_result_scenario"))' in app_text
-    assert 'render_price_optimizer_table(st.session_state.get("price_optimizer_result_scenario"))' in app_text
+    assert 'run_price_optimizer_from_scenario_tab' not in app_text
+    assert 'scenario_reference_price' not in app_text
+    assert 'is_scenario_price_optimizer_stale' not in app_text
+    assert 'Сценарная рекомендация по цене устарела' not in app_text
+    assert 'render_price_optimizer_chart(st.session_state.get("price_optimizer_result_scenario"))' not in app_text
+    assert 'render_price_optimizer_table(st.session_state.get("price_optimizer_result_scenario"))' not in app_text
+
+
+def test_price_candidate_context_text_is_not_misleading():
+    app_text = Path('app.py').read_text(encoding='utf-8')
+    assert 'Контекст: рекомендация рассчитана для параметров, указанных в разделе «Проверить сценарий»' in app_text
+    assert 'Контекст: рекомендация рассчитана для базовых условий.' not in app_text
 
 
 def test_non_actionable_chart_label_uses_candidate():
