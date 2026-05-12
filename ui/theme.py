@@ -18,10 +18,13 @@ def apply_theme() -> None:
   --app-bg:#0F1722;
   --surface:#233142;
   --surface-hover:#28384B;
+  --surface-soft:#28384B;
   --header-bg:#243243;
   --divider:rgba(255,255,255,0.08);
   --subtle-border:rgba(255,255,255,0.04);
+  --border:rgba(255,255,255,0.08);
   --text:#F4F7FB;
+  --text-main:#F4F7FB;
   --text-secondary:#93A3B8;
   --text-muted:#71829A;
   --accent:#6F70FF;
@@ -175,6 +178,28 @@ html, body, .stApp, [class*="css"] { font-family: Inter, -apple-system, BlinkMac
   color: var(--text) !important;
 }
 .stButton button[kind="primary"] { background: var(--accent) !important; border-color: var(--accent) !important; }
+
+.status-dot.status-success { color: var(--success); }
+.status-dot.status-warning { color: var(--warning); }
+.status-dot.status-muted { color: var(--text-muted); }
+.status-dot.status-danger { color: var(--danger); }
+.metric-card, .next-action-card, .scenario-preview-card, .risk-card {
+  background: var(--surface-hover); border: 1px solid var(--border); border-radius: 18px; padding: 16px; margin-bottom: 12px;
+}
+.metric-card-label { color: var(--text-secondary); font-size: .82rem; }
+.metric-card-value { color: var(--text-main); font-weight: 800; font-size: 1.35rem; margin-top: 4px; }
+.metric-card-delta { color: var(--text-muted); font-size: .86rem; margin-top: 6px; }
+.next-action-card.success, .metric-card.success { border-color: color-mix(in srgb, var(--success) 45%, transparent); }
+.next-action-card.warning, .metric-card.warning, .risk-card.warning { border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
+.next-action-card.danger, .metric-card.danger, .risk-card.danger { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.risk-card ul { margin: 8px 0 0 18px; color: var(--text-secondary); line-height: 1.55; }
+
+button:focus, input:focus, textarea:focus, [role="radio"]:focus, [role="radio"]:focus-visible, [data-baseweb="select"]:focus-within {
+  outline: 2px solid var(--accent) !important;
+  outline-offset: 2px !important;
+}
+button { min-height: 42px; }
+
 [data-testid="stMetric"] { background: var(--surface-hover); border: 1px solid var(--subtle-border); border-radius: 16px; padding: 12px; }
 .stExpander { border:1px solid var(--subtle-border) !important; background: var(--surface-hover) !important; border-radius: 16px !important; }
 
@@ -301,6 +326,18 @@ html, body, .stApp, [class*="css"] { font-family: Inter, -apple-system, BlinkMac
   border: 1px solid var(--subtle-border);
   padding: 12px;
   color: var(--text-secondary);
+}
+
+@media (max-width: 768px) {
+  .kpi-row,
+  .result-kpi-grid,
+  .decision-section-grid,
+  .decision-next-grid,
+  .scenario-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .surface-card { padding: 16px; border-radius: 18px; }
+  .page-header { font-size: 26px; }
 }
 
 @media (max-width: 900px) {

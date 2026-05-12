@@ -16,18 +16,18 @@ def test_audit_ui_uses_action_specific_inputs():
 
 def test_ui_has_user_friendly_tabs():
     src = Path("app.py").read_text()
-    assert '"Цена"' in src
-    assert '"Анализ решений"' in src
-    assert '"Сравнение"' in src
-    assert '"Отчёт"' in src
-    assert '"Лучший вариант цены": "Цена"' in src
-    assert '"Проверка решений": "Анализ решений"' in src
+    assert '"Цена-кандидат"' in src
+    assert '"Проверка решения"' in src
+    assert '"Сравнить варианты"' in src
+    assert '"Скачать отчёт"' in src
+    assert '"Лучший вариант цены": "Цена-кандидат"' in src
+    assert '"Проверка решений": "Проверка решения"' in src
 
 
 def test_decision_analyzer_has_no_visible_decision_layer_wording():
     src = Path("app.py").read_text()
     assert "Decision layer: проверяет варианты сценариев" not in src
-    assert "Проверьте управленческую гипотезу" in src
+    assert "Покажет, стоит ли запускать изменение" in src
     assert "Анализатор не меняет модель" in src
 
 
@@ -41,5 +41,23 @@ def test_decision_analyzer_uses_human_metric_labels():
 
 def test_decision_json_is_hidden_in_technical_expander():
     src = Path("app.py").read_text()
-    assert "Для аналитика: технические детали" in src
+    assert "Для аналитика: технический файл решения" in src
     assert "Технический JSON паспорта" in src or "decision_passport" in src
+
+
+def test_scenario_screen_has_no_price_sensitivity_artifact():
+    src = Path("app.py").read_text()
+    assert 'open_surface("Проверка соседних цен")' not in src
+    assert 'Дополнительно: чувствительность к цене' not in src
+
+
+def test_report_json_is_hidden_for_analyst():
+    src = Path("app.py").read_text()
+    assert 'open_surface("JSON для аналитика"' not in src
+    assert 'with st.expander("Для аналитика: технический файл"' in src
+
+
+def test_scenario_advanced_settings_are_not_main_user_path():
+    src = Path("app.py").read_text()
+    assert 'with st.expander("Для аналитика: расширенные настройки"' in src
+    assert 'with st.expander("Редко используется: логистика и внешний спрос"' in src
