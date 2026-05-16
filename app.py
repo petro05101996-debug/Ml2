@@ -7840,13 +7840,16 @@ def render_upload_screen() -> dict[str, Any]:
     horizon_days = int(st.session_state.get("input_horizon_days", CONFIG["HORIZON_DAYS_DEFAULT"]))
     analysis_calc_mode = str(st.session_state.get("input_analysis_calc_mode", DEFAULT_SCENARIO_CALC_MODE))
     auto_price_optimizer = bool(st.session_state.get("input_auto_price_optimizer", False))
+    auto_run_after_upload = bool(st.session_state.get("input_auto_run_after_upload", True))
     run_requested = False
+    auto_run_notice = ""
     if "upload_columns_confirmed" not in st.session_state:
         st.session_state["upload_columns_confirmed"] = False
     current_file_name = getattr(universal_file, "name", "") if universal_file is not None else ""
     if st.session_state.get("last_uploaded_file_name") != current_file_name:
         st.session_state["last_uploaded_file_name"] = current_file_name
         st.session_state["upload_columns_confirmed"] = False
+        st.session_state["upload_auto_started_for_file"] = None
 
     def _reset_upload_columns_confirmation() -> None:
         st.session_state["upload_columns_confirmed"] = False
@@ -7884,11 +7887,23 @@ def render_upload_screen() -> dict[str, Any]:
             except Exception as exc:
                 schema_errors.append(str(exc))
 
+    single_object_ready = False
+    if schema_valid and raw_for_select is not None and len(raw_for_select) > 0:
+        category_col_for_auto = "product_category_name" if "product_category_name" in raw_for_select.columns else "category"
+        auto_categories = raw_for_select[category_col_for_auto].dropna().astype(str).unique()
+        if len(auto_categories) == 1:
+            auto_skus = raw_for_select[raw_for_select[category_col_for_auto].astype(str) == str(auto_categories[0])]["product_id"].astype(str).dropna().unique()
+            single_object_ready = len(auto_skus) == 1
+    if schema_valid and single_object_ready and auto_run_after_upload and not st.session_state.get("upload_columns_confirmed"):
+        st.session_state["upload_columns_confirmed"] = True
     if not schema_valid:
         st.session_state["upload_columns_confirmed"] = False
     columns_confirmed = bool(st.session_state.get("upload_columns_confirmed"))
     sku_done = bool(st.session_state.get("input_target_category") and st.session_state.get("input_target_sku"))
     active_step = 0 if not upload_done else (1 if not columns_confirmed else 2)
+    if st.button("← На лендинг", key="upload_back_to_landing", use_container_width=False):
+        st.session_state["nav_page"] = "landing"
+        st.rerun()
     render_page_header("Загрузка данных", [
         "Шаг 1 из 3 — загрузите файл",
         "Шаг 2 из 3 — проверьте колонки",
@@ -7984,15 +7999,22 @@ def render_upload_screen() -> dict[str, Any]:
         st.markdown(f"**Качество данных:** {quality_status}")
         if target_category and target_sku:
             st.info(f"Будет рассчитан SKU: **{target_sku}** в категории **{target_category}**.")
+        analysis_calc_mode = st.radio(
+            "Режим расчёта (3 режима)",
+            options=list(SCENARIO_CALC_MODES.keys()),
+            format_func=lambda x: SCENARIO_CALC_MODES[x],
+            index=list(SCENARIO_CALC_MODES.keys()).index(DEFAULT_SCENARIO_CALC_MODE),
+            key="input_analysis_calc_mode",
+            horizontal=False,
+        )
+        st.caption("Доступны 3 режима: базовый, расширенный сценарный и факторная модель. Если не уверены — оставьте режим по умолчанию.")
+        auto_run_after_upload = st.checkbox(
+            "Запускать расчёт автоматически после загрузки, если в файле один SKU и колонки распознаны",
+            value=True,
+            help="Если в файле несколько категорий или SKU, сначала нужно выбрать объект анализа, чтобы не запустить расчёт не для того товара.",
+            key="input_auto_run_after_upload",
+        )
         with st.expander("Дополнительные допущения", expanded=False):
-            analysis_calc_mode = st.radio(
-                "Режим расчёта",
-                options=list(SCENARIO_CALC_MODES.keys()),
-                format_func=lambda x: SCENARIO_CALC_MODES[x],
-                index=list(SCENARIO_CALC_MODES.keys()).index(DEFAULT_SCENARIO_CALC_MODE),
-                key="input_analysis_calc_mode",
-            )
-            st.caption("Техническая настройка режима расчёта. Если не уверены — оставьте по умолчанию.")
             auto_price_optimizer = st.checkbox(
                 "После анализа сразу показать лучший найденный вариант цены",
                 value=False,
@@ -8003,7 +8025,16 @@ def render_upload_screen() -> dict[str, Any]:
                 key="input_auto_price_optimizer",
             )
         can_run_calculation = bool(schema_valid and data_gate.get("usage_policy", {}).get("can_run_calculation") and target_category and target_sku)
-        run_requested = st.button("Запустить анализ", type="primary", use_container_width=True, disabled=not can_run_calculation)
+        auto_run_possible = bool(can_run_calculation and single_object_ready and auto_run_after_upload)
+        auto_run_requested = bool(auto_run_possible and st.session_state.get("upload_auto_started_for_file") != current_file_name)
+        if auto_run_requested:
+            st.session_state["upload_auto_started_for_file"] = current_file_name
+            auto_run_notice = "Файл содержит один SKU, колонки распознаны — запускаем расчёт автоматически."
+            st.info(auto_run_notice)
+        elif upload_done and schema_valid and auto_run_after_upload and not single_object_ready:
+            st.caption("Автозапуск не включён: в файле несколько категорий/SKU, выберите объект анализа и нажмите кнопку запуска.")
+        manual_run_requested = st.button("Запустить анализ", type="primary", use_container_width=True, disabled=not can_run_calculation)
+        run_requested = bool(auto_run_requested or manual_run_requested)
         close_surface()
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -8016,6 +8047,7 @@ def render_upload_screen() -> dict[str, Any]:
         "horizon_days": horizon_days,
         "analysis_calc_mode": analysis_calc_mode,
         "auto_price_optimizer": bool(auto_price_optimizer),
+        "auto_run_notice": auto_run_notice,
         "data_quality_gate": data_gate,
         "universal_quality": universal_quality,
     }
@@ -9285,6 +9317,13 @@ if __name__ == "__main__":
         selected_decision_mode = render_decision_mode_cards(str(st.session_state.get("decision_mode", "find_best")))
         if selected_decision_mode != st.session_state.get("decision_mode"):
             st.session_state["decision_mode"] = selected_decision_mode
+            if selected_decision_mode == "quick_what_if":
+                st.session_state.active_workspace_tab = PAGE_WHAT_IF
+                st.session_state["workspace_tab_radio"] = PAGE_WHAT_IF
+            st.rerun()
+        if st.session_state.get("decision_mode") == "quick_what_if":
+            st.session_state.active_workspace_tab = PAGE_WHAT_IF
+            st.session_state["workspace_tab_radio"] = PAGE_WHAT_IF
             st.rerun()
         if st.session_state.get("decision_mode") == "find_best":
             st.caption("Система сама переберёт допустимые варианты: цену, скидку, промо и логистику. Затем покажет лучший вариант, риски и план проверки.")
