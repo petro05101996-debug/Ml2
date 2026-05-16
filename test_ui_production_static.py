@@ -35,7 +35,7 @@ def test_decision_action_labels_exist():
     assert "Изменить цену" in src
     assert "Изменить скидку" in src
     assert "Изменить промо" in src
-    assert "Проверить внешнюю гипотезу спроса" in src
+    assert "Внешний спрос" in src
 
 
 def test_no_duplicate_static_streamlit_keys():
@@ -51,7 +51,7 @@ def test_decision_results_are_signature_guarded():
     assert "decision_optimizer_signature" in src
     assert "recommendation_audit_signature" in src
     assert "Параметры изменились" in src
-    assert "Параметры рекомендации изменились" in src
+    assert "Параметры идеи изменились" in src
 
 
 def test_user_ui_does_not_use_slot_wording_for_saved_scenarios():
