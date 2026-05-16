@@ -389,7 +389,7 @@ def render_overview_hero(title: str, text: str) -> None:
 
 def render_decision_mode_cards(active_mode: str) -> str:
     st.markdown('<div class="action-card-grid">', unsafe_allow_html=True)
-    cols = st.columns(2)
+    cols = st.columns(3)
     selected = active_mode
     with cols[0]:
         st.markdown(f'<div class="action-card {"active" if active_mode == "find_best" else ""}"><div class="card-title">Найти лучшее решение</div><div class="muted">Система сама переберёт допустимые варианты цены, скидки, промо и логистики.</div></div>', unsafe_allow_html=True)
@@ -399,6 +399,10 @@ def render_decision_mode_cards(active_mode: str) -> str:
         st.markdown(f'<div class="action-card {"active" if active_mode == "audit_idea" else ""}"><div class="card-title">Проверить мою идею</div><div class="muted">Вы уже знаете, что хотите сделать — система проверит эффект, риск и план пилота.</div></div>', unsafe_allow_html=True)
         if st.button("Проверить мою идею", key="decision_mode_audit_idea", use_container_width=True):
             selected = "audit_idea"
+    with cols[2]:
+        st.markdown(f'<div class="action-card {"active" if active_mode == "quick_what_if" else ""}"><div class="card-title">Быстрый what-if</div><div class="muted">Сразу перейти к ручной настройке цены, скидки, промо, логистики и внешнего спроса.</div></div>', unsafe_allow_html=True)
+        if st.button("Быстрый what-if", key="decision_mode_quick_what_if", use_container_width=True):
+            selected = "quick_what_if"
     st.markdown('</div>', unsafe_allow_html=True)
     return selected
 

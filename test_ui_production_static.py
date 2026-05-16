@@ -73,3 +73,19 @@ def test_comparison_table_has_human_column_names():
     assert '"Confidence"' not in src
     assert '"Support"' not in src
     assert '"Warnings"' not in src
+
+
+def test_upload_screen_exposes_landing_mode_and_autorun_copy():
+    src = Path("app.py").read_text()
+    assert "← На лендинг" in src
+    assert "Режим расчёта (3 режима)" in src
+    assert "Запускать расчёт автоматически после загрузки" in src
+    assert "Автозапуск не включён" in src
+
+
+def test_decision_mode_cards_have_three_modes():
+    src = Path("ui/components.py").read_text()
+    assert "st.columns(3)" in src
+    assert "Найти лучшее решение" in src
+    assert "Проверить мою идею" in src
+    assert "Быстрый what-if" in src
