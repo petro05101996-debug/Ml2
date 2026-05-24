@@ -1,0 +1,5 @@
+import React from "react";
+export default function ResultsPage({ scenarioResult }: { scenarioResult: any }) {
+  const r=scenarioResult||{}; const b=r.base_result||{}; const s=r.stress_result||{};
+  return <section><h1>Сравнение условий и рисков</h1><ul><li>Чистый номинальный результат: {b.net_nominal ?? '—'}</li><li>Результат с учётом инфляции: {b.net_real ?? '—'}</li><li>Просадка в стресс-сценарии: {s.drawdown ?? '—'}</li><li>Ликвидность: {r.liquidity?.label ?? '—'}</li><li>Риск: {r.risk?.label ?? '—'}</li><li>Сложность: {r.complexity?.label ?? '—'}</li></ul><h3>Влияние факторов</h3><ul><li>Комиссии: {r.fees_impact?.fees_paid ?? '—'}</li><li>Налоги: {r.tax_impact?.tax_paid ?? '—'}</li><li>Инфляция: {r.inflation_impact?.inflation_loss ?? '—'}</li></ul><h3>Чувствительность</h3><ul>{(r.sensitivity_summary||[]).map((x:any,i:number)=><li key={i}>{x.factor}: {x.effect}</li>)}</ul><h3>Risk flags</h3><ul>{(r.risk_flags||[]).map((x:any)=><li key={x.code}>{x.title}</li>)}</ul><h3>Unknown fields</h3><ul>{(r.unknown_fields||[]).map((x:any)=><li key={x.code}>{x.title||x.code}</li>)}</ul></section>;
+}

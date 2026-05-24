@@ -1,0 +1,4 @@
+import React from "react";
+export default function ScenarioPreviewPage({ form, unknownFields, assumptions, confirmed, onConfirmedChange, canRun, onRun }: any) {
+  return <section><h1>Проверим вводные перед расчётом</h1><ul><li>Сумма: {form.amount}</li><li>Срок: {form.term}</li><li>Доходность: {form.annual_return_pct}%</li><li>Комиссии: {form.fees_pct}%</li><li>Налоги: {form.tax_pct}%</li><li>Инфляция: {form.inflation_pct}%</li></ul><h3>Что не указано</h3><ul>{(unknownFields||[]).map((u:any)=><li key={u.code}>{u.title}</li>)}</ul><h3>Допущения</h3><ul>{(assumptions||[]).map((a:string)=><li key={a}>{a}</li>)}</ul><label><input type="checkbox" checked={confirmed} onChange={(e)=>onConfirmedChange(e.target.checked)}/> Подтверждаю допущения</label><button disabled={!canRun} onClick={onRun}>Рассчитать</button></section>;
+}
