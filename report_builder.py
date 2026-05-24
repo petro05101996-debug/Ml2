@@ -1,10 +1,38 @@
-"""Streamlit-independent report payload helpers."""
+"""Report payload helpers with legal-safe wording."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+
+DISCLAIMER = (
+    "Отчёт носит информационно-аналитический характер. Он не является индивидуальной инвестиционной рекомендацией, "
+    "не содержит предложения купить, продать или удерживать финансовый инструмент, не определяет пригодность инструмента "
+    "для пользователя и не формирует инвестиционный профиль. Все расчёты основаны на введённых данных и допущениях."
+)
 
 
 def build_business_report_payload(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    from app import build_business_report_payload as _impl
-
-    return _impl(*args, **kwargs)
+    payload: Dict[str, Any] = kwargs.get("payload", {}) if isinstance(kwargs.get("payload", {}), dict) else {}
+    return {
+        "title": "Отчёт проверки условий и сценариев",
+        "subtitle": "Информационно-аналитический расчёт по введённым данным. Не является индивидуальной инвестиционной рекомендацией.",
+        "summary": "Краткое резюме без рекомендации.",
+        "sections": [
+            "Введённые пользователем данные",
+            "Что удалось определить",
+            "Что неизвестно",
+            "Использованные допущения",
+            "Базовый сценарий",
+            "Стресс-сценарий",
+            "Влияние комиссий",
+            "Влияние налогов",
+            "Влияние инфляции",
+            "Ликвидность",
+            "Risk flags",
+            "Чеклист вопросов",
+            "Ограничения расчёта",
+            "Юридический дисклеймер",
+        ],
+        "disclaimer_top": DISCLAIMER,
+        "disclaimer_bottom": DISCLAIMER,
+        "payload": payload,
+    }

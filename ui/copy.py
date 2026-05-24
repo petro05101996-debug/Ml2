@@ -38,7 +38,7 @@ TAB_ALIASES = {
     "What-if сценарий": PAGE_WHAT_IF,
     PAGE_WHAT_IF: PAGE_WHAT_IF,
     "Цена": PAGE_PRICE,
-    "Лучший вариант цены": PAGE_PRICE,
+    "Проверка цены": PAGE_PRICE,
     PAGE_PRICE: PAGE_PRICE,
     "Проверка решения": PAGE_DECISION,
     "Проверка решений": PAGE_DECISION,
