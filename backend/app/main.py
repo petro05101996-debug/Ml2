@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.app.api.compliance import router as compliance_router
 from backend.app.api.explain import router as explain_router
@@ -22,12 +26,12 @@ def scenario_templates() -> dict:
     return {"templates": ["single_scenario", "compare_scenarios", "portfolio_check", "instrument_explain"]}
 
 
-@app.post("/api/dialog/start")
 QUESTIONS = [
     {"id":"amount","title":"Какую сумму вы хотите проверить?","type":"number","why_it_matters":"Сумма влияет на абсолютный размер итогового результата."},
     {"id":"term_months","title":"На какой срок планируется размещение?","type":"number","why_it_matters":"Срок влияет на доход, ликвидность и чувствительность к рискам."},
 ]
 
+@app.post("/api/dialog/start")
 def dialog_start(payload: dict) -> dict:
     return {"status":"ok","step":"question","question":QUESTIONS[0],"cursor":0,"answers":{}}
 
@@ -99,3 +103,16 @@ def report_generate(payload: dict) -> dict:
 app.include_router(compliance_router)
 
 app.include_router(explain_router)
+
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
+
+if FRONTEND_DIST.exists():
+    assets_dir = FRONTEND_DIST / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/{full_path:path}")
+    def serve_spa(full_path: str):
+        return FileResponse(FRONTEND_DIST / "index.html")

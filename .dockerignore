@@ -1,0 +1,10 @@
+.git
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+node_modules
+frontend/node_modules
+frontend/dist
+.env
+.DS_Store
