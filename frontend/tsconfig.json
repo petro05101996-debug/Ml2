@@ -6,7 +6,10 @@
     "strict": false,
     "moduleResolution": "Bundler",
     "skipLibCheck": true,
-    "types": ["vite/client"]
+    "ignoreDeprecations": "6.0",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
   },
   "include": ["src"]
 }
