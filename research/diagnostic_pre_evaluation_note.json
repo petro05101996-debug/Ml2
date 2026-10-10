@@ -1,0 +1,9 @@
+{
+  "purpose": "Pre-outcome audit note, not a model result",
+  "run_id": 38036207864,
+  "test_results_observed": false,
+  "finding": "The two external_effect test cases currently repeat the training prompts exactly, including both A/B orders. They are not independent test examples.",
+  "fixed_analysis_rule": "Keep all raw results unchanged. In the principal new-input comparison exclude ANY test row whose full serialized messages equal a training row; report excluded IDs and raw totals separately. Require both A/B orders for a case-level pass. Do not choose adapter strength or checkpoint from test results.",
+  "expected_principal_denominator": {"cases": 10, "ordered_inputs": 20, "families": 5},
+  "generalization_limit": "Remaining test cases are parameterized relatives of training templates, not new mechanism families or a professional benchmark. This is an execution and local-behavior diagnostic only."
+}
