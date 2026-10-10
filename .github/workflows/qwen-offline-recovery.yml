@@ -1,4 +1,4 @@
-name: Qwen offline recovery probe
+name: Qwen offline recovery bundle
 on:
   push:
     branches: [research/qwen-offline-recovery-20261010]
@@ -6,24 +6,93 @@ on:
 permissions:
   contents: read
 jobs:
-  probe:
+  bundle:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 40
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_HUB_DISABLE_XET: '1'
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
     steps:
-      - name: Verify public model access without private inputs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install and retain non-Torch Python wheels
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import urllib.request, json, socket, platform
-          print('EXECUTOR',platform.platform())
-          for host in ['huggingface.co','pypi.org']:
-              print('DNS',host,socket.getaddrinfo(host,443)[0][4])
-          url='https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/config.json'
-          with urllib.request.urlopen(url,timeout=30) as r:
-              cfg=json.load(r)
-          print('MODEL',json.dumps(cfg,sort_keys=True))
-          print('PUBLIC_MODEL_NETWORK_PROBE_PASS')
+          python -m pip install 'torch==2.10.0' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'transformers==4.57.6' 'bitsandbytes==0.50.2' 'accelerate==1.12.0' 'safetensors>=0.6.2'
+          mkdir -p wheelhouse
+          python - <<'PY'
+          import importlib.metadata as m, subprocess
+          names=['transformers','bitsandbytes','accelerate','tokenizers','huggingface-hub','safetensors','numpy','packaging','psutil','pyyaml','regex','requests','tqdm','filelock','fsspec','typing-extensions','hf-xet','charset-normalizer','idna','urllib3','certifi']
+          pins=[]
+          for n in names:
+              try: pins.append(n+'=='+m.version(n))
+              except m.PackageNotFoundError: pass
+          open('wheelhouse/requirements-offline.txt','w').write('\n'.join(pins)+'\n')
+          subprocess.run(['python','-m','pip','download','--no-deps','--only-binary=:all:','-d','wheelhouse',*pins],check=True)
           PY
-          free -m
-          lscpu | head -30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen-python-wheels
+          path: wheelhouse/
+          compression-level: 0
+          retention-days: 1
+      - name: Export exact public Qwen snapshot as canonical NF4 plus original suffix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -u - <<'PY'
+          import os, json, hashlib, time, pathlib, shutil, gc
+          import torch, transformers, bitsandbytes as bnb
+          from huggingface_hub import snapshot_download
+          from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+          from safetensors import safe_open
+          from safetensors.torch import save_file
+          torch.set_num_threads(4)
+          repo='Qwen/Qwen3-4B-Instruct-2507'
+          revision='cdbee75f17c01a7cc42f958dc650907174af0554'
+          source=pathlib.Path(snapshot_download(repo,revision=revision,local_dir='source',allow_patterns=['*.json','*.safetensors','*.txt','*.jinja','LICENSE*','README.md'],max_workers=3))
+          def digest(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(8388608),b''):h.update(b)
+              return h.hexdigest()
+          hashes={p.name:digest(p) for p in source.iterdir() if p.is_file()}
+          expected={'model-00001-of-00003.safetensors':'75311d91bb08cf0b882913da464a1e722a31fb44db35208663487efb7a3d8ed6','model-00002-of-00003.safetensors':'0b48adbb1f60e901153d91907ba11ce63bd4b8b584482e730f48808d055dfba1','model-00003-of-00003.safetensors':'7dd39ccca5e4de123c74c14af44c9bf2eb75df33b4614382af0134528e060d5d'}
+          for n,h in expected.items():
+              if hashes.get(n)!=h:raise ValueError('Public snapshot hash mismatch: '+n)
+          print('PUBLIC_SOURCE_HASHES_VERIFIED',flush=True)
+          out=pathlib.Path('portable-qwen');out.mkdir()
+          tok=AutoTokenizer.from_pretrained(source,local_files_only=True,trust_remote_code=False)
+          cfg=BitsAndBytesConfig(load_in_4bit=True,bnb_4bit_quant_type='nf4',bnb_4bit_use_double_quant=True,bnb_4bit_compute_dtype=torch.bfloat16)
+          model=AutoModelForCausalLM.from_pretrained(source,local_files_only=True,trust_remote_code=False,quantization_config=cfg,device_map={'':'cpu'},dtype=torch.bfloat16,attn_implementation='sdpa',low_cpu_mem_usage=True)
+          model.eval().requires_grad_(False)
+          print('NF4_MODEL_LOADED',flush=True)
+          model.save_pretrained(out,safe_serialization=True,max_shard_size='450MB')
+          tok.save_pretrained(out)
+          mapping=json.loads((source/'model.safetensors.index.json').read_text())['weight_map']
+          suffix={}
+          for key,fn in mapping.items():
+              if key.startswith('model.layers.35.'):
+                  with safe_open(str(source/fn),framework='pt',device='cpu') as f:suffix[key]=f.get_tensor(key).clone()
+          save_file(suffix,str(out/'original-bf16-suffix.safetensors'))
+          manifest={'repo':repo,'revision':revision,'source_sha256':hashes,'format':'canonical bitsandbytes NF4; original BF16 last layer separately','export_torch':torch.__version__,'export_transformers':transformers.__version__,'export_bitsandbytes':bnb.__version__,'exported_sha256':{p.name:digest(p) for p in out.iterdir() if p.is_file()}}
+          (out/'portable_manifest.json').write_text(json.dumps(manifest,indent=2))
+          print('PORTABLE_MODEL_COMPLETE',json.dumps({p.name:p.stat().st_size for p in out.iterdir()}),flush=True)
+          del model,suffix;gc.collect()
+          shutil.rmtree(source)
+          PY
+          mkdir -p chunks
+          tar -cf - portable-qwen | split -b 400M -d - chunks/qwen.tar.part-
+          sha256sum chunks/* > chunks/SHA256SUMS
+          ls -lh chunks
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen-model-chunks
+          path: chunks/
+          compression-level: 0
+          retention-days: 1
