@@ -1,0 +1,29 @@
+name: Qwen offline recovery probe
+on:
+  push:
+    branches: [research/qwen-offline-recovery-20261010]
+    paths: ['.github/workflows/qwen-offline-recovery.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify public model access without private inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import urllib.request, json, socket, platform
+          print('EXECUTOR',platform.platform())
+          for host in ['huggingface.co','pypi.org']:
+              print('DNS',host,socket.getaddrinfo(host,443)[0][4])
+          url='https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/config.json'
+          with urllib.request.urlopen(url,timeout=30) as r:
+              cfg=json.load(r)
+          print('MODEL',json.dumps(cfg,sort_keys=True))
+          print('PUBLIC_MODEL_NETWORK_PROBE_PASS')
+          PY
+          free -m
+          lscpu | head -30
